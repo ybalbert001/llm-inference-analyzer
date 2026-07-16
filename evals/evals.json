@@ -1,0 +1,33 @@
+{
+  "skill_name": "llm-inference-analyzer",
+  "evals": [
+    {
+      "id": 0,
+      "eval_name": "qwen32b-fit-check",
+      "prompt": "我想把 Qwen/Qwen3-32B 部署在一台 p4d.24xlarge（8×A100 40GB）上，context 64K、并发 32，显存够吗？帮我分析并生成一个 HTML 报告。",
+      "expected_output": "A correct VRAM analysis: weights ~61 GiB (bf16), KV cache scaling with 64K×32 requests, a clear fits/doesn't-fit verdict against 8×40 GiB accounting for per-GPU sharding, and a generated HTML report file.",
+      "files": [],
+      "assertions": [
+        "Verdict is correct: states the requested shape does NOT fit on 8×A100 40GB (320 GiB total). Ground truth: ~603 GiB needed at 64K context × 32 requests.",
+        "Weights number is accurate: total weights reported as ~61 GiB (60–62 GiB acceptable) for Qwen3-32B bf16.",
+        "KV cache math is right: identifies KV cache as the dominant consumer, ~16 GiB per request at 64K context with bf16 GQA KV (512 GiB total at 32 requests). Accept if per-request or total KV is within 10%.",
+        "Actionable guidance: suggests at least one concrete mitigation (reduce concurrency/context, fp8 KV cache, larger-memory GPUs, or quantized weights) with numbers, not just 'doesn't fit'.",
+        "HTML report generated: an .html file exists in outputs/ and contains the model name and memory breakdown (not a stub or error page)."
+      ]
+    },
+    {
+      "id": 1,
+      "eval_name": "dsv4-conversational",
+      "prompt": "deepseek-ai/DeepSeek-V4-Flash 的权重到底占多少显存？我看 config 里写的是 fp8，但网上有人说实际比按 fp8 算出来的小很多。MoE experts 到底是什么精度？",
+      "expected_output": "A conversational chat answer leading with the number (weights ~148.6 GiB; MoE experts are actually fp4 despite config declaring quant_method fp8; routed experts ~137 GiB / ~92%; naive uniform-fp8 estimate would give ~271 GiB) PLUS a generated interactive HTML report for review.",
+      "files": [],
+      "assertions": [
+        "Total weights accurate: reports ~148.6 GiB (147–151 GiB acceptable) — not the ~271 GiB naive fp8 figure.",
+        "Identifies MoE experts as fp4: states the routed experts are stored in fp4/mxfp4/nvfp4 (not fp8), despite config.json declaring quant_method fp8.",
+        "Explains the discrepancy: mentions mixed precision and/or sub-byte packing (fp4 values packed into int8 storage) as why the real size is far below the uniform-fp8 estimate.",
+        "Expert share correct: routed MoE experts reported at ~137 GiB or ~92% of total weights (±5%).",
+        "Chat answer AND HTML both delivered: ANSWER.md is a direct conversational reply leading with the number, and an interactive .html report also exists in outputs/ (chat text + reviewable artifact, not just one of them)."
+      ]
+    }
+  ]
+}

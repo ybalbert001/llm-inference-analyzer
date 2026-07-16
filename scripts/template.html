@@ -1,0 +1,312 @@
+<!doctype html>
+<html lang="$html_lang"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>$page_title</title>
+<style>
+  :root {
+    --surface:#fcfcfb; --page:#f9f9f7; --ink:#0b0b0b; --ink2:#52514e; --muted:#898781;
+    --grid:#e1e0d9; --ring:rgba(11,11,11,.10);
+    --s1:#2a78d6; --s2:#1baf7a; --s3:#eda100; --s4:#008300;
+    --s5:#4a3aa7; --s6:#e34948; --s7:#e87ba4; --s8:#eb6834;
+    --fixed:#b3b1a8; --lmh:#8a8880;
+  }
+  @media (prefers-color-scheme: dark) { :root {
+    --surface:#1a1a19; --page:#0d0d0d; --ink:#ffffff; --ink2:#c3c2b7; --muted:#898781;
+    --grid:#2c2c2a; --ring:rgba(255,255,255,.10);
+    --s1:#3987e5; --s2:#199e70; --s3:#c98500; --s4:#008300;
+    --s5:#9085e9; --s6:#e66767; --s7:#d55181; --s8:#d95926;
+    --fixed:#4a4945; --lmh:#75736c;
+  } }
+  * { box-sizing:border-box }
+  body { margin:0; background:var(--page); color:var(--ink);
+    font:14px/1.55 system-ui,-apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif; }
+  .wrap { max-width:1280px; margin:0 auto; padding:32px 24px 48px }
+  .topbar { display:flex; align-items:flex-start; justify-content:space-between; gap:16px }
+  h1 { font-size:24px; font-weight:600; margin:0 0 4px }
+  .subtitle { color:var(--ink2); margin:0 0 6px }
+  .meta { color:var(--muted); font-size:12.5px; margin:0 0 16px }
+  .langsw { display:flex; gap:2px; background:var(--surface); border:1px solid var(--ring);
+    border-radius:8px; padding:3px; flex-shrink:0; margin-top:2px }
+  .langsw button { font:inherit; font-size:12.5px; font-weight:600; color:var(--ink2);
+    background:transparent; border:none; border-radius:6px; padding:5px 12px; cursor:pointer }
+  .langsw button.active { color:var(--page); background:var(--ink) }
+
+  /* filter row — shared across tabs; .pf controls only shown on parallel tab */
+  .filters { display:flex; gap:18px; align-items:center; flex-wrap:wrap;
+    background:var(--surface); border:1px solid var(--ring); border-radius:10px;
+    padding:10px 16px; margin:0 0 16px }
+  .filters label { display:flex; gap:7px; align-items:center; font-size:13px; color:var(--ink2) }
+  .filters select, .filters input[type=number] { font:inherit; color:var(--ink); background:var(--page);
+    border:1px solid var(--grid); border-radius:6px; padding:4px 8px }
+  .filters input[type=number] { width:72px }
+  .fnote { color:var(--muted); font-size:12px; margin-left:auto }
+  body:not(.tab-parallel) .pf { display:none !important }
+  body:not(.tab-parallel):not(.tab-roofline) .pfi { display:none !important }
+  #custom-box { display:none; gap:10px; align-items:center }
+  .warnmsg { color:var(--s6); font-size:12.5px; width:100%; display:none }
+
+  /* tabs */
+  .tabs { display:flex; gap:8px; margin:0 0 20px }
+  .tab { font:inherit; font-size:14px; font-weight:600; color:var(--ink2);
+    background:var(--surface); border:1px solid var(--ring); border-radius:8px;
+    padding:8px 20px; cursor:pointer }
+  .tab.active { color:var(--page); background:var(--ink); border-color:var(--ink) }
+  #tab-parallel, #tab-roofline { display:none }
+  body.tab-parallel #tab-estimate, body.tab-roofline #tab-estimate { display:none }
+  body.tab-parallel #tab-parallel { display:block }
+  body.tab-roofline #tab-roofline { display:block }
+
+  .cols { display:grid; grid-template-columns:280px 1fr; gap:24px; align-items:start }
+  @media (max-width:900px) { .cols { grid-template-columns:1fr } }
+
+  /* left structure panels */
+  .panel { background:var(--surface); border:1px solid var(--ring); border-radius:10px; padding:16px }
+  .panel h2 { font-size:13px; font-weight:600; color:var(--ink2); margin:0 0 12px }
+  .ell { color:var(--muted); font-size:12px; text-align:center; margin:2px 0 12px }
+  .arrow { text-align:center; color:var(--muted); font-size:12.5px; margin:14px 0 }
+  /* estimate tab: bordered layer blocks */
+  .io { border:1.5px solid; border-radius:8px; padding:7px 10px; text-align:center;
+    font-size:13px; margin:0 0 10px; background:var(--surface) }
+  .layer { border:1px solid var(--grid); border-radius:10px; padding:8px; margin:0 0 10px; position:relative }
+  .ltag { position:absolute; left:-6px; top:50%; transform:translate(-100%,-50%);
+    color:var(--muted); font-size:11px }
+  .sub { border:1.5px solid; border-radius:6px; padding:5px 9px; font-size:12.5px; text-align:center }
+  .layer .sub + .sub { margin-top:6px }
+  .dot { display:inline-block; width:9px; height:9px; border-radius:50%;
+    margin-right:6px; vertical-align:0; box-shadow:0 0 0 2px var(--surface) }
+  /* parallel tab: design_2-style square rows */
+  .sblk { border:1.5px solid; border-radius:9px; padding:8px 10px; margin:0 0 10px }
+  .sblab { color:var(--ink2); font-size:11.5px; margin:0 0 6px }
+  .sqrow { display:flex; gap:4px }
+  .sqrow + .sqrow { margin-top:4px }
+  .sq { flex:1; height:16px; border-radius:4px; display:block }
+
+  /* estimate tab: cards */
+  .grp { font-size:12px; font-weight:600; letter-spacing:.04em; color:var(--muted);
+    text-transform:uppercase; margin:0 0 8px }
+  .card + .grp, .grp2 { margin-top:20px }
+  .card { background:var(--surface); border:1px solid var(--ring); border-left:4px solid;
+    border-radius:10px; padding:12px 16px; margin:0 0 12px }
+  .ch { display:flex; align-items:baseline; gap:8px; flex-wrap:wrap }
+  .ct { font-weight:600 }
+  .cv { font-weight:600; margin-left:auto; font-size:16px }
+  .pct { color:var(--muted); font-size:12px }
+  .dt { color:var(--ink2); font-size:11px; border:1px solid var(--grid);
+    border-radius:4px; padding:1px 6px; white-space:nowrap }
+  .cl { color:var(--ink2); font-size:12.5px; margin-top:4px }
+  .cl b { color:var(--ink) }
+
+  /* estimate tab: stacked bars */
+  .barcard { background:var(--surface); border:1px solid var(--ring); border-radius:10px;
+    padding:16px; margin:24px 0 0 }
+  .barhead { font-weight:600; margin:0 0 10px }
+  .bar + .barhead { margin-top:18px }
+  .lgrow + .barhead { margin-top:18px }
+  .bar { display:flex; gap:2px; height:24px; border-radius:4px; overflow:hidden }
+  .seg { min-width:3px; position:relative; display:flex; align-items:center; justify-content:center }
+  .seg:first-child { border-radius:4px 0 0 4px } .seg:last-child { border-radius:0 4px 4px 0 }
+  .seg-label { color:#fff; font-size:12px; white-space:nowrap }
+  .lgrow { margin-top:10px; display:flex; gap:18px; flex-wrap:wrap; font-size:12.5px; color:var(--ink2) }
+  .lg i { display:inline-block; width:10px; height:10px; border-radius:2px; margin-right:5px; vertical-align:-1px }
+  .lg b { color:var(--ink); font-weight:600 }
+  .total { margin-top:14px; padding-top:12px; border-top:1px solid var(--grid);
+    color:var(--ink2) } .total b { color:var(--ink); font-size:15px }
+
+  /* parallel tab: nodes + gpu cards */
+  .node { background:var(--surface); border:1px solid var(--ring); border-radius:12px;
+    padding:14px 16px 16px; margin:0 0 16px }
+  .node-head { display:flex; align-items:baseline; gap:10px; margin:0 0 12px }
+  .node-title { font-weight:600; font-size:14px }
+  .node-sub { color:var(--muted); font-size:12px }
+  .node-warn { color:var(--s6); font-size:12.5px; font-weight:600; margin-left:auto }
+  .gpugrid { display:grid; grid-template-columns:1fr 1fr; gap:12px }
+  @media (max-width:700px) { .gpugrid { grid-template-columns:1fr } }
+  .gpu { border:1.5px dashed var(--grid); border-radius:10px; padding:10px 12px; background:var(--page) }
+  .gpu.oom { border-color:var(--s6); border-style:solid }
+  .gpu-head { display:flex; align-items:baseline; gap:8px; margin:0 0 8px }
+  .gpu-name { font-weight:600; font-size:13px }
+  .gpu-rank { color:var(--muted); font-size:11px }
+  .gpu-mem { margin-left:auto; font-size:12px; color:var(--ink2); font-variant-numeric:tabular-nums }
+  .gpu-mem b { color:var(--ink) }
+  .oombadge { background:var(--s6); color:#fff; font-size:11px; border-radius:4px;
+    padding:1px 6px; margin-left:auto }
+  .membar { display:flex; gap:2px; height:20px; border-radius:4px; overflow:hidden;
+    background:var(--surface); border:1px solid var(--grid) }
+  .membar .seg { min-width:2px }
+  .membar .seg:hover, .membar .free:hover { outline:2px solid var(--ink); outline-offset:-2px }
+  .membar .free { display:flex; align-items:center; justify-content:center;
+    color:var(--muted); font-size:11px; white-space:nowrap; overflow:hidden;
+    background:repeating-linear-gradient(45deg,transparent,transparent 5px,var(--grid) 5px,var(--grid) 6px) }
+  .gpu-line { color:var(--ink2); font-size:11.5px; margin-top:6px }
+  .gpu-line b { color:var(--ink) }
+  .chips { display:flex; gap:5px; flex-wrap:wrap; margin-top:8px; align-items:center }
+  .chip { display:inline-flex; border:1px solid var(--grid); border-radius:5px; overflow:hidden;
+    font-size:10.5px; line-height:1 }
+  .chip i { width:14px; height:22px; display:block }
+  .chip .lb { padding:0 6px; display:flex; align-items:center; color:var(--ink2);
+    background:var(--surface) }
+  .chip-io { border-radius:5px; padding:4px 7px; font-size:10.5px; color:#fff }
+  .experts { margin-top:6px; font-size:11px; color:var(--ink2) }
+  .experts .eg { display:inline-block; width:7px; height:10px; border-radius:2px;
+    background:var(--s1); margin-right:2px; vertical-align:-1px }
+  .experts .eg.cut { opacity:.45 }
+  .pbarcard { background:var(--surface); border:1px solid var(--ring); border-radius:10px;
+    padding:16px; margin:8px 0 0 }
+
+  /* roofline tab */
+  .roofcard { background:var(--surface); border:1px solid var(--ring); border-radius:10px;
+    padding:16px; margin:0 0 16px }
+  .roofcard svg { display:block; width:100%; height:auto }
+  .roofnote { color:var(--muted); font-size:12px; margin-top:10px }
+  .verdicts { display:grid; grid-template-columns:1fr; gap:12px }
+  .verdicts table { margin:10px 0 4px }
+  .verdicts td, .verdicts th { padding:5px 10px; font-size:12.5px }
+  .vbadge { font-size:11px; border-radius:4px; padding:1px 8px; color:#fff; white-space:nowrap }
+  .vformula { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:11.5px;
+    color:var(--ink2); background:var(--page); border-radius:6px; padding:6px 10px; margin-top:6px;
+    overflow-x:auto; white-space:nowrap }
+  /* per-kernel FLOPs / HBM bar chart */
+  .kbchart { margin:10px 0 6px }
+  .kbhead { display:grid; grid-template-columns:130px 1fr 1fr; gap:10px; font-size:11px;
+    color:var(--muted); padding:0 0 4px }
+  .kbhead .kbh-f, .kbhead .kbh-b { text-align:left }
+  .kbrow { display:grid; grid-template-columns:130px 1fr; gap:10px; align-items:center;
+    padding:3px 0 }
+  .kblabel { font-size:12px; color:var(--ink2); overflow:hidden; text-overflow:ellipsis;
+    white-space:nowrap }
+  .kbbars { display:grid; grid-template-columns:1fr 1fr; gap:10px }
+  .kbtrack { position:relative; background:var(--page); border-radius:4px; height:17px;
+    display:flex; align-items:center }
+  .kbbar { height:17px; border-radius:4px; min-width:2px }
+  .kbbar-hbm { opacity:.55 }
+  .kbval { position:absolute; left:7px; font-size:10.5px; color:var(--ink2);
+    font-variant-numeric:tabular-nums; white-space:nowrap; text-shadow:0 0 3px var(--surface) }
+  .ktbl { margin-top:8px }
+  .ktbl summary { font-size:12px; color:var(--muted) }
+
+  /* hover tooltip (parallel tab bar segments) */
+  #tip { position:fixed; display:none; pointer-events:none; z-index:99;
+    background:var(--ink); color:var(--page); font-size:12px; line-height:1.4;
+    border-radius:6px; padding:6px 10px; box-shadow:0 2px 10px rgba(0,0,0,.25);
+    white-space:nowrap }
+  #tip b { font-weight:600 }
+  #tip .tpct { opacity:.7 }
+
+  /* table views */
+  details { margin-top:16px; color:var(--ink2) }
+  summary { cursor:pointer; font-size:13px }
+  table { border-collapse:collapse; margin-top:10px; background:var(--surface);
+    border:1px solid var(--ring); border-radius:8px; font-size:13px }
+  th,td { padding:6px 14px; text-align:left; border-bottom:1px solid var(--grid) }
+  th { color:var(--muted); font-weight:500; font-size:12px }
+  tr:last-child td { border-bottom:none }
+  tr.sep td { border-top:2px solid var(--grid) }
+  .num { text-align:right; font-variant-numeric:tabular-nums }
+  td.oomcell { color:var(--s6); font-weight:600 }
+</style></head><body><div class="wrap">
+  <div class="topbar">
+    <div>
+      <h1 id="h-title">$title</h1>
+      <p class="subtitle" id="h-subtitle">$subtitle</p>
+      <p class="meta" id="h-meta">$meta</p>
+    </div>
+    <div class="langsw" id="langsw">
+      <button data-lang="zh" id="lang-btn-zh">中文</button>
+      <button data-lang="en" id="lang-btn-en">EN</button>
+    </div>
+  </div>
+
+  <div class="filters">
+    <label><span id="lbl-ctx">$lbl_ctx</span>
+      <select id="f-ctx">$ctx_options</select>
+    </label>
+    <label><span id="lbl-req">$lbl_req</span>
+      <select id="f-req">$req_options</select>
+    </label>
+    <label><span id="lbl-kv">$lbl_kv</span>
+      <select id="f-kv">$kv_options</select>
+    </label>
+    <label class="pfi">TP <select id="f-tp">$tp_options</select></label>
+    <label class="pf">PP <select id="f-pp">$pp_options</select></label>
+    <label class="pf" id="ep-box">EP <select id="f-ep"></select></label>
+    <label class="pf" id="dp-box" style="display:none">
+      <input type="checkbox" id="f-dp"> <span id="lbl-dp">$lbl_dp</span></label>
+    <label class="pfi"><span id="lbl-inst">$lbl_inst</span> <select id="f-inst">$instance_options</select></label>
+    <span class="pf" id="custom-box">
+      <label><span id="lbl-custom-mem">$lbl_custom_mem</span> <input type="number" id="f-cmem" value="141" min="1"> GiB</label>
+      <label><span id="lbl-custom-gpn">$lbl_custom_gpn</span> <input type="number" id="f-cgpn" value="8" min="1"> <span id="lbl-custom-cards">$lbl_custom_cards</span></label>
+    </span>
+    <span class="fnote" id="fnote">$fnote</span>
+    <span class="warnmsg" id="warnmsg"></span>
+  </div>
+
+  <div class="tabs">
+    <button class="tab active" id="tab-btn-estimate">$tab_estimate</button>
+    <button class="tab" id="tab-btn-parallel">$tab_parallel</button>
+    <button class="tab" id="tab-btn-roofline">$tab_roofline</button>
+  </div>
+
+  <div id="tab-estimate">
+    <div class="cols">
+      <div class="panel"><h2 id="h-struct-title">$struct_title</h2><div id="h-struct">$struct</div></div>
+      <div>
+        <div class="grp" id="h-grp-static">$grp_static</div>
+        <div id="h-static-cards">$static_cards</div>
+        <div class="grp grp2" id="h-grp-runtime">$grp_runtime</div>
+        <div id="h-runtime-cards">$runtime_cards</div>
+      </div>
+    </div>
+
+    <div class="barcard">
+      <div class="barhead" id="h-weights-bar-head">$weights_bar_head</div>
+      <div class="bar" id="h-weights-segs">$weights_segs</div>
+      <div class="lgrow" id="h-weights-legend">$weights_legend</div>
+      <div class="barhead" id="d-tot-head">$total_bar_head</div>
+      <div class="bar" id="d-tot-bar">$total_segs</div>
+      <div class="lgrow" id="d-tot-legend">$total_legend</div>
+      <div class="total" id="d-total-line">$total_line</div>
+    </div>
+
+    <details><summary id="h-details-table-all">$details_table_all</summary>
+      <table><thead><tr><th id="h-th-component">$th_component</th><th id="h-th-dtype">$th_dtype</th><th class="num" id="h-th-params">$th_params</th><th class="num">GiB</th><th class="num" id="h-th-share">$th_share</th></tr></thead>
+      <tbody id="h-table-rows">$table_rows</tbody></table>
+    </details>
+  </div>
+
+  <div id="tab-parallel">
+    <div class="cols">
+      <div>
+        <div class="panel"><h2 id="h-pstruct-title">$pstruct_title</h2><div id="h-pstruct">$pstruct</div></div>
+        <div class="arrow" id="h-parallel-arrow">$parallel_arrow</div>
+      </div>
+      <div>
+        <div id="cluster"></div>
+        <div class="pbarcard">
+          <div class="barhead" id="sum-head"></div>
+          <div class="lgrow" id="legend"></div>
+          <div class="total" id="sum-line"></div>
+        </div>
+        <details><summary id="h-details-table-gpu">$details_table_gpu</summary>
+          <div style="overflow-x:auto"><table id="dtable"></table></div>
+        </details>
+      </div>
+    </div>
+  </div>
+
+  <div id="tab-roofline">
+    <div class="roofcard">
+      <div class="barhead" id="roof-title"></div>
+      <div id="roof-svg"></div>
+      <div class="roofnote" id="roof-note"></div>
+    </div>
+    <div class="verdicts" id="roof-verdicts"></div>
+  </div>
+  <div id="tip"></div>
+</div>
+
+<script>
+var D = $viz_json;
+var EP_INIT = $ep_init;
+$app_js
+</script>
+</body></html>
