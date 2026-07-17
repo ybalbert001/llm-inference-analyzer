@@ -43,6 +43,8 @@ python3 scripts/main.py Qwen/Qwen3-32B --context 32768 --requests 64 \
 
 ## 已验证的模型
 
+> **说明：** 下列模型目前仅经过**理论层面的验证**——即 config 公式推导与真实 safetensors 头信息（参数量、dtype、总字节数）相互对账一致，且内部守恒律自检全部通过；**尚未与真实部署实测数据对照验证**（例如 SGLang/vLLM 在 GPU 上实际报告的显存占用）。实测实验数据后续会陆续放入 [`validate_experiments/`](validate_experiments/) 目录。
+
 | model_id | 模型结构类型 | 参数规模(总 / 激活) |
 |---|---|---|
 | deepseek-ai/DeepSeek-V4-Flash | MoE + MQA + DSA + MTP | 291B / 14B |

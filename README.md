@@ -43,6 +43,8 @@ python3 scripts/main.py Qwen/Qwen3-32B --context 32768 --requests 64 \
 
 ## Validated models
 
+> **Note:** the models below are currently validated **theoretically only** — the config-derived formulas are reconciled against the real safetensors headers (parameter counts, dtypes, total bytes), and internal conservation checks pass. They have **not yet been verified against real deployment measurements** (e.g. actual VRAM usage reported by SGLang/vLLM on GPUs). Empirical experiment data will be added to the [`validate_experiments/`](validate_experiments/) directory as it is collected.
+
 | model_id | Architecture | Params (total / active) |
 |---|---|---|
 | deepseek-ai/DeepSeek-V4-Flash | MoE + MQA + DSA + MTP | 291B / 14B |
