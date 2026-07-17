@@ -46,4 +46,164 @@
 
 ## 具体验证-实验计划
 
-...
+### 0. 总览
+
+共 6 个实验，按 MTP 配置分为两组，**组内可共用部署，组间不可**：
+
+| 编号 | 实验 | 验证对象 | 组 | 机型 | 模型 |
+|---|---|---|---|---|---|
+| E1 | 权重总量对账 | 每卡 weights 字节 | A（开 MTP） | 8×B200 | 4 个（见覆盖矩阵） |
+| E2 | KV cell size 对账 | 每 token KV 字节 | A（与 E1 共用启动） | 8×B200 | 3 个（见覆盖矩阵） |
+| E3 | 显存账闭合 | 剩余显存 / 固定开销 | A（开 MTP） | 8×B200 | GLM-5.2-FP8 全矩阵 + Qwen3-32B 抽查 |
+| E4 | dp-attention 显存变化 | 权重增量 + KV 容量比 | A（开 MTP） | 8×B200 | GLM-5.2-FP8（MLA 专属） |
+| E5 | Decode roofline | TPOT ∝ 1/带宽 | B（关 MTP） | B300 / B200 / H200 / H100 各一台 | DeepSeek-V4-Flash + Qwen3-32B |
+| E6 | Prefill roofline | TTFT ∝ 1/算力 | B（与 E5 共用部署） | 同 E5 | 同 E5 |
+
+**模型覆盖矩阵**——工具对不同结构走不同计算分支，每条分支至少被一个（模型 × 实验）组合覆盖：
+
+| 工具计算分支 | 差异点 | 覆盖模型 | 覆盖实验 |
+|---|---|---|---|
+| KV：MLA | `kv_lora_rank + rope`，纯 TP 每卡全量复制 | GLM-5.2-FP8 | E2 / E3 / E4 |
+| KV：MQA（GQA-1） | `2 × 1 × head_dim`，TP > 1 即复制 | DeepSeek-V4-Flash | E2 |
+| KV：GQA-8 | `2 × kv_heads × head_dim`，TP 下按 kv head 切 1/min(TP, 8) | Qwen3-32B | E2 / E3 |
+| 权重：纯 fp8 | 单一 dtype 直读 | GLM-5.2-FP8 | E1 |
+| 权重：fp4 sub-byte 打包 | I8 存储 ÷2 还原 + scale 张量 | nvidia/GLM-5.2-NVFP4 | E1 |
+| 权重：fp4 + fp8 混合精度 | 逐部件不同 dtype（experts fp4、attention fp8） | DeepSeek-V4-Flash | E1 |
+| 权重：bf16 dense | 无量化路径、无 MoE | Qwen3-32B | E1 |
+| Roofline：DSA top-k | decode 读取封顶 `min(context, index_topk)`、prefill capped pairs | DeepSeek-V4-Flash | E5 / E6 |
+| Roofline：dense attention | decode 全 context、prefill causal pairs T(T+1)/2 | Qwen3-32B | E5 / E6 |
+| MTP 有 / 无 | 权重含 MTP 层、cell size +1 层 vs 均无 | GLM-5.2 系 / Qwen3-32B | E1 / E2 |
+
+模型选择理由：
+- **GLM-5.2-FP8**（703.7 GiB，MoE + MLA + DSA + MTP）：组 A 主力。单节点 8×B200（1536 GiB）可容纳；是 MLA 模型，E4 才有意义；纯 fp8 无 sub-byte 干扰，适合作显存账基线。备选 DeepSeek-V4-Pro（需多节点，暂不作首选）。
+- **DeepSeek-V4-Flash**（148.6 GiB，MoE + MQA + DSA + MTP）：组 B 主力兼 E1/E2 覆盖位。四种机型中最小的 8×H100（640 GiB）也装得下，满足"四台机器同一模型同一 TP"的比值法前提；混合精度权重与 MQA 结构补齐两条分支。
+- **Qwen3-32B**（61 GiB，Dense + GQA，bf16，无 MTP）：覆盖工具最"普通"的路径——dense、GQA、无量化、无 MTP、无 DSA。体积小、启动快，适合 E3 抽查与 roofline 第二模型，成本几乎可忽略。
+- **nvidia/GLM-5.2-NVFP4**：仅参与 E1，专门覆盖 fp4 sub-byte 打包还原这条最容易出错的权重路径（需 B 系列 GPU 支持 fp4 kernel）。
+
+> 注意：组 A 的"开启 MTP"前提仅适用于**有 MTP 的模型**；Qwen3-32B 无 MTP，无此开关，工具口径同样不含 MTP，两边天然一致。
+
+### 1. 公共约定
+
+- **环境记录**：每次实验记录 sglang 版本（commit）、CUDA / driver 版本、机型、工具 commit。同一实验的所有对照组必须使用同一 sglang 版本。
+- **工具基准值先行**：每个实验开始前，先用工具按实验参数（模型 / TP / context / 并发 / kv-dtype / dp-attention）生成预测值并记入该实验的 `expected.md`，实测后不回改——避免"先看实测再对预测"。
+- **目录规范**：每个实验一个子目录 `validate_experiments/E<N>_<slug>/`，内含：
+	- `expected.md`——工具预测值 + 生成命令
+	- `runs.csv`——每次启动/压测一行（参数 + 采集字段 + 计算结果）
+	- `logs/`——原始启动日志与 bench_serving 输出
+	- `conclusion.md`——判定结论与偏差分析
+- **组 A 公共启动参数**：纯 TP（`--tp 8`，不开 `--enable-dp-attention`、不开 EP）、开启 MTP speculative decoding、`--disable-cuda-graph`、固定 `--max-running-requests`（全组统一一个值）。
+- **组 B 公共启动参数**：关闭 speculative decoding、`--chunked-prefill-size 8192`、四台机器完全相同的启动命令（机型无关部分）。
+
+### 2. 实验组 A：显存类（开 MTP）
+
+#### E1 权重总量对账
+
+- **目的**：验证工具并行 TAB 的每卡 weights 数（`sliced/TP + replicated` 口径）与实际加载一致。
+- **配置**：组 A 公共参数，默认 `--mem-fraction-static`。
+- **采集**：启动日志 `Load weight begin` 与 `Load weight end` 两行的 `avail mem`，差值 = 每卡实测权重。
+- **模型矩阵**（每模型一次启动，四条权重路径各覆盖一条）：
+
+| 模型 | 覆盖的权重路径 | 备注 |
+|---|---|---|
+| GLM-5.2-FP8 | 纯 fp8 | 基线；与 E2/E3 共用启动 |
+| nvidia/GLM-5.2-NVFP4 | fp4 sub-byte 打包（÷2 还原 + scale） | 与 FP8 版同结构，两者每卡权重之差还可交叉验证量化压缩比 |
+| DeepSeek-V4-Flash | fp4 + fp8 混合精度 | 逐部件不同 dtype，工具最复杂的识别路径 |
+| Qwen3-32B | bf16 dense、无 MTP | 最简路径，兜底对照 |
+
+- **判定**：每个模型独立判定，`|实测 − 工具每卡 weights| / 工具值 ≤ 2%`。1–2% 内视为通过；>2% 优先排查运行时 dtype 转换（fp8→bf16 上转、在线量化）与组件漏算。
+
+#### E2 KV cell size 对账（与 E1 共用启动，零额外成本）
+
+- **目的**：验证每 token KV 字节数（cell size），即 KV 公式中唯一有信息量的量。
+- **采集**：同一份启动日志（或 `/get_server_info`）中的 KV pool 总字节数与 `max_total_num_tokens`。
+- **计算**：`实测 cell size = KV pool 字节数 ÷ max_total_num_tokens`。
+- **模型矩阵**（三种 KV 结构判定分支各覆盖一条，全部来自 E1 已有启动）：
+
+| 模型 | KV 结构分支 | 理论 cell size 构成 |
+|---|---|---|
+| GLM-5.2-FP8 | MLA | `(kv_lora_rank 512 + rope 64) × 层数`，开 MTP +1 层 |
+| DeepSeek-V4-Flash | MQA（GQA-1） | `2 × 1 × head_dim × 层数`，开 MTP +1 层 |
+| Qwen3-32B | GQA-8 | `2 × 8 × head_dim × 层数`，无 MTP |
+
+- **判定**：每模型独立与工具理论值对账，容差 1%。
+- **dtype 矩阵**：`--kv-cache-dtype` ∈ {fp8, bf16} 各一次（GLM 的 bf16 轮可与 E3 共用启动；注意 DSA 模型 auto → fp8，需显式指定才能测 bf16——若 sglang 拒绝非 fp8 则记录该约束并跳过）。
+
+#### E3 显存账闭合
+
+- **目的**：验证给定 context × 并发 × kv-dtype 下，工具的整本显存账（权重 + KV + 固定开销 + 剩余）闭合。
+- **方法**（每个矩阵格两次启动）：
+	1. 首次启动用默认 `--mem-fraction-static`，记录实际 `max_total_num_tokens`（记 T₀）与所用 fraction（记 f₀）。
+	2. 目标 `T* = context × 并发`，按线性关系外推：`f₁ = f₀ + (T* − T₀) × cell_size ÷ 单卡总显存`。
+	3. 用 f₁ 二次启动，确认 `max_total_num_tokens` 落在 T* 的 ±1–2% 内；对账一律用**日志实际值**而非目标值。
+	4. 记录初始化完成后的 `avail mem` 作为实测剩余显存。
+- **判定**：`实测剩余显存 ≈ 工具剩余值`，容差 GiB 量级（≤2 GiB）。若所有矩阵格出现**同号系统性偏差**，用该偏差反推工具"固定开销 1 GiB"参数的真实值（`--fixed-overhead-gib`），并在 conclusion 中给出建议默认值。
+- **矩阵**：GLM-5.2-FP8 跑全矩阵（2×2×2 = 8 格，约 16 次启动）；Qwen3-32B 抽查 2 格（context 64K × 并发 {16, 64} × bf16）——验证闭合逻辑对 GQA / dense / 无 MTP 路径同样成立，且其体积小、剩余显存大，对"固定开销"的相对敏感度更高。
+
+| 维度 | 取值（GLM 全矩阵） |
+|---|---|
+| context | 12K、64K |
+| 并发 | 16、64 |
+| kv-cache-dtype | fp8、bf16 |
+
+#### E4 dp-attention 显存变化
+
+- **目的**：验证工具 dp-attention 模式下的两个预测——每卡权重增量（代价）与集群 KV 容量提升（收益），并做三量闭合。
+- **配置**：同一模型同一节点两次启动，**相同 `--mem-fraction-static`**：
+	- 启动 ①（纯 TP）：`--tp 8`
+	- 启动 ②（DP attention）：`--tp 8 --dp 8 --enable-dp-attention`
+- **采集**：两次启动各自的每卡权重（`avail mem` 差值法）W₁ / W₂，`max_total_num_tokens` K₁ / K₂（注意语义：K₁ 是全局池子，K₂ 是**每个 DP rank 自己的池子**）。
+- **判定**（三条独立检查）：
+	1. **权重增量**：`W₂ − W₁ ≈ 工具两种模式每卡 weights 之差`（差分对账，免疫共同系统偏差），容差取增量的 5% 或 0.5 GiB 取大者。
+	2. **容量比**：`8 × K₂ ÷ K₁` 应略小于 8（缺口 = 权重复制侵占的 pool 预算）。
+	3. **闭合校验**：`K₁ × 8 − 8 × K₂ ≈ 8 × (W₂ − W₁) ÷ cell_size`，三个量全部来自日志，账应对圆。
+- **可选 sanity check**：以等长请求打满两种部署，确认 DP 模式下实际可同时容纳的 token 数确实 ≈ 8 × K₂。
+
+### 3. 实验组 B：Roofline 类（关 MTP）
+
+四台机器（B300 / B200 / H200 / H100）各部署，`--tp 8`、同一 checkpoint、同一启动命令，E5 与 E6 复用同一部署、只跑不同 bench。**不可 B 系列用 fp4、H 系列用 fp8**。
+
+**两个模型各跑一轮**，覆盖工具 roofline 的两条 attention 访问模式分支：
+
+| 模型 | 分支 | 预期差异 |
+|---|---|---|
+| DeepSeek-V4-Flash（fp8） | DSA top-k：decode 读取封顶 `min(context, index_topk)`，prefill capped pairs | 长 prompt 下 TTFT 趋回线性 |
+| Qwen3-32B（bf16） | dense attention：decode 全 context，prefill causal pairs T(T+1)/2 | 长 prompt 下 TTFT 超线性；比值用 bf16 算力（H100/H200 989、B200 2250） |
+
+注意：Qwen3-32B 是 bf16 权重，其 prefill 比值预期按 **bf16 峰值算力**计算（B200/H200 = 2250/989 ≈ 2.27，恰与 fp8 比值相同——同代架构 fp8:bf16 均为 2:1）；decode 带宽比值与 dtype 无关，两模型预期一致，互为复核。
+
+#### E5 Decode roofline（TPOT ∝ 1/带宽）
+
+- **目的**：验证 decode 是 memory-bound、跨机型 TPOT 比值等于带宽反比。
+- **压测**：`sglang.bench_serving`，并发 = 1，固定 input 8192 / output 512，重复 3 次取中位数 TPOT（ITL 作旁证）。
+- **判定**（比值法，容差 ±10%）：
+
+| 比值 | 预期（带宽反比） | 性质 |
+|---|---|---|
+| TPOT(H200) / TPOT(B200) | ≈ 1.67 | 主验证 |
+| TPOT(H100) / TPOT(H200) | ≈ 1.43 | 主验证 |
+| TPOT(H100) / TPOT(B200) | ≈ 2.39 | 链条一致性 |
+| TPOT(B300) / TPOT(B200) | ≈ 1.0 | **控制组（证伪）**：带宽同、fp4 算力差 50%；若 B300 明显更快 ⇒ decode 非 memory-bound，判定推翻 |
+
+- **旁证（不作判定）**：各机型 `实测 TPOT ÷ 工具理论 step 时间`，预期落在 1.4–2.0×（对应 50–70% 效率），四台机器该系数应接近——这正是比值法能消掉公因子的前提自检。
+
+#### E6 Prefill roofline（TTFT ∝ 1/算力）
+
+- **目的**：验证 prefill 是 compute-bound、跨机型 TTFT 比值等于峰值 FLOPS 反比。
+- **压测**：单条请求（并发 = 1，逐条发送），prompt 长度 ∈ {8192, 16384, 32768, 65536, 131072}（8192 的整数倍，对齐 chunked-prefill 口径），每个长度重复 3 次取中位数 TTFT。
+- **判定**（每个长度独立算比值，容差 ±10%）：
+
+| 比值 | 预期（fp8 算力反比） | 性质 |
+|---|---|---|
+| TTFT(H200) / TTFT(B200) | ≈ 4500/1979 ≈ 2.27 | 主验证 |
+| TTFT(H100) / TTFT(H200) | ≈ 1.0 | **控制组（证伪）**：算力同（1979 fp8）、带宽差 1.43×；若 H200 明显更快 ⇒ prefill 非 compute-bound，判定推翻 |
+
+- **形状对账**：同一机型上 TTFT vs prompt 长度的曲线与工具对各长度的预测序列对形状（GEMM 线性项 + causal pairs 二次项；DSA top-k 封顶后趋回线性），不假设纯线性。
+
+### 4. 执行顺序与成本估算
+
+1. **E1 + E2**（4 个模型各一次启动，权重与 cell size 一并采集）→ 这两个量是后面所有账的基础，先钉死。
+2. **E3**（GLM 全矩阵约 16 次启动 + Qwen 抽查 4 次，可基于 CC 自动化：改参数 → 重启 → 抓日志 → 填 runs.csv）。
+3. **E4**（2 次启动 + 可选打满测试）。
+4. **E5 + E6**（切换到组 B 部署：4 台机器 × 2 模型 × 1 次部署，每个部署跑 decode bench 3 次 + prefill 5 长度 × 3 次）。
+
+失败处理约定：任一判定不通过时，先在 conclusion.md 记录偏差与排查结论，再决定是修工具（公式/参数）还是修实验口径；**不回改 expected.md**。
