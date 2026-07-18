@@ -12,21 +12,22 @@
 		 - **对账前提**：纯 TP（不开 `--enable-dp-attention`、不开 EP），差值只取权重加载段（不含 CUDA graph 与常驻 buffer）；部署时**开启 MTP speculative decoding**——SGLang 只在开 MTP 时才加载 MTP 权重，开启后实测与工具静态总量（含 MTP）口径一致，无需扣减。
 		 - **对账基准**：用工具并行 TAB 的每卡 weights 数，**不是**总量 ÷ TP——纯 TP 下也有每卡复制的部分（MLA 的 kv_a/rope 投影、norm、DSA indexer 等），工具公式为 `sliced/TP + replicated`。
 		 - **判定标准**：允许 **1–2% 的误差**（allocator 保留粒度、TP 不整除 padding、fp8 scale 等零碎）；超过 2% 视为真实偏差（优先排查运行时 dtype 转换或组件漏算）。
-	 - 针对 kv cache，验证 **cell size（每 token 每 layer 的 KV 字节数 × 层数，即每 token 的 KV 占用）**，而不是验证某个总 GiB 数。原因：
-		 - SGLang 的 KV pool 是供给侧驱动的——启动时把 `mem_fraction_static` 扣除权重后的剩余显存全部预分配给 KV pool，其大小与工作负载（context/并发）无关；而工具算的 `context × requests × cell` 是需求侧的最坏情况上界。两者语义不同，直接对总数没有意义。
-		 - cell size 是这条公式里唯一有信息量的待验证量，总 GiB 只是它乘以 token 数的线性函数（恒等式，无需验证）。
+	 - 针对 kv cache，分两层验证：先验证 **cell size（每 token 每 layer 的 KV 字节数 × 层数，即每 token 的 KV 占用）**，再验证**池子总量**。
+		 - SGLang 的 KV pool 是供给侧驱动的——启动时把 `mem_fraction_static` 扣除权重后的剩余显存全部预分配给 KV pool，其大小与工作负载（context/并发）无关。工具的并行 TAB 同时建模两侧：需求侧 `context × requests × cell`（利用率条的分子），供给侧 `frac × 单卡显存 − 固定开销 − weights`（KV 池容量，即 `max_total_num_tokens × cell`）。供给侧池子总量是工具的直接预测值，其对账即 E3 的主验证目标。
+		 - cell size 是需求/供给换算中唯一的原子量（池子字节 ↔ token 数的汇率），单独先验证；池子总量的偏差才能归因到 weights / 固定开销 / frac 三个成分上。
 		 - 实测方法：从启动日志 / `/get_server_info` 读取 KV pool 字节数与 `max_total_num_tokens`，`实测 cell size = KV pool 字节数 ÷ max_total_num_tokens`，与工具理论值对账（例：DeepSeek-V4-Pro fp8 = (512+64) × 61 层 ≈ 61 KiB/token）。无需修改 sglang 代码。
 		 - 注意口径：开启 MTP speculative decoding 时 cell size 会多一层；kv-cache-dtype 需两边对齐。
  - 并行切分部分 （可以基于 CC 进行自动化实验）
-	 - 验证不同的 context window、并发池子大小、kv-cache-dtype 组合下，工具的整本显存账是否闭合。方法：**调节 `--mem-fraction-static`，使日志中的 `max_total_num_tokens ≈ context × 并发数**（即把 KV pool 钉在工具计算的 KV 需求上），此时验证 **剩余显存 ≈ 工具计算的剩余值**。注意 SGLang 对 `--max-total-tokens` 是 min 钳制而非照单分配，所以不通过触发 OOM 来验证，而是做显存账闭合对账。口径约定：
-		 - **两个旋钮角色不同**：`--mem-fraction-static` 是细调旋钮（对 token 数单调线性，先跑一次按比例外推，两次启动即可落点）；`kv-cache-dtype` 改变 cell size 本身，作为实验矩阵的独立维度（fp8 / bf16 各验一轮），不作调节用，每轮两边口径一致。
-		 - **"≈" 的容差**：`max_total_num_tokens` 落点允许 ±1–2%；对账时用日志中实际生效值计算，不用目标值。
-		 - **启动参数固定 `--disable-cuda-graph`**：排除 CUDA graph 缓冲这个工具未建模的最大扰动项；同时固定 `max_running_requests`，控制 `req_to_token_pool` 等随并发上限增长的开销。剩余显存的偏差容忍度比权重对账松（GiB 量级），系统性偏差可反推工具"固定开销 1 GiB"参数的真实值。
+	 - 验证不同 kv-cache-dtype × mem-fraction-static 组合下，工具的整本显存账是否闭合。方法：**直接对账**——固定 `--mem-fraction-static` 启动（如默认 0.9），从日志读实测 `max_total_num_tokens`，与工具并行 TAB 同一 frac 下预测的池容量 tokens 对账（工具供给侧公式：`池 tokens = (frac × 单卡显存 − 固定开销 − weights) ÷ cell size`）。口径约定：
+		 - **两个旋钮角色不同**：`--mem-fraction-static` 是工具滑块与启动参数两边显式对齐的自变量（可作为矩阵维度取多值，验证线性关系）；`kv-cache-dtype` 改变 cell size 本身，作为独立维度（fp8 / bf16 各验一轮），每轮两边口径一致。
+		 - **对账用日志实际值**：`max_total_num_tokens` 与 KV pool 字节数均取日志/`/get_server_info` 实际值。注意若显式传了 `--max-total-tokens`，SGLang 取 min 钳制，会破坏"池子填满静态区"的前提——本实验不传该参数。
+		 - **启动参数固定 `--disable-cuda-graph`**：池子在 graph 捕获前分配，`max_total_num_tokens` 理论上不受影响，但剩余显存对账（第二观测量）会被扰动，关掉更干净；同时固定 `max_running_requests`，控制 `req_to_token_pool` 等随并发上限增长的开销。
+		 - **固定开销反推**：对账方程 `实测池 tokens = (frac × cap − fixed − weights) ÷ cell` 中，frac 是显式启动参数、weights 由 E1 钉死、cell 由 E2 钉死，**唯一未知数是 fixed**——每个矩阵格可独立解出一个 fixed 值，各格应一致。
 	 - 验证开启 `--enable-dp-attention` 后的显存变化（MLA 模型）。原理：MLA 的 latent KV 无 head 维，纯 TP 下每卡整份复制；开 DP 后 attention 改为数据并行，各 rank 只存自己请求的 KV（每卡 1/TP），代价是 attention 权重每卡整份复制。同一模型同一 TP 开/关各跑一次，验证两个观测量并互相闭合：
 		 - **观测量 1（代价）：每卡权重增量**。复用权重对账方法（`avail mem` 差值），开/关的每卡权重之差应等于工具并行 TAB 两种模式下每卡 weights 之差（差分对账，免疫共同的系统偏差）。
 		 - **观测量 2（收益）：集群有效 KV 容量比值 ≈ TP**。注意语义变化：开 DP 后 `max_total_num_tokens` 是**每个 DP rank 自己池子**的容量，集群容量 = TP × 每 rank 值；纯 TP 下（KV 复制）集群容量 = max_total_num_tokens 本身。比值应略小于 TP，缺口正是权重复制侵占的 pool 预算。
 		 - **闭合校验**：`纯TP容量 × TP − DP集群容量 ≈ TP × 每卡权重增量 ÷ cell size`，三个量均来自日志，账应对圆。
-		 - 实验条件：显式 `--tp N --dp N`（SGLang 要求 dp=tp）；沿用"钉 pool"法时每 rank 目标为 `context × 并发 ÷ TP`；若做打满请求的 sanity check 需用等长请求（调度按负载分发，长度悬殊时某 rank 会先满）。
+		 - 实验条件：显式 `--tp N --dp N`（SGLang 要求 dp=tp），两次启动用相同 `--mem-fraction-static`；若做打满请求的 sanity check 需用等长请求（调度按负载分发，长度悬殊时某 rank 会先满）。
  - 性能 Roofline
 	 - 验证 decode 与带宽成正比（memory-bound 斜率）。并发 = 1，**不需要 PD 分离**：单请求下 prefill 只发生一次，用 `sglang.bench_serving` 直接测 **TPOT/ITL（逐 token 延迟）**即为纯 decode step 时间，天然扣除了 TTFT。
 		 - **测比值而非绝对值**：实测吞吐通常只有理论上界的 50–70%（kernel 效率、通信开销），绝对值必然对不上；跨机型 TPOT 比值可将 kernel 效率损失作为公因子消掉。机型选 **B300 / B200 / H200 / H100**，理论带宽比值链：B200/H200 ≈ 1.67、H200/H100 ≈ 1.43、B200/H100 ≈ 2.39，实测 TPOT 比值应与之一致。
@@ -54,7 +55,7 @@
 |---|---|---|---|---|---|
 | E1 | 权重总量对账 | 每卡 weights 字节 | A（开 MTP） | 8×B200 | 4 个（见覆盖矩阵） |
 | E2 | KV cell size 对账 | 每 token KV 字节 | A（与 E1 共用启动） | 8×B200 | 3 个（见覆盖矩阵） |
-| E3 | 显存账闭合 | 剩余显存 / 固定开销 | A（开 MTP） | 8×B200 | GLM-5.2-FP8 全矩阵 + Qwen3-32B 抽查 |
+| E3 | 显存账闭合 | KV 池容量（max_total_num_tokens）/ 固定开销 | A（开 MTP） | 8×B200 | GLM-5.2-FP8 全矩阵 + Qwen3-32B 抽查 |
 | E4 | dp-attention 显存变化 | 权重增量 + KV 容量比 | A（开 MTP） | 8×B200 | GLM-5.2-FP8（MLA 专属） |
 | E5 | Decode roofline | TPOT ∝ 1/带宽 | B（关 MTP） | B300 / B200 / H200 / H100 各一台 | DeepSeek-V4-Flash + Qwen3-32B |
 | E6 | Prefill roofline | TTFT ∝ 1/算力 | B（与 E5 共用部署） | 同 E5 | 同 E5 |
@@ -85,7 +86,8 @@
 ### 1. 公共约定
 
 - **环境记录**：每次实验记录 sglang 版本（commit）、CUDA / driver 版本、机型、工具 commit。同一实验的所有对照组必须使用同一 sglang 版本。
-- **工具基准值先行**：每个实验开始前，先用工具按实验参数（模型 / TP / context / 并发 / kv-dtype / dp-attention）生成预测值并记入该实验的 `expected.md`，实测后不回改——避免"先看实测再对预测"。
+- **工具基准值先行**：每个实验开始前，先用工具按实验参数（模型 / TP / context / 并发 / kv-dtype / dp-attention / **mem-fraction-static**）生成预测值并记入该实验的 `expected.md`，实测后不回改——避免"先看实测再对预测"。`--mem-fraction-static` 必须与实测启动参数严格一致，`runs.csv` 增加 frac 列。
+- **工具口径**：并行 TAB 为供给侧口径——KV 显示池容量而非需求，**不含乘性碎片项**，固定开销 1 GiB 为独立显式项。expected.md 中记录工具 commit，确保口径可追溯。
 - **目录规范**：每个实验一个子目录 `validate_experiments/E<N>_<slug>/`，内含：
 	- `expected.md`——工具预测值 + 生成命令
 	- `runs.csv`——每次启动/压测一行（参数 + 采集字段 + 计算结果）
@@ -128,22 +130,26 @@
 - **判定**：每模型独立与工具理论值对账，容差 1%。
 - **dtype 矩阵**：`--kv-cache-dtype` ∈ {fp8, bf16} 各一次（GLM 的 bf16 轮可与 E3 共用启动；注意 DSA 模型 auto → fp8，需显式指定才能测 bf16——若 sglang 拒绝非 fp8 则记录该约束并跳过）。
 
-#### E3 显存账闭合
+#### E3 显存账闭合（KV 池容量直接对账）
 
-- **目的**：验证给定 context × 并发 × kv-dtype 下，工具的整本显存账（权重 + KV + 固定开销 + 剩余）闭合。
-- **方法**（每个矩阵格两次启动）：
-	1. 首次启动用默认 `--mem-fraction-static`，记录实际 `max_total_num_tokens`（记 T₀）与所用 fraction（记 f₀）。
-	2. 目标 `T* = context × 并发`，按线性关系外推：`f₁ = f₀ + (T* − T₀) × cell_size ÷ 单卡总显存`。
-	3. 用 f₁ 二次启动，确认 `max_total_num_tokens` 落在 T* 的 ±1–2% 内；对账一律用**日志实际值**而非目标值。
-	4. 记录初始化完成后的 `avail mem` 作为实测剩余显存。
-- **判定**：`实测剩余显存 ≈ 工具剩余值`，容差 GiB 量级（≤2 GiB）。若所有矩阵格出现**同号系统性偏差**，用该偏差反推工具"固定开销 1 GiB"参数的真实值（`--fixed-overhead-gib`），并在 conclusion 中给出建议默认值。
-- **矩阵**：GLM-5.2-FP8 跑全矩阵（2×2×2 = 8 格，约 16 次启动）；Qwen3-32B 抽查 2 格（context 64K × 并发 {16, 64} × bf16）——验证闭合逻辑对 GQA / dense / 无 MTP 路径同样成立，且其体积小、剩余显存大，对"固定开销"的相对敏感度更高。
+- **目的**：验证给定 mem-fraction-static × kv-dtype 下，工具供给侧预测（KV 池容量 = `max_total_num_tokens`）与实际一致，即整本显存账（权重 + 固定开销 + KV 池 + 非静态区）闭合。
+- **方法**（每个矩阵格**一次启动**）：
+	1. 固定 `--mem-fraction-static` 启动（矩阵取值见下），不传 `--max-total-tokens`。
+	2. 从日志/`/get_server_info` 读实测 `max_total_num_tokens` 与 KV pool 字节数。
+	3. 工具并行 TAB 滑块调到同一 frac，读预测池容量 tokens（工具公式：`(frac × cap − fixed − weights) ÷ cell`）。
+	4. 另记录初始化完成后的 `avail mem` 作为实测剩余显存（第二观测量，对账工具非静态区余量）。
+- **判定**：
+	1. **主判定**：`|实测 max_total_num_tokens − 工具预测| / 预测 ≤ 2%`。
+	2. **固定开销反推**：每格用 `fixed = frac × cap − weights − 实测池 tokens × cell` 独立解出 fixed（weights 取 E1 实测、cell 取 E2 实测），各格结果应一致；若稳定偏离 1 GiB，在 conclusion 中给出 `--fixed-overhead-gib` 建议默认值。
+	3. **旁证**：实测剩余显存 ≈ 工具非静态区余量（cap − used），容差 GiB 量级（≤2 GiB，受 workspace 等未建模项扰动，不作主判定）。
+- **矩阵**：GLM-5.2-FP8 跑全矩阵（2×2 = 4 格，4 次启动）；Qwen3-32B 抽查 2 格（frac {0.85, 0.9} × bf16）——验证闭合逻辑对 GQA / dense / 无 MTP 路径同样成立，且其权重小、池子大，对"固定开销"的相对敏感度更高。frac 取两值也顺带验证了池容量对 frac 的线性关系（斜率应 = cap ÷ cell）。
 
 | 维度 | 取值（GLM 全矩阵） |
 |---|---|
-| context | 12K、64K |
-| 并发 | 16、64 |
+| mem-fraction-static | 0.85、0.90 |
 | kv-cache-dtype | fp8、bf16 |
+
+> 无需 context × 并发的需求侧实测矩阵——需求只是 `ctx × req × cell` 的恒等式，cell 已由 E2 验证。
 
 #### E4 dp-attention 显存变化
 
@@ -154,8 +160,8 @@
 - **采集**：两次启动各自的每卡权重（`avail mem` 差值法）W₁ / W₂，`max_total_num_tokens` K₁ / K₂（注意语义：K₁ 是全局池子，K₂ 是**每个 DP rank 自己的池子**）。
 - **判定**（三条独立检查）：
 	1. **权重增量**：`W₂ − W₁ ≈ 工具两种模式每卡 weights 之差`（差分对账，免疫共同系统偏差），容差取增量的 5% 或 0.5 GiB 取大者。
-	2. **容量比**：`8 × K₂ ÷ K₁` 应略小于 8（缺口 = 权重复制侵占的 pool 预算）。
-	3. **闭合校验**：`K₁ × 8 − 8 × K₂ ≈ 8 × (W₂ − W₁) ÷ cell_size`，三个量全部来自日志，账应对圆。
+	2. **每 rank 池容量**：K₂ 直接与工具 DP 模式下同一 frac 的预测池容量对账（`(frac × cap − fixed − W₂预测) ÷ cell`），容差 2%；K₁ 同理与纯 TP 模式预测对账。旁证：`8 × K₂ ÷ K₁` 应略小于 8，缺口 = 权重复制侵占的 pool 预算。
+	3. **闭合校验**：`K₁ × 8 − 8 × K₂ ≈ 8 × (W₂ − W₁) ÷ cell_size`，三个量全部来自日志，账应对圆（此条不依赖工具，纯实测自洽）。
 - **可选 sanity check**：以等长请求打满两种部署，确认 DP 模式下实际可同时容纳的 token 数确实 ≈ 8 × K₂。
 
 ### 3. 实验组 B：Roofline 类（关 MTP）
@@ -202,7 +208,7 @@
 ### 4. 执行顺序与成本估算
 
 1. **E1 + E2**（4 个模型各一次启动，权重与 cell size 一并采集）→ 这两个量是后面所有账的基础，先钉死。
-2. **E3**（GLM 全矩阵约 16 次启动 + Qwen 抽查 4 次，可基于 CC 自动化：改参数 → 重启 → 抓日志 → 填 runs.csv）。
+2. **E3**（GLM 全矩阵 4 次启动 + Qwen 抽查 2 次，每格一次启动，可基于 CC 自动化：改参数 → 重启 → 抓日志 → 填 runs.csv）。
 3. **E4**（2 次启动 + 可选打满测试）。
 4. **E5 + E6**（切换到组 B 部署：4 台机器 × 2 模型 × 1 次部署，每个部署跑 decode bench 3 次 + prefill 5 长度 × 3 次）。
 

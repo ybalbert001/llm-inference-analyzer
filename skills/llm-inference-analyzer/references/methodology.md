@@ -107,7 +107,7 @@ python3 main.py Qwen/Qwen3-32B --tp 4 --instance p5.48xlarge --html qwen.html   
 
 ## 一B、并行切分可视化（并行 TAB，design_2）
 
-把模型权重与 GPU 节点硬件结合，可视化 TP/PP/EP 并行下每张卡分到哪些部件、占多少显存、剩多少给 KV。页面内所有并行参数（TP/PP/EP、机型、context、并发、KV 精度、DP attention）实时切换重算；显存条色块 hover 显示各部件占用明细。CLI 的 `--tp/--pp/--ep/--instance/--fixed-overhead-gib/--tp-options/--pp-options` 设定初始值。
+把模型权重与 GPU 节点硬件结合，可视化 TP/PP/EP 并行下每张卡分到哪些部件、占多少显存、剩多少给 KV。页面内所有并行参数（TP/PP/EP、机型、context、并发、KV 精度、DP attention、mem-fraction-static）实时切换重算；显存条色块 hover 显示各部件占用明细。CLI 的 `--tp/--pp/--ep/--instance/--fixed-overhead-gib/--mem-fraction-static/--tp-options/--pp-options` 设定初始值。
 
 ### 切分口径（对齐 SGLang/vLLM 语义）
 
@@ -123,7 +123,7 @@ python3 main.py Qwen/Qwen3-32B --tp 4 --instance p5.48xlarge --html qwen.html   
 - GQA/MHA：按 kv head 切，每卡 1/min(TP, n_kv_heads)；TP 超过 kv_heads 后不再下降、开始复制（Qwen3-32B 8 kv heads 在 TP16 时每卡 KV = 总量/8）
 - **MLA：latent 无 head 维，纯 TP 下每卡全量复制**（GLM-5.2 128K×16 并发 fp8 ≈ 137 GiB/卡，直接 OOM）。页面提供 **DP attention** 开关（对齐 SGLang `--enable-dp-attention`）：开启后 KV 按 TP 切 1/TP，代价是 attention 权重每卡整份复制——attention 小 KV 大，通常划算。这一对比是该图的核心演示场景。
 
-**其他**：每卡固定开销默认 1 GiB（CUDA context/NCCL buffer，`--fixed-overhead-gib` 可调）+ 碎片 5%（与 design_1 一致）；activation 近似按 1/TP。
+**KV 容量口径（对齐 SGLang `--mem-fraction-static`）**：每卡显存按 mem-fraction-static（滑块，默认 0.9）分为静态区与非静态区。静态区 = 权重 + 每卡固定开销（默认 1 GiB，`--fixed-overhead-gib` 可调）+ **KV 池**——KV 池自动填满静态区剩余空间（`frac × cap − fixed − weights`），与 SGLang 启动时的预分配行为一致，显存条显示的即真实占用（可与 `nvidia-smi` 对账）。activation（近似按 1/TP）与 CUDA graph 落在非静态区。每卡另有 KV 利用率条：**KV 需求**（`ctx × 并发 × cell size` 按切分口径折算到每卡）÷ **KV 池容量**，>100% 标红表示该并发跑不满；并给出该容量支持的最大并发反推值。权重放不下静态区时显示"无法启动"。本 TAB 不再使用 design_1 的乘性碎片 5%——非静态区本身就是余量，再乘会重复扣减。
 
 ### GPU 机型
 

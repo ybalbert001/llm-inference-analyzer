@@ -130,6 +130,7 @@ MSG = {
     "html.lbl_kv": {"zh": "KV cache 精度", "en": "KV cache dtype"},
     "html.lbl_dp": {"zh": "DP attention（KV 切 TP，attention 权重复制）", "en": "DP attention (KV split by TP, attention weights replicated)"},
     "html.lbl_inst": {"zh": "机型", "en": "instance"},
+    "html.lbl_frac": {"zh": "mem-fraction-static", "en": "mem-fraction-static"},
     "html.lbl_custom_mem": {"zh": "单卡", "en": "per GPU"},
     "html.lbl_custom_gpn": {"zh": "每节点", "en": "per node"},
     "html.lbl_custom_cards": {"zh": "卡", "en": "GPUs"},

@@ -78,6 +78,7 @@ Lead with the bottom line — total GiB, and if the user named hardware, whether
 - **Fit checks are per-GPU, not just total.** For "does it run on N × GPU?", use the parallel tab's per-GPU numbers rather than dividing the grand total by N: MLA models replicate KV across TP ranks (can OOM even when the total "fits" — the DP-attention toggle is the fix), and GQA KV stops shrinking once TP exceeds the KV-head count.
 - **Roofline numbers are upper bounds.** Decode tokens/s assumes perfect overlap and no NCCL cost — real systems hit 50–70%. Say "theoretical upper bound", not "expected throughput". The memory-bound/compute-bound verdict and the "concurrency is free up to ~N" knee-point guidance are the robust takeaways.
 - **Not in the total**: per-GPU fixed overhead beyond the default 1 GiB assumption and multi-GPU comm buffers can vary. Mention this when the fit is tight.
+- **Parallel tab KV is capacity, not demand.** The membar shows the SGLang-style pre-allocated KV pool (`mem-fraction-static × cap − fixed − weights`), matching what `nvidia-smi` reports on a live server. The per-GPU utilization bar (KV demand ÷ pool capacity) is the fit verdict: >100% means the requested context × concurrency doesn't fit — quote the "max concurrency ≈ N" readout.
 - Models with built-in KV compression configs (`compress_ratios`, `sliding_window` on sparse-attention models) may use less KV than reported — the script computes the no-compression upper bound.
 
 ## When something breaks or looks wrong

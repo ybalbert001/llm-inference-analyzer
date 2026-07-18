@@ -39,6 +39,8 @@
   .filters select, .filters input[type=number] { font:inherit; color:var(--ink); background:var(--page);
     border:1px solid var(--grid); border-radius:6px; padding:4px 8px }
   .filters input[type=number] { width:72px }
+  .filters input[type=range] { width:90px; accent-color:var(--ink); padding:0 }
+  #f-frac-val { font-variant-numeric:tabular-nums; color:var(--ink); font-size:12.5px }
   .fnote { color:var(--muted); font-size:12px; margin-left:auto }
   body:not(.tab-parallel) .pf { display:none !important }
   body:not(.tab-parallel):not(.tab-roofline) .pfi { display:none !important }
@@ -130,8 +132,10 @@
   .gpu-mem b { color:var(--ink) }
   .oombadge { background:var(--s6); color:#fff; font-size:11px; border-radius:4px;
     padding:1px 6px; margin-left:auto }
-  .membar { display:flex; gap:2px; height:20px; border-radius:4px; overflow:hidden;
-    background:var(--surface); border:1px solid var(--grid) }
+  .membar { display:flex; gap:2px; height:20px; border-radius:4px;
+    background:var(--surface); border:1px solid var(--grid); position:relative }
+  .membar .fracline { position:absolute; top:-7px; bottom:-7px; width:4px; margin-left:-2px;
+    border-left:2px dashed var(--ink); opacity:.6 }
   .membar .seg { min-width:2px }
   .membar .seg:hover, .membar .free:hover { outline:2px solid var(--ink); outline-offset:-2px }
   .membar .free { display:flex; align-items:center; justify-content:center;
@@ -139,6 +143,22 @@
     background:repeating-linear-gradient(45deg,transparent,transparent 5px,var(--grid) 5px,var(--grid) 6px) }
   .gpu-line { color:var(--ink2); font-size:11.5px; margin-top:6px }
   .gpu-line b { color:var(--ink) }
+  /* KV demand ÷ capacity bullet chart: light capacity zone + thick capacity
+     tick + dark demand fill; overflow past the tick is red */
+  .kvutil { display:flex; align-items:center; gap:8px; margin-top:6px }
+  .kvutil-lb { font-size:10.5px; color:var(--muted); white-space:nowrap }
+  .kvutil-track { flex:1; height:13px; border-radius:4px; background:var(--surface);
+    border:1px solid var(--grid); position:relative; overflow:hidden }
+  .kvutil-capzone { position:absolute; left:0; top:0; height:100%;
+    background:color-mix(in srgb, var(--s5) 18%, transparent) }
+  .kvutil-fill { position:absolute; left:0; top:2px; height:9px; border-radius:2px;
+    background:var(--s5) }
+  .kvutil-fill.over { background:var(--s6); border-radius:0 2px 2px 0 }
+  .kvutil-capline { position:absolute; top:-1px; bottom:-1px; width:3px; margin-left:-1px;
+    background:var(--ink) }
+  .kvutil-pct { font-size:11px; color:var(--ink2); font-variant-numeric:tabular-nums;
+    min-width:38px; text-align:right }
+  .kvutil-pct.over { color:var(--s6); font-weight:600 }
   .chips { display:flex; gap:5px; flex-wrap:wrap; margin-top:8px; align-items:center }
   .chip { display:inline-flex; border:1px solid var(--grid); border-radius:5px; overflow:hidden;
     font-size:10.5px; line-height:1 }
@@ -231,6 +251,9 @@
     <label class="pf" id="ep-box">EP <select id="f-ep"></select></label>
     <label class="pf" id="dp-box" style="display:none">
       <input type="checkbox" id="f-dp"> <span id="lbl-dp">$lbl_dp</span></label>
+    <label class="pf"><span id="lbl-frac">$lbl_frac</span>
+      <input type="range" id="f-frac" min="0.70" max="0.98" step="0.01" value="$mem_frac_init">
+      <span id="f-frac-val"></span></label>
     <label class="pfi"><span id="lbl-inst">$lbl_inst</span> <select id="f-inst">$instance_options</select></label>
     <span class="pf" id="custom-box">
       <label><span id="lbl-custom-mem">$lbl_custom_mem</span> <input type="number" id="f-cmem" value="141" min="1"> GiB</label>

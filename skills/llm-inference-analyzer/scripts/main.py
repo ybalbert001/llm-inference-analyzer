@@ -1103,6 +1103,7 @@ def _build_lang_fragments(a: dict, cfg: dict, p: dict, is_moe: bool, short: str,
         "lbl_kv": t("html.lbl_kv"),
         "lbl_dp": t("html.lbl_dp"),
         "lbl_inst": t("html.lbl_inst"),
+        "lbl_frac": t("html.lbl_frac"),
         "lbl_custom_mem": t("html.lbl_custom_mem"),
         "lbl_custom_gpn": t("html.lbl_custom_gpn"),
         "lbl_custom_cards": t("html.lbl_custom_cards"),
@@ -1240,6 +1241,7 @@ def render_html(a: dict, out_path: str, ctx_options: list, req_options: list,
         "tp_options": _popts(tp_opts, tp_init),
         "pp_options": _popts(pp_opts, pp_init),
         "ep_init": str(ep_init),
+        "mem_frac_init": f"{pargs.mem_fraction_static if pargs else 0.9:g}",
         "viz_json": viz_json,
     })
 
@@ -1285,6 +1287,10 @@ def main():
                     help="initial AWS instance type (default p5en.48xlarge)")
     ap.add_argument("--fixed-overhead-gib", type=float, default=1.0,
                     help="per-GPU fixed overhead: CUDA context / NCCL buffers (default 1 GiB)")
+    ap.add_argument("--mem-fraction-static", type=float, default=0.9,
+                    help="initial mem-fraction-static for the parallel tab: fraction of GPU "
+                         "memory pre-allocated as weights + KV pool, mirroring SGLang "
+                         "--mem-fraction-static (default 0.9)")
     ap.add_argument("--tp-options", default="1,2,4,8,16,32")
     ap.add_argument("--pp-options", default="1,2,3,4,6,8")
     ap.add_argument("--lang", choices=["zh", "en"], default="zh",

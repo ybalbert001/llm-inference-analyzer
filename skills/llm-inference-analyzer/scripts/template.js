@@ -11,6 +11,12 @@ function setText(id, txt) { var e = el(id); if (e) e.textContent = txt; }
 // fp4 = mxfp4: 0.5 B data + 1 uint8 scale per 16 elements
 function kvBytesPer(dtype) { return dtype === 'fp8' ? 1 : dtype === 'fp4' ? 0.5625 : 2; }
 function ctxLabel(v) { return v % 1048576 === 0 ? (v / 1048576) + 'M' : (v / 1024) + 'K'; }
+// human token count: 1.94M / 317K / 512
+function tokLabel(v) {
+  if (v >= 1048576) return (v / 1048576).toFixed(2) + 'M';
+  if (v >= 1024) return Math.round(v / 1024) + 'K';
+  return String(Math.round(v));
+}
 function kvDtypeNow() {
   var sel = el('f-kv').value;
   return sel === 'auto' ? D.kvAuto : sel;
@@ -37,10 +43,25 @@ var I18N = {
     instLabel: function (inst, count, gpu, memGib) {
       return inst + '（' + count + '×' + gpu + ' ' + memGib + ' GiB）';
     },
-    fragOverhead: function () { return '碎片+固定开销'; },
+    fixedOverhead: function () { return '固定开销（CUDA context/NCCL）'; },
+    kvCapLabel: function () { return 'KV cache 容量'; },
+    fracLineTip: function (frac) { return 'mem-fraction-static = ' + frac + '：左侧为静态区（权重 + KV 池），启动时整体预分配'; },
     gpuPctTip: function (memGib, pct) { return '（占 ' + memGib + ' GiB 卡的 ' + pct + '%）'; },
-    freeTipLabel: function () { return 'free（可再给 KV）'; },
+    freeTipLabel: function () { return '非静态区余量（CUDA graph 等）'; },
     freePct: function (pct) { return '（' + pct + '%）'; },
+    cannotStart: function (gib) { return '静态区放不下权重，差 ' + gib + ' GiB，无法启动'; },
+    kvUtilBarLabel: function () { return 'KV 需求/容量'; },
+    kvUtilTip: function (d, c, pct) {
+      return '<b>KV 需求 ' + d + ' GiB ÷ 池容量 ' + c + ' GiB = ' + pct + '%</b><br>黑色刻度线 = 池容量位置；越过为红色超容';
+    },
+    kvUtilLine: function (d, c, pct, maxTok, ctxLbl, maxReq) {
+      return 'KV 需求 <b>' + d + '</b> / 容量 <b>' + c + '</b> GiB（<b>' + pct + '%</b>）· 池容量 ≈ <b>' +
+        maxTok + '</b> tokens（≈ ' + maxReq + ' 个 ' + ctxLbl + ' 满 context 请求）';
+    },
+    sumCapLine: function (maxTok, ctxLbl, maxReq, frac) {
+      return 'mem-fraction-static ' + frac + ' 下 KV 池容量 ≈ <b>' + maxTok +
+        '</b> tokens（max_total_num_tokens，按瓶颈 stage）≈ ' + maxReq + ' 个 ' + ctxLbl + ' 满 context 请求';
+    },
     pctParen: function (pct) { return '（' + pct + '%）'; },
     layerChipLabel: function (lo, hi, count) { return 'L' + lo + '–L' + hi + ' ×' + count + ' 层'; },
     perLayerFrac: function (tp) { return '，每层 1⁄' + tp; },
@@ -50,7 +71,7 @@ var I18N = {
     warnPpExceeds: function (pp, L) { return 'PP(' + pp + ') 超过层数 ' + L; },
     oomExceeds: function (gib) { return '超出 ' + gib + ' GiB'; },
     gpuLine: function (weights, kv, act, tail) {
-      return '权重 <b>' + weights + '</b> + KV <b>' + kv + '</b> + act ' + act + ' GiB' + tail;
+      return '权重 <b>' + weights + '</b> + KV 池 <b>' + kv + '</b> + act ' + act + ' GiB' + tail;
     },
     freeTail: function (free) { return '，剩 <b>' + free + '</b> GiB'; },
     nodeWarn: function (count) { return '⚠ ' + count + ' 卡显存不足'; },
@@ -76,7 +97,7 @@ var I18N = {
     },
     tableHeader: function () {
       return "<tr><th>GPU</th><th>rank</th><th>层</th>" +
-        "<th class='num'>权重 GiB</th><th class='num'>KV GiB</th><th class='num'>act GiB</th>" +
+        "<th class='num'>权重 GiB</th><th class='num'>KV 容量 GiB</th><th class='num'>KV 需求 GiB</th><th class='num'>act GiB</th>" +
         "<th class='num'>合计 GiB</th><th class='num'>剩余 GiB</th></tr>";
     },
     gemmDecodeNote: function (B) { return '权重每步读一遍，' + B + ' token 共享 → 强度随并发线性涨'; },
@@ -172,10 +193,25 @@ var I18N = {
     instLabel: function (inst, count, gpu, memGib) {
       return inst + ' (' + count + '×' + gpu + ' ' + memGib + ' GiB)';
     },
-    fragOverhead: function () { return 'fragmentation + fixed overhead'; },
+    fixedOverhead: function () { return 'fixed overhead (CUDA context/NCCL)'; },
+    kvCapLabel: function () { return 'KV cache capacity'; },
+    fracLineTip: function (frac) { return 'mem-fraction-static = ' + frac + ': left of this line is the static region (weights + KV pool), pre-allocated at startup'; },
     gpuPctTip: function (memGib, pct) { return ' (' + pct + '% of the ' + memGib + ' GiB GPU)'; },
-    freeTipLabel: function () { return 'free (available for more KV)'; },
+    freeTipLabel: function () { return 'non-static headroom (CUDA graph etc.)'; },
     freePct: function (pct) { return ' (' + pct + '%)'; },
+    cannotStart: function (gib) { return 'weights exceed static region by ' + gib + ' GiB — cannot start'; },
+    kvUtilBarLabel: function () { return 'KV demand/cap'; },
+    kvUtilTip: function (d, c, pct) {
+      return '<b>KV demand ' + d + ' GiB ÷ pool capacity ' + c + ' GiB = ' + pct + '%</b><br>black tick = pool capacity; red = overflow past it';
+    },
+    kvUtilLine: function (d, c, pct, maxTok, ctxLbl, maxReq) {
+      return 'KV demand <b>' + d + '</b> / capacity <b>' + c + '</b> GiB (<b>' + pct + '%</b>) · pool ≈ <b>' +
+        maxTok + '</b> tokens (≈ ' + maxReq + ' full-' + ctxLbl + '-context requests)';
+    },
+    sumCapLine: function (maxTok, ctxLbl, maxReq, frac) {
+      return 'At mem-fraction-static ' + frac + ', KV pool ≈ <b>' + maxTok +
+        '</b> tokens (max_total_num_tokens, bottleneck stage) ≈ ' + maxReq + ' full-' + ctxLbl + '-context requests';
+    },
     pctParen: function (pct) { return ' (' + pct + '%)'; },
     layerChipLabel: function (lo, hi, count) { return 'L' + lo + '–L' + hi + ' ×' + count + ' layers'; },
     perLayerFrac: function (tp) { return ', 1⁄' + tp + ' per layer'; },
@@ -185,7 +221,7 @@ var I18N = {
     warnPpExceeds: function (pp, L) { return 'PP(' + pp + ') exceeds layer count ' + L; },
     oomExceeds: function (gib) { return 'over by ' + gib + ' GiB'; },
     gpuLine: function (weights, kv, act, tail) {
-      return 'Weights <b>' + weights + '</b> + KV <b>' + kv + '</b> + act ' + act + ' GiB' + tail;
+      return 'Weights <b>' + weights + '</b> + KV pool <b>' + kv + '</b> + act ' + act + ' GiB' + tail;
     },
     freeTail: function (free) { return ', <b>' + free + '</b> GiB free'; },
     nodeWarn: function (count) { return '⚠ ' + count + ' GPU(s) out of memory'; },
@@ -211,7 +247,7 @@ var I18N = {
     },
     tableHeader: function () {
       return "<tr><th>GPU</th><th>rank</th><th>layers</th>" +
-        "<th class='num'>weights GiB</th><th class='num'>KV GiB</th><th class='num'>act GiB</th>" +
+        "<th class='num'>weights GiB</th><th class='num'>KV cap GiB</th><th class='num'>KV need GiB</th><th class='num'>act GiB</th>" +
         "<th class='num'>total GiB</th><th class='num'>free GiB</th></tr>";
     },
     gemmDecodeNote: function (B) { return 'weights read once per step, shared by ' + B + ' tokens → intensity scales linearly with concurrency'; },
@@ -408,7 +444,7 @@ function readParams(){
     dpAttn: el('f-dp').checked && dpAvailable(tp),
     memGib:memGib, gpn:gpn, instLabel:instLabel,
     ctx:+el('f-ctx').value, req:+el('f-req').value,
-    kvDtype: kvDtypeNow()
+    kvDtype: kvDtypeNow(), frac:+el('f-frac').value
   };
 }
 
@@ -457,13 +493,26 @@ function gpuMemory(s, P){
   w.others = n*(L.norms + L.indexer) + nm*L.moeGate;
 
   var weights = 0; for (var k in w) weights += w[k];
+  // KV demand: bytes this GPU must hold to serve ctx × req at the chosen sharding
   var kvStage = D.kvElemsPerLayer * kvBytesPer(P.kvDtype) * n * P.ctx * P.req;
   var kv = P.dpAttn  ? kvStage/P.tp
          : D.kvIsMla ? kvStage
                      : kvStage/Math.min(P.tp, D.kvNKvHeads);
   var act = D.actBytes/P.tp;
-  var used = (weights+kv+act)*(1+D.overhead) + D.fixedGib*GIB;
-  return { w:w, weights:weights, kv:kv, act:act, used:used,
+  var cap = P.memGib*GIB, fixed = D.fixedGib*GIB;
+  // SGLang-style allocation: the static region (frac × cap) is pre-allocated at
+  // startup as weights + KV pool; whatever the weights don't take becomes KV
+  // capacity. Activation / CUDA graph live in the (1-frac) non-static region.
+  var staticBudget = P.frac*cap;
+  var kvCap = staticBudget - fixed - weights;
+  var canStart = kvCap > 0;
+  var used = canStart ? staticBudget + act : weights + fixed + act;
+  var maxReq = (canStart && kv > 0) ? Math.floor(kvCap*P.req/kv) : 0;
+  // pool capacity in tokens (= SGLang max_total_num_tokens for this GPU):
+  // demand kv covers ctx*req tokens, so tokens/byte = ctx*req/kv
+  var maxTokens = (canStart && kv > 0) ? kvCap*P.ctx*P.req/kv : 0;
+  return { w:w, weights:weights, kv:kv, kvCap:Math.max(kvCap,0), kvCapRaw:kvCap,
+           canStart:canStart, act:act, used:used, maxReq:maxReq, maxTokens:maxTokens,
            layers:[lo,hi], nDense:nd, nMoe:nm };
 }
 
@@ -479,26 +528,57 @@ function expertInfo(t, P){
 
 function memBar(m, P){
   var cap = P.memGib*GIB, h = '';
-  var over = (m.weights+m.kv+m.act)*D.overhead;
+  // static region fills left-to-right; non-static blocks (activation) anchor at
+  // the RIGHT edge with the free headroom in between, so they never overlap the
+  // frac boundary line.
   var parts = [];
   COMPS.forEach(function(c){ if (m.w[c.k] > 0) parts.push({label:c.label, b:m.w[c.k], color:c.color}); });
-  parts.push({label:'KV cache', b:m.kv, color:C.kv});
-  parts.push({label:'activation', b:m.act, color:C.act});
-  parts.push({label:Tr('fragOverhead')(), b:over + D.fixedGib*GIB, color:'var(--fixed)'});
-  parts.forEach(function(s0){
-    var frac = Math.min(s0.b/cap, 1);
-    h += "<div class='seg' style='flex:"+frac.toFixed(6)+" 0 0;background:"+s0.color+
+  parts.push({label:Tr('fixedOverhead')(), b:D.fixedGib*GIB, color:'var(--fixed)'});
+  if (m.canStart) parts.push({label:Tr('kvCapLabel')(), b:m.kvCap, color:C.kv});
+  function seg(s0){
+    // clamp tiny-but-real segments to ~0.6% so they stay visible (activation
+    // per GPU can be <0.2% of the card); flex-grow normalizes the slight excess
+    var frac = Math.min(Math.max(s0.b/cap, 0.006), 1);
+    return "<div class='seg' style='flex:"+frac.toFixed(6)+" 0 0;background:"+s0.color+
          "' data-tip='<b>"+s0.label+"</b>&emsp;"+gib(s0.b)+" GiB "+
          "<span class=\"tpct\">"+Tr('gpuPctTip')(P.memGib, (s0.b/cap*100).toFixed(1))+"</span>'></div>";
-  });
+  }
+  parts.forEach(function(s0){ h += seg(s0); });
   var free = cap - m.used;
   if (free > 0){
     var ffrac = free/cap;
-    var flabel = ffrac > 0.14 ? Math.round(ffrac*100)+'% free' : '';
+    var flabel = ffrac > 0.14 ? 'CUDA graph… ' + Math.round(ffrac*100) + '%' : '';
     h += "<div class='free' style='flex:"+ffrac.toFixed(6)+" 0 0' data-tip='<b>"+Tr('freeTipLabel')()+"</b>&emsp;"+
          gib(free)+" GiB <span class=\"tpct\">"+Tr('freePct')((ffrac*100).toFixed(1))+"</span>'>"+flabel+"</div>";
   }
+  h += seg({label:'activation', b:m.act, color:C.act});
+  // dashed marker at the mem-fraction-static boundary
+  h += "<div class='fracline' style='left:"+(P.frac*100).toFixed(2)+"%' data-tip='"+
+       Tr('fracLineTip')(P.frac.toFixed(2))+"'></div>";
   return "<div class='membar'>"+h+"</div>";
+}
+
+// KV demand vs KV pool capacity as a bullet chart: the scale is
+// max(demand, capacity); the capacity mark is a thick tick on a light track,
+// demand is the dark fill. Overflow past the tick turns red, so 216% and 500%
+// look different (the tick sits at a different position).
+function kvUtilBar(m, P){
+  if (!m.canStart || m.kvCap <= 0) return '';
+  var ratio = m.kv/m.kvCap, pct = (ratio*100).toFixed(0), over = ratio > 1;
+  var scale = Math.max(m.kv, m.kvCap);
+  var capPos = m.kvCap/scale*100, fillW = m.kv/scale*100;
+  var okW = Math.min(fillW, capPos);
+  var tip = Tr('kvUtilTip')(gib(m.kv), gib(m.kvCap), pct);
+  var h = "<div class='kvutil' data-tip='"+tip+"'>"+
+    "<span class='kvutil-lb'>"+Tr('kvUtilBarLabel')()+"</span>"+
+    "<div class='kvutil-track'>"+
+      "<div class='kvutil-capzone' style='width:"+capPos.toFixed(2)+"%'></div>"+
+      "<div class='kvutil-fill' style='width:"+okW.toFixed(2)+"%'></div>"+
+      (over ? "<div class='kvutil-fill over' style='left:"+capPos.toFixed(2)+"%;width:"+
+              (fillW-capPos).toFixed(2)+"%'></div>" : '')+
+      "<div class='kvutil-capline' style='left:"+capPos.toFixed(2)+"%'></div>"+
+    "</div><span class='kvutil-pct"+(over?' over':'')+"'>"+pct+"%</span></div>";
+  return h;
 }
 
 function chips(m, s, t, P){
@@ -548,17 +628,25 @@ function updateParallel(){
       var s0 = Math.floor(g/P.tp), t = g%P.tp;
       var m = stages[s0];
       clusterWeights += m.weights; clusterKv += m.kv;
-      var free = cap - m.used, oom = free < 0;
+      var free = cap - m.used, oom = !m.canStart || free < 0;
       if (oom){ nodeOom++; oomTotal++; }
       maxUsed = Math.max(maxUsed, m.used);
-      var memTxt = oom
-        ? "<span class='oombadge'>"+Tr('oomExceeds')(gib(-free))+"</span>"
-        : "<span class='gpu-mem'><b>"+gib(m.used)+"</b> / "+P.memGib+" GiB</span>";
+      var memTxt = !m.canStart
+        ? "<span class='oombadge'>"+Tr('cannotStart')(gib(-m.kvCapRaw))+"</span>"
+        : oom
+          ? "<span class='oombadge'>"+Tr('oomExceeds')(gib(-free))+"</span>"
+          : "<span class='gpu-mem'><b>"+gib(m.used)+"</b> / "+P.memGib+" GiB</span>";
+      var utilLine = m.canStart
+        ? "<div class='gpu-line'>"+Tr('kvUtilLine')(gib(m.kv), gib(m.kvCap),
+            (m.kv/m.kvCap*100).toFixed(0), tokLabel(m.maxTokens), ctxLabel(P.ctx), m.maxReq)+"</div>"
+        : '';
       cards += "<div class='gpu"+(oom?' oom':'')+"'>"+
         "<div class='gpu-head'><span class='gpu-name'>GPU-"+g+"</span>"+
         "<span class='gpu-rank'>pp"+s0+"·tp"+t+"</span>"+memTxt+"</div>"+
         memBar(m, P)+
-        "<div class='gpu-line'>"+Tr('gpuLine')(gib(m.weights), gib(m.kv), gib(m.act), oom?'':Tr('freeTail')(gib(free)))+"</div>"+
+        kvUtilBar(m, P)+
+        "<div class='gpu-line'>"+Tr('gpuLine')(gib(m.weights), gib(m.canStart?m.kvCap:0), gib(m.act), oom?'':Tr('freeTail')(gib(free)))+"</div>"+
+        utilLine+
         chips(m, s0, t, P)+"</div>";
     }
     html += "<div class='node'><div class='node-head'>"+
@@ -587,9 +675,9 @@ function updateParallel(){
       lg += "<span class='lg'><i style='background:"+c.color+"'></i>"+label+"</span>";
     }
   });
-  lg += "<span class='lg'><i style='background:"+C.kv+"'></i>"+Tr('kvCacheLegendLabel')(P.kvDtype)+"</span>";
+  lg += "<span class='lg'><i style='background:"+C.kv+"'></i>"+Tr('kvCapLabel')()+" ("+P.kvDtype+")</span>";
   lg += "<span class='lg'><i style='background:"+C.act+"'></i>activation</span>";
-  lg += "<span class='lg'><i style='background:var(--fixed)'></i>"+Tr('fragOverhead')()+"</span>";
+  lg += "<span class='lg'><i style='background:var(--fixed)'></i>"+Tr('fixedOverhead')()+"</span>";
   el('legend').innerHTML = lg;
 
   var kvNote = P.dpAttn
@@ -599,9 +687,16 @@ function updateParallel(){
       : (P.tp > D.kvNKvHeads
           ? Tr('kvNoteTpExceeds')(P.tp, D.kvNKvHeads, (P.tp/Math.min(P.tp,D.kvNKvHeads)).toFixed(1))
           : Tr('kvNoteSliced')(P.tp));
+  var minMaxReq = Infinity, minMaxTok = Infinity, allStart = true;
+  stages.forEach(function(m){
+    if (!m.canStart) allStart = false;
+    else { minMaxReq = Math.min(minMaxReq, m.maxReq); minMaxTok = Math.min(minMaxTok, m.maxTokens); }
+  });
+  var capLine = allStart && isFinite(minMaxTok)
+    ? '<br>'+Tr('sumCapLine')(tokLabel(minMaxTok), ctxLabel(P.ctx), minMaxReq, P.frac.toFixed(2)) : '';
   el('sum-line').innerHTML =
     Tr('sumLine')(gib(maxUsed), P.memGib, gib(clusterWeights), gib(D.weightsBytes), gib(Math.max(repl,0)))+
-    '<br>'+kvNote;
+    '<br>'+kvNote+capLine;
 
   // table view
   var th = Tr('tableHeader')();
@@ -611,7 +706,9 @@ function updateParallel(){
     var f2 = cap - m2.used;
     rows += "<tr><td>GPU-"+g2+"</td><td>pp"+s2+"·tp"+t2+"</td>"+
       "<td>L"+m2.layers[0]+"–L"+(m2.layers[1]-1)+"</td>"+
-      "<td class='num'>"+gib(m2.weights)+"</td><td class='num'>"+gib(m2.kv)+"</td>"+
+      "<td class='num'>"+gib(m2.weights)+"</td>"+
+      "<td class='num"+(m2.canStart?"":" oomcell")+"'>"+gib(m2.kvCap)+"</td>"+
+      "<td class='num"+(m2.canStart && m2.kv>m2.kvCap?" oomcell":"")+"'>"+gib(m2.kv)+"</td>"+
       "<td class='num'>"+gib(m2.act)+"</td><td class='num'>"+gib(m2.used)+"</td>"+
       "<td class='num"+(f2<0?" oomcell":"")+"'>"+gib(f2)+"</td></tr>";
   }
@@ -1450,6 +1547,9 @@ el('f-inst').addEventListener('change', function(){ updateParallel(); updateRoof
 el('f-dp').addEventListener('change', updateParallel);
 el('f-cmem').addEventListener('input', updateParallel);
 el('f-cgpn').addEventListener('input', updateParallel);
+el('f-frac').addEventListener('input', function(){ syncFracLabel(); updateParallel(); });
+function syncFracLabel(){ setText('f-frac-val', (+el('f-frac').value).toFixed(2)); }
+syncFracLabel();
 rebuildEpOptions(+el('f-tp').value);
 if (D.nMoe){ el('f-ep').value = String(EP_INIT); }
 
@@ -1473,7 +1573,7 @@ var FRAG_IDS = {
   'h-parallel-arrow': 'parallel_arrow',
   'h-details-table-gpu': 'details_table_gpu',
   'lbl-ctx': 'lbl_ctx', 'lbl-req': 'lbl_req', 'lbl-kv': 'lbl_kv',
-  'lbl-dp': 'lbl_dp', 'lbl-inst': 'lbl_inst',
+  'lbl-dp': 'lbl_dp', 'lbl-inst': 'lbl_inst', 'lbl-frac': 'lbl_frac',
   'lbl-custom-mem': 'lbl_custom_mem', 'lbl-custom-gpn': 'lbl_custom_gpn',
   'lbl-custom-cards': 'lbl_custom_cards',
   'fnote': 'fnote'
