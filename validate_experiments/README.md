@@ -2,7 +2,11 @@
 
 ## 验证思路
 
-初步打算针对不同的机型（B300 / B200 / H200 / H100），通过 sglang 部署进行实验。包括下面几个部分
+初步打算针对不同的机型（B300 / B200 / H200 / H100），通过 sglang 部署进行实验。
+
+**执行方式约束（2026-07）**：机器资源每次只能准备好**一种机型**，因此实验按「机型会话」组织——每拿到一种机型，就把该机型上所有能做的实验一次性做完再释放机器，而不是按实验编号顺序跨机型推进。跨机型比值类判定（E5/E6）由各会话独立采集本机原始数据、事后离线合并计算（见「4. 执行组织：按机型会话」）。现阶段大机型均拉不到，只能拉到 **g5.2xlarge（1× A10G 24 GB）**——即第一个会话 S0，用小模型（Qwen/Qwen3.5-4B）跑通显存类实验与单机形状对账（详见「0.1 机型现状与 g5.2xlarge 先行会话」）。
+
+实验包括下面几个部分
 
  - 显存拆解部分
 	 - 针对 weight，**只对齐总量**，暂不做分部件（attention / experts / embed）级别的对账。原因：
@@ -57,8 +61,34 @@
 | E2 | KV cell size 对账 | 每 token KV 字节 | A（与 E1 共用启动） | 8×B200 | 3 个（见覆盖矩阵） |
 | E3 | 显存账闭合 | KV 池容量（max_total_num_tokens）/ 固定开销 | A（开 MTP） | 8×B200 | GLM-5.2-FP8 全矩阵 + Qwen3-32B 抽查 |
 | E4 | dp-attention 显存变化 | 权重增量 + KV 容量比 | A（开 MTP） | 8×B200 | GLM-5.2-FP8（MLA 专属） |
-| E5 | Decode roofline | TPOT ∝ 1/带宽 | B（关 MTP） | B300 / B200 / H200 / H100 各一台 | DeepSeek-V4-Flash + Qwen3-32B |
+| E5 | Decode roofline | TPOT ∝ 1/带宽 | B（关 MTP） | B300 / B200 / H200 / H100（各自会话分别采集，事后合并） | DeepSeek-V4-Flash + Qwen3-32B |
 | E6 | Prefill roofline | TTFT ∝ 1/算力 | B（与 E5 共用部署） | 同 E5 | 同 E5 |
+
+> 上表按实验编号描述"验证什么"；实际执行按机型会话组织（见「4. 执行组织：按机型会话」），每个会话把当次机型能做的实验全部做完。现阶段先执行下面 0.1 的 g5.2xlarge 会话 S0。
+
+#### 0.1 机型现状与 g5.2xlarge 先行会话（S0）
+
+**现状（2026-07）**：B300 / B200 / H200 / H100 均拉不到，只能拉到 **g5.2xlarge**（1× NVIDIA A10G，Ampere，24 GB GDDR6，带宽 600 GB/s，bf16 Tensor ≈ 70 TFLOPS dense；不支持 fp4，无 fp8 Tensor Core）。单卡意味着只能 `--tp 1`，因此并行切分与跨机型比值类实验暂无法执行，但**显存类对账方法与单机形状对账不依赖多卡/多机**，可先行钉死。
+
+**先行模型：Qwen/Qwen3.5-4B**（bf16 dense，权重 ≈ 8.7 GiB，GQA-4，32 层，head_dim 256，vocab 248K，无 MTP）——24 GB 单卡装下权重后 KV 池仍有 10+ GiB（cell ≈ 64 KiB/token @ bf16，池容量约 15 万+ tokens），frac 矩阵与长 prompt 形状实验都有足够空间。
+
+各实验在 g5.2xlarge 上的可行性：
+
+| 编号 | 实验 | g5.2xlarge 可行性 | 说明 |
+|---|---|---|---|
+| E1′ | 权重总量对账 | ✅ | TP=1 下 `sliced/TP + replicated` 退化为总量，但 `avail mem` 差值法与运行时 dtype 转换检测照常验证 |
+| E2′ | KV cell size 对账 | ✅ | 新增覆盖 **GQA-4 + head_dim 256** 分支（`2 × 4 × 256 × 32 层`，非常规 head_dim，工具易错点） |
+| E3′ | 显存账闭合 | ✅ | frac ∈ {0.80, 0.85, 0.90} × kv-dtype {bf16, fp8_e5m2}；A10G 无 fp8 Tensor Core，但 fp8 仅作 KV 存储格式通常可用——若 sglang 在 Ampere 上拒绝则记录该约束并只跑 bf16 |
+| E4 | dp-attention | ❌ | 单卡无 TP/DP；且 Qwen3.5-4B 非 MLA |
+| E5″ | Decode 旁证 | ⚠️ 部分 | 无跨机型比值；单机测 TPOT 绝对值 vs 工具理论 step 时间，检验效率系数落在 1.4–2.0×（50–70% 效率）区间，仅作旁证不作判定 |
+| E6″ | Prefill 形状对账 | ✅ | **形状对账不需要多机**：单机 TTFT vs prompt 长度 {8192…65536} 曲线与工具预测序列对形状（GEMM 线性 + causal pairs 二次项） |
+
+启动配置沿用两组约定（Qwen3.5-4B 无 MTP，无 MTP 开关差异，但 cuda-graph 配置仍不同，**不可共用部署**）：
+
+- **E1′/E2′/E3′**：组 A 参数（`--tp 1`、`--disable-cuda-graph`、固定 `--max-running-requests`）。
+- **E5″/E6″**：组 B 参数（`--tp 1`、`--chunked-prefill-size 8192`、开 cuda graph）。
+
+目录规范照旧：`validate_experiments/E<N>p_<slug>/`（先行实验以 `p` 后缀区分，如 `E1p_weights_g5`），待大机型可用后原编号实验按会话执行，先行结果作为方法验证与工具回归基线。S0 会话的另一个核心产出是**会话执行手册**：把「拿到机器 → 环境记录 → 组 A 部署跑显存实验 → 切组 B 部署跑 roofline → 归档释放」整套流程脚本化（CC 自动化），后续每个大机型会话直接复用。
 
 **模型覆盖矩阵**——工具对不同结构走不同计算分支，每条分支至少被一个（模型 × 实验）组合覆盖：
 
@@ -67,6 +97,7 @@
 | KV：MLA | `kv_lora_rank + rope`，纯 TP 每卡全量复制 | GLM-5.2-FP8 | E2 / E3 / E4 |
 | KV：MQA（GQA-1） | `2 × 1 × head_dim`，TP > 1 即复制 | DeepSeek-V4-Flash | E2 |
 | KV：GQA-8 | `2 × kv_heads × head_dim`，TP 下按 kv head 切 1/min(TP, 8) | Qwen3-32B | E2 / E3 |
+| KV：GQA-4 + 非常规 head_dim（256） | `2 × 4 × 256`，head_dim ≠ hidden/heads，须从 config 直读 | Qwen/Qwen3.5-4B | E2′ / E3′（g5 先行） |
 | 权重：纯 fp8 | 单一 dtype 直读 | GLM-5.2-FP8 | E1 |
 | 权重：fp4 sub-byte 打包 | I8 存储 ÷2 还原 + scale 张量 | nvidia/GLM-5.2-NVFP4 | E1 |
 | 权重：fp4 + fp8 混合精度 | 逐部件不同 dtype（experts fp4、attention fp8） | DeepSeek-V4-Flash | E1 |
@@ -80,12 +111,13 @@
 - **DeepSeek-V4-Flash**（148.6 GiB，MoE + MQA + DSA + MTP）：组 B 主力兼 E1/E2 覆盖位。四种机型中最小的 8×H100（640 GiB）也装得下，满足"四台机器同一模型同一 TP"的比值法前提；混合精度权重与 MQA 结构补齐两条分支。
 - **Qwen3-32B**（61 GiB，Dense + GQA，bf16，无 MTP）：覆盖工具最"普通"的路径——dense、GQA、无量化、无 MTP、无 DSA。体积小、启动快，适合 E3 抽查与 roofline 第二模型，成本几乎可忽略。
 - **nvidia/GLM-5.2-NVFP4**：仅参与 E1，专门覆盖 fp4 sub-byte 打包还原这条最容易出错的权重路径（需 B 系列 GPU 支持 fp4 kernel）。
+- **Qwen/Qwen3.5-4B**（≈8.7 GiB，Dense + GQA-4，bf16，head_dim 256，无 MTP）：g5.2xlarge 先行实验专用——唯一能在 24 GB 单卡上留出充足 KV 池空间的候选。覆盖 GQA-4 + 非常规 head_dim（256 ≠ hidden 2560 / 16 heads = 160）分支：cell size 必须从 config 的 `head_dim` 字段直读而非由 hidden/heads 推导，这是工具容易算错的路径，与 Qwen3-32B 的 GQA-8 常规路径互补。大机型可用后仍可作为低成本回归模型保留。
 
 > 注意：组 A 的"开启 MTP"前提仅适用于**有 MTP 的模型**；Qwen3-32B 无 MTP，无此开关，工具口径同样不含 MTP，两边天然一致。
 
 ### 1. 公共约定
 
-- **环境记录**：每次实验记录 sglang 版本（commit）、CUDA / driver 版本、机型、工具 commit。同一实验的所有对照组必须使用同一 sglang 版本。
+- **环境记录**：每个会话进场时记录 sglang 版本（commit / docker 镜像）、CUDA / driver 版本、机型、工具 commit，写入该会话所有 `runs.csv` 的环境列。同一实验的所有对照组必须使用同一 sglang 版本；**跨会话合并的实验（E5/E6）要求所有会话版本一致**（例外流程见组 B 开头）。
 - **工具基准值先行**：每个实验开始前，先用工具按实验参数（模型 / TP / context / 并发 / kv-dtype / dp-attention / **mem-fraction-static**）生成预测值并记入该实验的 `expected.md`，实测后不回改——避免"先看实测再对预测"。`--mem-fraction-static` 必须与实测启动参数严格一致，`runs.csv` 增加 frac 列。
 - **工具口径**：并行 TAB 为供给侧口径——KV 显示池容量而非需求，**不含乘性碎片项**，固定开销 1 GiB 为独立显式项。expected.md 中记录工具 commit，确保口径可追溯。
 - **目录规范**：每个实验一个子目录 `validate_experiments/E<N>_<slug>/`，内含：
@@ -166,7 +198,9 @@
 
 ### 3. 实验组 B：Roofline 类（关 MTP）
 
-四台机器（B300 / B200 / H200 / H100）各部署，`--tp 8`、同一 checkpoint、同一启动命令，E5 与 E6 复用同一部署、只跑不同 bench。**不可 B 系列用 fp4、H 系列用 fp8**。
+四种机型（B300 / B200 / H200 / H100）**分属不同的机型会话，不会同时在手**：每个会话独立部署（`--tp 8`、同一 checkpoint、同一启动命令的机型无关部分），只负责采集**本机原始数据**（TPOT / ITL / 各长度 TTFT），落盘 `runs.csv`；跨机型比值在 ≥2 个会话完成后**离线合并计算**，任何比值判定不阻塞单个会话的进行。E5 与 E6 复用同一部署、只跑不同 bench。**不可 B 系列用 fp4、H 系列用 fp8**。
+
+跨会话可比性是比值法的生命线，三项必须钉死（写入每个会话的 `runs.csv` 环境列并逐项核对）：**sglang 版本**（首个组 B 会话锁定 docker 镜像 / commit，后续会话严格复用，禁止"顺手升级"）、**checkpoint 与启动命令**（机型无关部分逐字节相同）、**bench 脚本与参数**（并发、input/output 长度、重复次数）。若某会话被迫换版本（如新机型 kernel 支持要求），须在旧版本可跑的机型上做一次新旧版本对照，确认 TPOT/TTFT 无显著漂移后方可与历史会话合并。
 
 **两个模型各跑一轮**，覆盖工具 roofline 的两条 attention 访问模式分支：
 
@@ -205,11 +239,26 @@
 
 - **形状对账**：同一机型上 TTFT vs prompt 长度的曲线与工具对各长度的预测序列对形状（GEMM 线性项 + causal pairs 二次项；DSA top-k 封顶后趋回线性），不假设纯线性。
 
-### 4. 执行顺序与成本估算
+### 4. 执行组织：按机型会话
 
-1. **E1 + E2**（4 个模型各一次启动，权重与 cell size 一并采集）→ 这两个量是后面所有账的基础，先钉死。
-2. **E3**（GLM 全矩阵 4 次启动 + Qwen 抽查 2 次，每格一次启动，可基于 CC 自动化：改参数 → 重启 → 抓日志 → 填 runs.csv）。
-3. **E4**（2 次启动 + 可选打满测试）。
-4. **E5 + E6**（切换到组 B 部署：4 台机器 × 2 模型 × 1 次部署，每个部署跑 decode bench 3 次 + prefill 5 长度 × 3 次）。
+**执行单位是"机型会话"（Session），不是实验编号**：每次只能准备好一种机型，拿到机器后按下表把该机型上所有能做的实验一次做完、归档数据、释放机器。会话到来的顺序取决于机器可用性，**除 S0 先行外无强制顺序**；实验编号（E1–E6）只描述"验证什么"，同一实验的数据可能分散在多个会话中采集。
 
-失败处理约定：任一判定不通过时，先在 conclusion.md 记录偏差与排查结论，再决定是修工具（公式/参数）还是修实验口径；**不回改 expected.md**。
+| 会话 | 机型 | 组 A（显存类，开 MTP） | 组 B（roofline，关 MTP） | 备注 |
+|---|---|---|---|---|
+| S0 | g5.2xlarge（1×A10G） | E1′ + E2′（Qwen3.5-4B 一次启动）→ E3′（frac × kv-dtype 矩阵） | E5″（单机效率系数旁证）+ E6″（TTFT 形状对账） | **现阶段唯一可执行**；产出会话执行手册（CC 自动化脚本），后续会话复用 |
+| S1 | 8×B200 | **组 A 全量**：E1 + E2（4 模型各一次启动）→ E3（GLM 全矩阵 4 格 + Qwen 抽查 2 格）→ E4（2 次启动 + 可选打满） | E5 + E6 的 **B200 数据点**（2 模型各一次部署） | 组 A 唯一指定机型，是最重的会话；组 B 若首个跑到，则锁定 sglang 版本基准 |
+| S2 | 8×H200 | —（可选：2 个 roofline 模型重跑 E1/E2 作跨机型回归，成本一次启动） | E5 + E6 的 **H200 数据点** | |
+| S3 | 8×H100 | —（同 S2 可选回归） | E5 + E6 的 **H100 数据点** | 640 GiB 装不下 GLM-5.2-FP8，只跑 2 个 roofline 模型 |
+| S4 | 8×B300 | — | E5 + E6 的 **B300 数据点**（decode 证伪控制组） | |
+
+**会话内固定流程**（S0 打磨、后续复用）：
+
+1. **进场**：记录环境（机型、sglang 版本/镜像、CUDA/driver、工具 commit），核对与历史会话的版本一致性（组 B 硬性要求，见组 B 开头）。
+2. **基准值先行**：用工具按本会话全部实验参数生成 `expected.md`（进场时一次性生成，实测后不回改）。
+3. **组 A 部署**：跑本会话的显存类实验（改参数 → 重启 → 抓日志 → 填 `runs.csv`，CC 自动化）。
+4. **切组 B 部署**：跑 roofline bench（decode 3 次 + prefill 5 长度 × 3 次，每模型），只采集原始数据落盘。
+5. **离场**：日志与 `runs.csv` 归档进仓库，写单会话 `conclusion.md`（本机可判定项：显存类判定、效率系数旁证、TTFT 形状），释放机器。
+
+**跨会话合并判定**：E5/E6 的比值判定（含 B300/B200、H200/H100 两个证伪控制组）在对应两个会话都完成后离线计算，结论写入 `validate_experiments/cross_session/conclusion.md`——单个会话不等待、不阻塞。
+
+失败处理约定：任一判定不通过时，先在 conclusion.md 记录偏差与排查结论，再决定是修工具（公式/参数）还是修实验口径；**不回改 expected.md**。若排查发现是实验口径问题且机器已释放，将修正后的口径记入会话手册，待该机型下次可用时重测。
