@@ -226,7 +226,7 @@ def _sub_byte_name(cfg: dict, bits: int) -> str:
     return f"{bits}bit"
 
 
-def exact_components(catalog: dict, cfg: dict) -> tuple[dict, dict, dict]:
+def exact_components(catalog: dict, cfg: dict) -> tuple[dict, dict, dict, dict]:
     """Aggregate the tensor catalog into per-component bytes/params/dtypes.
 
     Sub-byte packing (e.g. two fp4 values per int8 byte, or eight int4 per
@@ -249,16 +249,18 @@ def exact_components(catalog: dict, cfg: dict) -> tuple[dict, dict, dict]:
     # config-declared hint (e.g. DeepSeek expert_dtype) as fallback confirmation
     hint_fp4 = str(cfg.get("expert_dtype", "")).lower() in ("fp4", "mxfp4", "nvfp4")
 
-    by_key, dtype_hist, comp_dtypes = {}, {}, {}
+    by_key, dtype_hist, comp_dtypes, recon = {}, {}, {}, {}
     for key, tensors in groups.items():
         apparent = 0
         has_int_weight = False
+        int_bits = None
         for name, t in tensors:
             if QUANT_META.search(name):
                 continue
             apparent += math.prod(t["shape"]) if t["shape"] else 1
             if t["dtype"] in INT_DTYPES:
                 has_int_weight = True
+                int_bits = INT_DTYPES[t["dtype"]]
 
         # ---- packing factor: formula/apparent ≈ 2, 4 or 8 (±6%)
         pack = 1
@@ -293,7 +295,16 @@ def exact_components(catalog: dict, cfg: dict) -> tuple[dict, dict, dict]:
                 d["params"] += params
         by_key[key] = d
         comp_dtypes[key] = dts
-    return by_key, dtype_hist, comp_dtypes
+        # reconciliation trail for the evidence tab: the two independent param
+        # counts (config formula vs safetensors shapes) and the packing verdict
+        recon[key] = {
+            "formula": expected,               # None when no reliable closed form
+            "apparent": apparent,              # from real tensor shapes
+            "pack": pack,                      # 1 = unpacked; 2/4/8 = sub-byte packed
+            "storageBits": int_bits,           # int8/int32 the packed values live in
+            "trueBits": (int_bits // pack) if (int_bits and pack > 1) else None,
+        }
+    return by_key, dtype_hist, comp_dtypes, recon
 
 
 def dtype_label(dtype_hist: dict) -> str:
@@ -533,9 +544,9 @@ def analyze(model_id: str, cfg: dict, ctx: int, requests: int, kv_dtype: str,
     order = ["embed", "lm_head", "attention", "indexer", "dense_ffn",
              "moe_routed", "moe_shared", "moe_gate", "norms", "mtp"]
 
-    exact = comp_dtypes = None
+    exact = comp_dtypes = recon = None
     if catalog:
-        exact, dtype_hist, comp_dtypes = exact_components(catalog, cfg)
+        exact, dtype_hist, comp_dtypes, recon = exact_components(catalog, cfg)
         wname = dtype_label(dtype_hist)
 
     comps = []
@@ -600,7 +611,7 @@ def analyze(model_id: str, cfg: dict, ctx: int, requests: int, kv_dtype: str,
         "mha_total": mha_total, "mha_ratio": mha_ratio,
         "batch_tokens": batch_tokens, "act_total": act_total, "act_desc": act_desc,
         "runtime_total": runtime_total, "overhead": overhead, "grand": grand,
-        "exact": exact is not None, "comp_dtypes": comp_dtypes,
+        "exact": exact is not None, "comp_dtypes": comp_dtypes, "recon": recon,
     }
 
 
@@ -863,6 +874,212 @@ def build_parallel_struct(a: dict, cfg: dict) -> str:
     return h
 
 
+def build_evidence(a: dict, cfg: dict, p: dict) -> str:
+    """Evidence tab (first tab): why the weight numbers are trustworthy.
+
+    Three stacked sections, top-to-bottom = the reasoning order:
+      A · the config.json fields the formulas consume (the input)
+      B · per-component parameter formula: symbolic = substituted = result
+      C · reconciliation — config formula vs safetensors shapes, as paired bars.
+          Equal bars = two independent sources agree. A short apparent bar +
+          a ⚡ badge = sub-byte packing (e.g. two fp4 packed into one int8),
+          explained inline. Grey/absent when safetensors was not read.
+    """
+    H = cfg["hidden_size"]
+    L = cfg["num_hidden_layers"]
+    V = cfg["vocab_size"]
+    n_heads = cfg["num_attention_heads"]
+    is_moe = bool(p["moe_layers"])
+    is_mla = p["is_mla"]
+    recon = a.get("recon")
+
+    # ---------- Fused A · config → formula → param count (one row per component) ----------
+    # Each row pairs the config fields a component's formula consumes (left column)
+    # with that formula rendered symbolic = substituted = result (right column), so
+    # the causal chain "these fields feed this formula → this many params" reads
+    # left-to-right on a single line. Config chips carry their plain-language meaning
+    # as a hover tooltip, keeping the row compact. Three inputs are NOT
+    # component-specific — hidden_size/num_hidden_layers (every formula uses them),
+    # the quant byte-multiplier, and the DSA index (compute-only, yields no weight) —
+    # so they sit in a global band above the table instead of being forced into a
+    # row. Each row's left border + dot reuse the same slot color the component gets
+    # everywhere else (bars, layer diagram, table), so color reads as a legend.
+    def chip(field, val, meaning):
+        if val is None:
+            return ""
+        return f"<code class='ev-chip' data-tip='{meaning}'>{field}</code>&nbsp;{val}"
+
+    def abrow(slot, name, chips, symbolic, substituted, params):
+        cfg_cell = " ".join(c for c in chips if c) or "—"
+        return (f"<tr><td class='ev-abname' style='border-left-color:{_var(slot)}'>"
+                f"<i class='dot' style='background:{_var(slot)}'></i>{name}</td>"
+                f"<td class='ev-abcfg'>{cfg_cell}</td>"
+                f"<td class='ev-abf'><div class='ev-fsym'>{symbolic}</div>"
+                f"<div class='ev-fsub'>= {substituted}</div>"
+                f"<div class='ev-fres'>= <b>{_b(params)}</b> {t('ev.params')}</div></td></tr>")
+
+    # global band: inputs shared by every formula (not tied to one component)
+    _bpp = f"{a['total_bytes'] / a['total_params']:.2f}"
+    gchips = [
+        chip("hidden_size", H, t("ev.f.hidden_size")),
+        chip("num_hidden_layers", L, t("ev.f.num_hidden_layers")),
+        chip(a["wname"], f"{_bpp} B/param", t("ev.f.quant", bpp=_bpp))]
+    # compute-only fields (affect flops, not stored weight) — shown here rather
+    # than in a component row, since no weight formula consumes them.
+    if is_moe and cfg.get("num_experts_per_tok"):
+        gchips.append(chip("num_experts_per_tok", cfg["num_experts_per_tok"], t("ev.f.num_experts_per_tok")))
+    if cfg.get("index_n_heads"):
+        gchips.append(chip("index_n_heads", cfg["index_n_heads"], t("ev.f.index_n_heads")))
+    global_band = (f"<div class='ev-gband'><span class='ev-glab'>{t('ev.grp_global')}</span>"
+                   + " · ".join(c for c in gchips if c) + "</div>")
+
+    rows_ab = ""
+    mult = "2" if p["lm_head"] else "1"
+    rows_ab += abrow(0, "embed + lm_head",
+                     [chip("vocab_size", f"{V:,}", t("ev.f.vocab_size"))],
+                     f"{mult} × vocab × hidden", f"{mult} × {V:,} × {H:,}",
+                     p["embed"] + p["lm_head"])
+    if is_mla:
+        q_lora = cfg.get("q_lora_rank")
+        qk_nope, qk_rope = cfg["qk_nope_head_dim"], cfg["qk_rope_head_dim"]
+        v_dim, kv_lora = cfg["v_head_dim"], cfg["kv_lora_rank"]
+        qk_head = qk_nope + qk_rope
+        if q_lora:
+            sym = "L × (q_a + q_b + kv_a + kv_b + o)"
+            sub = (f"{L} × ({H}×{q_lora} + {q_lora}×{n_heads}×{qk_head} "
+                   f"+ {H}×({kv_lora}+{qk_rope}) + {kv_lora}×{n_heads}×({qk_nope}+{v_dim}) "
+                   f"+ {n_heads}×{v_dim}×{H})")
+        else:
+            sym = "L × (q + kv_a + kv_b + o)"
+            sub = (f"{L} × ({H}×{n_heads}×{qk_head} + {H}×({kv_lora}+{qk_rope}) "
+                   f"+ {kv_lora}×{n_heads}×({qk_nope}+{v_dim}) + {n_heads}×{v_dim}×{H})")
+        attn_chips = [
+            chip("q_lora_rank", q_lora, t("ev.f.q_lora_rank")),
+            chip("kv_lora_rank", kv_lora, t("ev.f.kv_lora_rank")),
+            chip("qk_nope_head_dim", qk_nope, t("ev.f.qk_nope_head_dim")),
+            chip("qk_rope_head_dim", qk_rope, t("ev.f.qk_rope_head_dim")),
+            chip("v_head_dim", v_dim, t("ev.f.v_head_dim")),
+            chip("num_attention_heads", n_heads, t("ev.f.num_attention_heads"))]
+        rows_ab += abrow(1, "attention (MLA)", attn_chips, sym, sub, p["attention"])
+    else:
+        n_kv = cfg.get("num_key_value_heads", n_heads)
+        hd = cfg.get("head_dim") or H // n_heads
+        kind = "MHA" if n_kv == n_heads else "GQA"
+        attn_chips = [
+            chip("num_attention_heads", n_heads, t("ev.f.num_attention_heads")),
+            chip("num_key_value_heads", n_kv, t("ev.f.num_key_value_heads")),
+            chip("head_dim", hd, t("ev.f.head_dim"))]
+        rows_ab += abrow(1, f"attention ({kind})", attn_chips, "L × (q + k + v + o)",
+                         f"{L} × ({H}×{n_heads}×{hd} + 2×{H}×{n_kv}×{hd} + {n_heads}×{hd}×{H})",
+                         p["attention"])
+    if is_moe:
+        n_routed = cfg.get("n_routed_experts") or cfg.get("num_experts") or cfg.get("num_local_experts")
+        moe_inter = cfg.get("moe_intermediate_size")
+        dense_n, moe_n = p["dense_layers"], p["moe_layers"]
+        if dense_n and p.get("dense_ffn"):
+            inter = cfg.get("intermediate_size")
+            dense_chips = [
+                chip("intermediate_size", f"{inter:,}", t("ev.f.intermediate_size")),
+                chip("first_k_dense_replace", dense_n, t("ev.f.first_k_dense_replace"))]
+            rows_ab += abrow(2, "dense FFN", dense_chips,
+                             "3 × hidden × intermediate × dense_layers",
+                             f"3 × {H:,} × {inter:,} × {dense_n}", p["dense_ffn"])
+        moe_chips = [
+            chip("n_routed_experts", n_routed, t("ev.f.n_routed_experts")),
+            chip("moe_intermediate_size", f"{moe_inter:,}", t("ev.f.moe_intermediate_size"))]
+        rows_ab += abrow(3, "MoE routed experts ★", moe_chips,
+                         "n_routed × 3 × hidden × moe_inter × moe_layers",
+                         f"{n_routed} × 3 × {H:,} × {moe_inter:,} × {moe_n}", p["moe_routed"])
+        if p.get("moe_shared"):
+            shared_chips = [
+                chip("n_shared_experts", cfg.get("n_shared_experts"), t("ev.f.n_shared_experts")),
+                chip("moe_intermediate_size", f"{moe_inter:,}", t("ev.f.moe_intermediate_size"))]
+            rows_ab += abrow(3, "MoE shared experts", shared_chips,
+                             "n_shared × 3 × hidden × moe_inter × moe_layers",
+                             f"{cfg.get('n_shared_experts')} × 3 × {H:,} × {moe_inter:,} × {moe_n}",
+                             p["moe_shared"])
+    else:
+        inter = cfg.get("intermediate_size")
+        ffn_chips = [chip("intermediate_size", f"{inter:,}", t("ev.f.intermediate_size"))]
+        rows_ab += abrow(2, "FFN", ffn_chips, "3 × hidden × intermediate × L",
+                         f"3 × {H:,} × {inter:,} × {L}", p["dense_ffn"])
+    if p.get("mtp"):
+        n_mtp = cfg.get("num_nextn_predict_layers")
+        mtp_chips = [chip("num_nextn_predict_layers", n_mtp, t("ev.f.num_nextn_predict_layers"))]
+        rows_ab += abrow(4, f"MTP × {n_mtp}", mtp_chips,
+                         "n_mtp × (attention + MoE expert stack + eh_proj 2·H·H)",
+                         t("ev.mtp_composite"), p["mtp"])
+
+    ab_table = (f"{global_band}<table class='ev-abtab'><thead><tr>"
+                f"<th>{t('ev.col_component')}</th><th>{t('ev.col_config')}</th>"
+                f"<th>{t('ev.col_paramformula')}</th></tr></thead>"
+                f"<tbody>{rows_ab}</tbody></table>")
+
+    # ---------- Section B · reconciliation bars ----------
+    if not recon:
+        sec_c = f"<div class='ev-noexact'>{t('ev.no_exact')}</div>"
+    else:
+        cb = {c["key"]: c for c in a["comps"]}
+        order = ["embed", "lm_head", "attention", "dense_ffn",
+                 "moe_routed", "moe_shared", "mtp"]
+        rows = [(k, recon[k]) for k in order
+                if k in recon and recon[k].get("formula") and recon[k].get("apparent")]
+        max_f = max((r["formula"] for _, r in rows), default=1)
+        bars = ""
+        for key, r in rows:
+            fw = max(2.0, r["formula"] / max_f * 100)
+            aw = max(2.0, r["apparent"] / max_f * 100)
+            color = _var(COMP_SLOT.get(key, 7))
+            packed = r["pack"] > 1
+            if packed:
+                true_name = _sub_byte_name(cfg, r["trueBits"]) if r["trueBits"] else "?"
+                badge = f"<span class='ev-badge pack'>⚡ {r['pack']}× {t('ev.verdict_pack')} → {true_name}</span>"
+            else:
+                badge = f"<span class='ev-badge ok'>✓ 1.00× {t('ev.verdict_match')}</span>"
+            name = cb.get(key, {}).get("name", key)
+            bars += (
+                f"<div class='ev-rrow'><div class='ev-rname'>{name}</div>"
+                f"<div class='ev-rbars'>"
+                f"<div class='ev-rline'><span class='ev-rtag'>{t('ev.col_formula')}</span>"
+                f"<span class='ev-bar' style='width:{fw:.2f}%;background:{color}'></span>"
+                f"<span class='ev-rval'>{_b(r['formula'])}</span></div>"
+                f"<div class='ev-rline'><span class='ev-rtag'>{t('ev.col_apparent')}</span>"
+                f"<span class='ev-bar' style='width:{aw:.2f}%;background:{color};opacity:.55'></span>"
+                f"<span class='ev-rval'>{_b(r['apparent'])}</span></div>"
+                f"</div><div class='ev-rverdict'>{badge}</div></div>")
+            if packed:
+                bars += (f"<div class='ev-packbox'><b>{t('ev.pack_box_title')}</b> "
+                         f"{t('ev.pack_box_body', bits=r['storageBits'], pack=r['pack'], true=r['trueBits'])}"
+                         f"<div class='ev-packviz'>"
+                         + "".join("<span class='ev-nib'>fp"
+                                   + str(r['trueBits']) + "</span>" for _ in range(r['pack']))
+                         + f"<span class='ev-nibeq'>= 1 byte ({r['storageBits']}-bit)</span></div></div>")
+
+        # Σ cross-check against the official index.json total_size
+        idx = a.get("index_total")
+        tot = a["total_bytes"]
+        if idx:
+            dev = abs(tot - idx) / idx
+            sigma = t("ev.sigma_ok", sigma=_gib(tot), idx=_gib(idx), dev=f"{dev:.1%}")
+        else:
+            sigma = t("ev.sigma_line", sigma=_gib(tot))
+        caption = f"<div class='ev-caption'>{t('ev.match_caption')}</div>"
+        sec_c = (f"<div class='ev-recon'>{bars}</div>{caption}"
+                 f"<div class='ev-sigma'>{sigma}</div>")
+
+    # ---------- KV footnote (runtime; formula only, no reconciliation) ----------
+    _, kv_desc = kv_per_token_elems(cfg)
+    kv_foot = (f"<div class='ev-foot'><b>{t('ev.kv_foot_title')}</b> {kv_desc}"
+               f"　<span class='ev-dim'>{t('ev.kv_foot_body')}</span></div>")
+
+    return (
+        f"<div class='ev-sec'><div class='ev-h'>{t('ev.sec_ab_title')}</div>"
+        f"<div class='ev-note'>{t('ev.sec_ab_note')}</div>{ab_table}</div>"
+        f"<div class='ev-sec'><div class='ev-h'>{t('ev.sec_c_title')}</div>"
+        f"<div class='ev-note'>{t('ev.sec_c_note')}</div>{sec_c}</div>"
+        f"{kv_foot}")
+
+
 def _build_lang_fragments(a: dict, cfg: dict, p: dict, is_moe: bool, short: str,
                           n_routed, L: int, dense_n: int, moe_n: int,
                           instances: dict, kv_auto: str, kv_choice: str, tot: float) -> dict:
@@ -1119,6 +1336,9 @@ def _build_lang_fragments(a: dict, cfg: dict, p: dict, is_moe: bool, short: str,
         "th_share": t("html.th_share"),
         "parallel_arrow": t("html.parallel_arrow"),
         "details_table_gpu": t("html.details_table_gpu"),
+        # evidence tab (first tab)
+        "evidence": build_evidence(a, cfg, p),
+        "tab_evidence": t("html.tab_evidence"),
     }
 
 
@@ -1319,6 +1539,7 @@ def main():
               file=sys.stderr)
 
     catalog = None
+    declared = None
     if not args.no_exact:
         try:
             catalog, declared = fetch_safetensors_catalog(args.model_id)
@@ -1334,6 +1555,7 @@ def main():
                 args.batch_tokens, args.overhead, catalog=catalog)
     a["kv_auto"] = kv_auto
     a["kv_choice"] = kv_choice
+    a["index_total"] = declared            # official total_size for the Σ cross-check
     report(a)
     if args.html:
         ctx_options = [int(v) for v in args.ctx_options.split(",")]
