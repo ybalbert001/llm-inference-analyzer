@@ -482,6 +482,8 @@ def kv_structure(cfg: dict) -> dict:
       linear_layers   — layers with fixed-size state instead of paged KV
       kv_groups       — [[count, window], ...] storage model; window=0 means
                         full context, window>0 means capped at min(ctx, window)
+      lin_state_per_req — bytes of fixed conv+ssm state per concurrent request
+                        summed over linear layers (0 when none/unknown dims)
       read_cap        — decode per-layer read cap in tokens (0 = full context)
       read_cap_layers — how many layers the read cap applies to
       warnings        — notes for structures whose numbers are still upper bounds
@@ -524,11 +526,33 @@ def kv_structure(cfg: dict) -> dict:
     if n_sliding:
         kv_groups.append([n_sliding, sliding_window])
 
+    # --- linear/SSM per-request fixed state (SGLang mamba pool) ---------------
+    # Qwen3.5/GDN-style: conv state (bf16) + ssm state per linear layer per
+    # request; grows with concurrency, not context. Verified against S0 g5
+    # startup log (conv 48 KiB + ssm 2 MiB per layer per slot).
+    lin_state_per_req = 0
     if n_linear:
+        k_hd, n_k = cfg.get("linear_key_head_dim"), cfg.get("linear_num_key_heads")
+        v_hd, n_v = cfg.get("linear_value_head_dim"), cfg.get("linear_num_value_heads")
+        kernel = cfg.get("linear_conv_kernel_dim") or 0
+        if k_hd and n_k and v_hd and n_v:
+            conv_b = (2 * k_hd * n_k + v_hd * n_v) * max(kernel - 1, 0) * 2
+            ssm_bytes = 4 if str(cfg.get("mamba_ssm_dtype", "")).startswith("float32") else 2
+            ssm_b = n_v * k_hd * v_hd * ssm_bytes
+            lin_state_per_req = n_linear * (conv_b + ssm_b)
+
+    if n_linear and lin_state_per_req:
+        warnings.append(
+            f"混合架构：{n_kv_layers}/{L} 层为 attention 存 KV，"
+            f"其余 {n_linear} 层为 linear/SSM 定长 state ≈ "
+            f"{lin_state_per_req / 2**20:.1f} MiB/请求（随并发不随 context 增长，"
+            f"并行页已计入静态区）。按 槽位数=并发数 的最小需求计；"
+            f"SGLang 默认启发式可能预分配更多槽，部署时建议显式设 --max-mamba-cache-size。")
+    elif n_linear:
         warnings.append(
             f"混合架构：{n_kv_layers}/{L} 层为 attention 存 KV，"
             f"其余 {n_linear} 层为 linear/SSM 定长 state（不计入 KV 池）；"
-            f"linear-attention state 显存暂未建模。")
+            f"config 缺 linear_* 维度字段，state 显存未建模。")
     if n_sliding:
         warnings.append(
             f"滑窗注意力：{n_sliding} 层 KV 存储上限已按 min(context, {sliding_window}) 计。")
@@ -564,6 +588,7 @@ def kv_structure(cfg: dict) -> dict:
         "n_layers": L,
         "n_kv_layers": n_kv_layers,
         "linear_layers": n_linear,
+        "lin_state_per_req": lin_state_per_req,
         "sliding_layers": n_sliding,
         "sliding_window": sliding_window,
         "kv_groups": kv_groups,
@@ -735,7 +760,11 @@ def analyze(model_id: str, cfg: dict, ctx: int, requests: int, kv_dtype: str,
     # ---- runtime: activation workspace scales with tokens in flight
     act_total, act_desc = activation_bytes(cfg, p, batch_tokens)
 
-    runtime_total = kv_total + act_total
+    # hybrid models: linear/SSM layers hold a fixed per-request state (SGLang
+    # mamba pool) — scales with concurrency, not context
+    lin_state_total = kv_struct["lin_state_per_req"] * requests
+
+    runtime_total = kv_total + act_total + lin_state_total
     grand = (total_bytes + runtime_total) * (1 + overhead)
 
     return {
@@ -746,6 +775,7 @@ def analyze(model_id: str, cfg: dict, ctx: int, requests: int, kv_dtype: str,
         "kv_struct": kv_struct,
         "kv_elems_total": elems * kv_layers,  # dtype-independent: elements/token over KV-bearing layers
         "kv_per_tok": kv_per_tok, "kv_per_req": kv_per_req, "kv_total": kv_total,
+        "lin_state_total": lin_state_total,
         "mha_total": mha_total, "mha_ratio": mha_ratio,
         "batch_tokens": batch_tokens, "act_total": act_total, "act_desc": act_desc,
         "runtime_total": runtime_total, "overhead": overhead, "grand": grand,
@@ -924,6 +954,10 @@ def report(a: dict):
           f" -> per request {human(a['kv_per_req'])} -> x{a['requests']} = {human(a['kv_total'])}")
     if a["mha_total"]:
         print(f"    (uncompressed MHA equivalent {human(a['mha_total'])}, MLA saves {a['mha_ratio']:,.0f}x)")
+    if a["lin_state_total"]:
+        print(f"  Linear/SSM state ({a['kv_struct']['linear_layers']} layers, fixed per request): "
+              f"{a['kv_struct']['lin_state_per_req'] / 2**20:,.1f} MiB/req"
+              f" -> x{a['requests']} = {human(a['lin_state_total'])}")
     print(f"  Activation workspace ({a['batch_tokens']:,} tokens/forward): {human(a['act_total'])}")
     print(f"    {a['act_desc']}")
     print(f"  runtime total: {human(a['runtime_total'])}")
@@ -1410,6 +1444,14 @@ def _build_lang_fragments(a: dict, cfg: dict, p: dict, is_moe: bool, short: str,
                           "<span id='d-kv-total'>…</span> GiB", None, kv_lines,
                           dtype="<span id='d-kv-dtype'>…</span>")
 
+    if a["kv_struct"]["lin_state_per_req"]:
+        runtime_cards += _card(7, t("card.lin_title", n_linear=a["kv_struct"]["linear_layers"]),
+                               "<span id='d-lin-total'>…</span> GiB", None,
+                               [t("card.lin_line",
+                                  mib=f"{a['kv_struct']['lin_state_per_req'] / 2**20:.1f}",
+                                  n_linear=a["kv_struct"]["linear_layers"]),
+                                t("card.lin_line2")])
+
     act_lines = [act_desc,
                  t("card.act_line2", batch_tokens=f"{a['batch_tokens']:,}"),
                  t("card.act_line3")]
@@ -1428,11 +1470,16 @@ def _build_lang_fragments(a: dict, cfg: dict, p: dict, is_moe: bool, short: str,
     weights_segs, weights_legend = _stacked_bar(wsegs)
 
     tsegs = [{"label": t("bar.weights_static_label"), "bytes": a["total_bytes"], "share": a["total_bytes"] / tot, "slot": 3 if is_moe else 2},
-             {"label": "KV Cache", "bytes": a["kv_total"], "share": a["kv_total"] / tot, "slot": 5},
-             {"label": "Activation", "bytes": a["act_total"], "share": a["act_total"] / tot, "slot": 6}]
+             {"label": "KV Cache", "bytes": a["kv_total"], "share": a["kv_total"] / tot, "slot": 5}]
+    if a["lin_state_total"]:
+        tsegs.append({"label": "linear/SSM state", "bytes": a["lin_state_total"],
+                      "share": a["lin_state_total"] / tot, "slot": 7})
+    tsegs.append({"label": "Activation", "bytes": a["act_total"], "share": a["act_total"] / tot, "slot": 6})
     total_segs, total_legend = _stacked_bar(tsegs)
 
+    lin_part = t("bar.lin_part", lin=_gib(a['lin_state_total'])) if a["lin_state_total"] else ""
     total_line = t("bar.total_line", w=_gib(a['total_bytes']), kv=_gib(a['kv_total']),
+                   lin_part=lin_part,
                    act=_gib(a['act_total']), ov=f"{a['overhead']:.0%}".rstrip('%'),
                    grand=_gib(a['grand']), kv_per_req=_gib(a['kv_per_req']))
 
@@ -1446,8 +1493,12 @@ def _build_lang_fragments(a: dict, cfg: dict, p: dict, is_moe: bool, short: str,
     trows += (f"<tr class='sep'><td><i class='dot' style='background:{_var(5)}'></i>"
               f"<span id='d-tbl-kv-label'>KV cache</span></td>"
               f"<td><span id='d-tbl-kv-dtype'>—</span></td>"
-              f"<td class='num'>—</td><td class='num'><span id='d-tbl-kv-val'>—</span></td><td class='num'>—</td></tr>"
-              f"<tr><td><i class='dot' style='background:{_var(6)}'></i>"
+              f"<td class='num'>—</td><td class='num'><span id='d-tbl-kv-val'>—</span></td><td class='num'>—</td></tr>")
+    if a["kv_struct"]["lin_state_per_req"]:
+        trows += (f"<tr><td><i class='dot' style='background:{_var(7)}'></i>"
+                  f"linear/SSM state ({a['kv_struct']['linear_layers']} layers)</td><td>—</td>"
+                  f"<td class='num'>—</td><td class='num'><span id='d-tbl-lin-val'>—</span></td><td class='num'>—</td></tr>")
+    trows += (f"<tr><td><i class='dot' style='background:{_var(6)}'></i>"
               f"activation ({a['batch_tokens']:,} tokens/forward)</td><td>bf16</td>"
               f"<td class='num'>—</td><td class='num'>{_gib(a['act_total'])}</td><td class='num'>—</td></tr>")
 
@@ -1603,6 +1654,8 @@ def render_html(a: dict, out_path: str, ctx_options: list, req_options: list,
         "L": L,
         "nKvLayers": a["kv_struct"]["n_kv_layers"],   # full-attn layers that hold paged KV
         "kvGroups": a["kv_struct"]["kv_groups"],       # [[count, window], ...] storage groups
+        "linLayers": a["kv_struct"]["linear_layers"],
+        "linStateBytes": a["kv_struct"]["lin_state_per_req"],  # fixed state per request, all linear layers
         "readCap": a["kv_struct"]["read_cap"],         # decode per-layer read cap (0=full ctx)
         "readCapLayers": a["kv_struct"]["read_cap_layers"],
         "kvWarnings": a.get("weight_warnings", []) + a["kv_struct"]["warnings"],

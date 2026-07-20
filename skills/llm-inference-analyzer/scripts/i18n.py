@@ -116,6 +116,15 @@ MSG = {
         "zh": "假如用 MHA 全存：<b><span id='d-mha'>…</span> GiB</b> —— MLA 压成 {kv_lora} 维共享 latent，省 <b>{ratio}×</b>",
         "en": "if stored as full MHA: <b><span id='d-mha'>…</span> GiB</b> — MLA compresses to a {kv_lora}-dim shared latent, saving <b>{ratio}×</b>",
     },
+    "card.lin_title": {"zh": "Linear/SSM state — {n_linear} 层定长 state × <span id='d-lin-req'>…</span> 并发",
+                        "en": "Linear/SSM state — {n_linear} layers × <span id='d-lin-req'>…</span> concurrent requests"},
+    "card.lin_line": {"zh": "每请求 {mib} MiB（conv + ssm state，{n_linear} 层合计）——随并发增长，与 context 无关",
+                       "en": "{mib} MiB per request (conv + ssm state over {n_linear} layers) — grows with concurrency, independent of context"},
+    "card.lin_line2": {"zh": "启动时随静态区一次性预分配（SGLang mamba 池），真实并发只占用/释放槽位；此处按 槽位数 = 并发数 的最小需求计，"
+                             "SGLang 默认启发式可能预分配更多槽（建议显式设 --max-mamba-cache-size）",
+                        "en": "pre-allocated once at startup with the static region (SGLang mamba pool); real traffic only claims/releases slots. "
+                              "Sized as slots = concurrency (minimum need) — SGLang's default heuristic may pre-allocate more "
+                              "(set --max-mamba-cache-size explicitly when deploying)"},
     "card.act_title": {"zh": "Activation 工作区 — {batch_tokens} tokens/forward", "en": "Activation workspace — {batch_tokens} tokens/forward"},
     "card.act_line2": {"zh": "一次 forward 最多 {batch_tokens} tokens（chunked prefill 上限），逐层执行，只有当前层的中间结果存活",
                         "en": "one forward pass handles at most {batch_tokens} tokens (chunked-prefill cap); layers execute sequentially, only the current layer's intermediates are live"},
@@ -128,10 +137,11 @@ MSG = {
     "bar.pct_paren": {"zh": "（{pct:.0f}%）", "en": " ({pct:.0f}%)"},
     "bar.total_head": {"zh": "静态 + 动态 · 部署总占用 ≈ {gib} GiB（context {ctx} × {req} 并发）",
                         "en": "Static + dynamic · total deployment footprint ≈ {gib} GiB (context {ctx} × {req} concurrent)"},
+    "bar.lin_part": {"zh": " + linear state {lin}", "en": " + linear state {lin}"},
     "bar.total_line": {
-        "zh": "权重 {w}（静态） + KV {kv} + Activation {act}（动态） + 碎片 ~{ov}% ≈ <b>{grand} GiB</b>"
+        "zh": "权重 {w}（静态） + KV {kv}{lin_part} + Activation {act}（动态） + 碎片 ~{ov}% ≈ <b>{grand} GiB</b>"
               "<span class='pct'>　·　KV 随 context × 并发线性增长：每并发 +{kv_per_req} GiB</span>",
-        "en": "Weights {w} (static) + KV {kv} + Activation {act} (dynamic) + ~{ov}% fragmentation ≈ <b>{grand} GiB</b>"
+        "en": "Weights {w} (static) + KV {kv}{lin_part} + Activation {act} (dynamic) + ~{ov}% fragmentation ≈ <b>{grand} GiB</b>"
               "<span class='pct'> · KV scales linearly with context × concurrency: +{kv_per_req} GiB per concurrent request</span>",
     },
 

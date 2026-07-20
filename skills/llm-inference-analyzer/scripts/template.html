@@ -214,22 +214,22 @@
     background:repeating-linear-gradient(45deg,transparent,transparent 5px,var(--grid) 5px,var(--grid) 6px) }
   .gpu-line { color:var(--ink2); font-size:11.5px; margin-top:6px }
   .gpu-line b { color:var(--ink) }
-  /* KV demand ÷ capacity bullet chart: light capacity zone + thick capacity
-     tick + dark demand fill; overflow past the tick is red */
-  .kvutil { display:flex; align-items:center; gap:8px; margin-top:6px }
-  .kvutil-lb { font-size:10.5px; color:var(--muted); white-space:nowrap }
-  .kvutil-track { flex:1; height:13px; border-radius:4px; background:var(--surface);
+  /* KV demand ÷ capacity bullet chart, styled like the membar above: demand
+     fills are full-height segments laid out horizontally (full-attn dark,
+     sliding light, side by side); the capacity zone behind them uses the same
+     diagonal hatch as the membar free block, so the visible hatched part reads
+     as remaining pool capacity. Overflow past the capacity tick is red. The %
+     figure lives in the kvUtilLine text below the bar. */
+  .kvutil { margin-top:6px }
+  .kvutil-track { height:20px; border-radius:4px; background:var(--surface);
     border:1px solid var(--grid); position:relative; overflow:hidden }
   .kvutil-capzone { position:absolute; left:0; top:0; height:100%;
-    background:color-mix(in srgb, var(--s5) 18%, transparent) }
-  .kvutil-fill { position:absolute; left:0; top:2px; height:9px; border-radius:2px;
-    background:var(--s5) }
-  .kvutil-fill.over { background:var(--s6); border-radius:0 2px 2px 0 }
+    background:repeating-linear-gradient(45deg,transparent,transparent 5px,var(--grid) 5px,var(--grid) 6px) }
+  .kvutil-fill { position:absolute; top:0; height:100% }
+  .kvutil-fill:hover { outline:2px solid var(--ink); outline-offset:-2px }
+  .kvutil-fill.over { background:var(--s6) }
   .kvutil-capline { position:absolute; top:-1px; bottom:-1px; width:3px; margin-left:-1px;
     background:var(--ink) }
-  .kvutil-pct { font-size:11px; color:var(--ink2); font-variant-numeric:tabular-nums;
-    min-width:38px; text-align:right }
-  .kvutil-pct.over { color:var(--s6); font-weight:600 }
   .chips { display:flex; gap:5px; flex-wrap:wrap; margin-top:8px; align-items:center }
   .chip { display:inline-flex; border:1px solid var(--grid); border-radius:5px; overflow:hidden;
     font-size:10.5px; line-height:1 }

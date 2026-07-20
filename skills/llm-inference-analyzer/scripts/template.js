@@ -44,8 +44,9 @@ var I18N = {
     totalHead: function (gib, ctxStr, req) {
       return '静态 + 动态 · 部署总占用 ≈ ' + gib + ' GiB（context ' + ctxStr + ' × ' + req + ' 并发）';
     },
-    totalLine: function (w, kv, act, ovPct, grand, kvPerReq) {
-      return '权重 ' + w + '（静态） + KV ' + kv + ' + Activation ' + act + '（动态） + 碎片 ~' +
+    totalLine: function (w, kv, act, ovPct, grand, kvPerReq, lin) {
+      return '权重 ' + w + '（静态） + KV ' + kv + (lin ? ' + linear state ' + lin : '') +
+        ' + Activation ' + act + '（动态） + 碎片 ~' +
         ovPct + '% ≈ <b>' + grand + ' GiB</b>' +
         "<span class='pct'>　·　KV 随 context × 并发线性增长：每并发 +" + kvPerReq + ' GiB</span>';
     },
@@ -62,10 +63,21 @@ var I18N = {
     freeTipLabel: function () { return '非静态区余量（CUDA graph 等）'; },
     freePct: function (pct) { return '（' + pct + '%）'; },
     cannotStart: function (gib) { return '静态区放不下权重，差 ' + gib + ' GiB，无法启动'; },
-    kvUtilBarLabel: function () { return 'KV 需求/容量'; },
     kvUtilTip: function (d, c, pct) {
       return '<b>KV 需求 ' + d + ' GiB ÷ 池容量 ' + c + ' GiB = ' + pct + '%</b><br>黑色刻度线 = 池容量位置；越过为红色超容';
     },
+    kvGroupTip: function (layers, window, gib0) {
+      return window
+        ? '<b>滑窗层 ×' + layers + '</b>&emsp;' + gib0 + ' GiB<br>每层存 min(context, ' + window + ') tokens，长 context 下饱和不再增长'
+        : '<b>全局层 ×' + layers + '</b>&emsp;' + gib0 + ' GiB<br>每层存全部 context，随 context 线性增长';
+    },
+    linStateLabel: function (req) { return 'linear/SSM state（' + req + ' 并发定长）'; },
+    linStateTipNote: function () {
+      return '启动时随静态区一次性预分配（SGLang mamba 池），真实并发只占用/释放槽位。'+
+        '此处按 槽位数 = 并发数 的最小需求计；SGLang 默认启发式可能预分配更多槽'+
+        '（建议部署时显式设 --max-mamba-cache-size）';
+    },
+    kvSlidingLegend: function () { return 'KV 需求：滑窗层（bullet 条浅色段）'; },
     kvUtilLine: function (d, c, pct, maxTok, ctxLbl, maxReq) {
       return 'KV 需求 <b>' + d + '</b> / 容量 <b>' + c + '</b> GiB（<b>' + pct + '%</b>）· 池容量 ≈ <b>' +
         maxTok + '</b> tokens（≈ ' + maxReq + ' 个 ' + ctxLbl + ' 满 context 请求）';
@@ -194,8 +206,9 @@ var I18N = {
     totalHead: function (gib, ctxStr, req) {
       return 'Static + dynamic · total deployment footprint ≈ ' + gib + ' GiB (context ' + ctxStr + ' × ' + req + ' concurrent)';
     },
-    totalLine: function (w, kv, act, ovPct, grand, kvPerReq) {
-      return 'Weights ' + w + ' (static) + KV ' + kv + ' + Activation ' + act + ' (dynamic) + ~' +
+    totalLine: function (w, kv, act, ovPct, grand, kvPerReq, lin) {
+      return 'Weights ' + w + ' (static) + KV ' + kv + (lin ? ' + linear state ' + lin : '') +
+        ' + Activation ' + act + ' (dynamic) + ~' +
         ovPct + '% fragmentation ≈ <b>' + grand + ' GiB</b>' +
         "<span class='pct'> · KV scales linearly with context × concurrency: +" + kvPerReq + ' GiB per concurrent request</span>';
     },
@@ -212,10 +225,21 @@ var I18N = {
     freeTipLabel: function () { return 'non-static headroom (CUDA graph etc.)'; },
     freePct: function (pct) { return ' (' + pct + '%)'; },
     cannotStart: function (gib) { return 'weights exceed static region by ' + gib + ' GiB — cannot start'; },
-    kvUtilBarLabel: function () { return 'KV demand/cap'; },
     kvUtilTip: function (d, c, pct) {
       return '<b>KV demand ' + d + ' GiB ÷ pool capacity ' + c + ' GiB = ' + pct + '%</b><br>black tick = pool capacity; red = overflow past it';
     },
+    kvGroupTip: function (layers, window, gib0) {
+      return window
+        ? '<b>sliding layers ×' + layers + '</b>&emsp;' + gib0 + ' GiB<br>each stores min(context, ' + window + ') tokens — saturates at long context'
+        : '<b>global layers ×' + layers + '</b>&emsp;' + gib0 + ' GiB<br>each stores the full context — grows linearly with context';
+    },
+    linStateLabel: function (req) { return 'linear/SSM state (fixed × ' + req + ' reqs)'; },
+    linStateTipNote: function () {
+      return 'Pre-allocated once at startup with the static region (SGLang mamba pool); real traffic only claims/releases slots. '+
+        'Sized here as slots = concurrency (minimum need); SGLang&#39;s default heuristic may pre-allocate more slots '+
+        '(set --max-mamba-cache-size explicitly when deploying)';
+    },
+    kvSlidingLegend: function () { return 'KV demand: sliding layers (light segment on bullet)'; },
     kvUtilLine: function (d, c, pct, maxTok, ctxLbl, maxReq) {
       return 'KV demand <b>' + d + '</b> / capacity <b>' + c + '</b> GiB (<b>' + pct + '%</b>) · pool ≈ <b>' +
         maxTok + '</b> tokens (≈ ' + maxReq + ' full-' + ctxLbl + '-context requests)';
@@ -395,7 +419,8 @@ function updateEstimate() {
   var kvPerTok = D.kvElemsPerLayer * (D.nKvLayers || D.L) * kvBytesPer(kvDtype);
   var kvPerReq = D.kvElemsPerLayer * kvLayerTokens(ctx) * kvBytesPer(kvDtype);
   var kvTotal = kvPerReq * req;
-  var runtime = kvTotal + D.actBytes;
+  var linTotal = (D.linStateBytes || 0) * req;
+  var runtime = kvTotal + linTotal + D.actBytes;
   var total = D.weightsBytes + runtime;
   var grand = total * (1 + D.overhead);
   var ctxStr = ctx.toLocaleString('en-US');
@@ -415,15 +440,20 @@ function updateEstimate() {
 
   var segs = [
     {label: Tr('weightsStaticLabel')(), bytes: D.weightsBytes, slot: D.weightsSlot},
-    {label: 'KV Cache', bytes: kvTotal, slot: 5},
-    {label: 'Activation', bytes: D.actBytes, slot: 6}
+    {label: 'KV Cache', bytes: kvTotal, slot: 5}
   ];
+  if (linTotal > 0) segs.push({label: 'linear/SSM state', bytes: linTotal, slot: 7});
+  segs.push({label: 'Activation', bytes: D.actBytes, slot: 6});
   setText('d-tot-head', Tr('totalHead')(gib(total), ctxStr, req));
   el('d-tot-bar').innerHTML = barHtml(segs, total);
   el('d-tot-legend').innerHTML = legendHtml(segs);
   el('d-total-line').innerHTML = Tr('totalLine')(
     gib(D.weightsBytes), gib(kvTotal), gib(D.actBytes),
-    Math.round(D.overhead * 100), gib(grand), gib(kvPerReq));
+    Math.round(D.overhead * 100), gib(grand), gib(kvPerReq),
+    linTotal > 0 ? gib(linTotal) : null);
+  setText('d-lin-total', gib(linTotal));
+  setText('d-tbl-lin-val', gib(linTotal));
+  setText('d-lin-req', req);
 
   setText('d-tbl-kv-label', Tr('tblKvLabel')(ctxStr, req));
   setText('d-tbl-kv-dtype', kvDtype);
@@ -434,7 +464,9 @@ function updateEstimate() {
 // component colors match the parallel structure column (design_2):
 // yellow embed / green attention / blue FFN / pink MTP / gray lm_head
 var C = { embed:'var(--s3)', lmHead:'var(--lmh)', attn:'var(--s2)', ffn:'var(--s1)',
-          mtp:'var(--s7)', others:'var(--s8)', kv:'var(--s5)', act:'var(--s6)' };
+          mtp:'var(--s7)', others:'var(--s8)', kv:'var(--s5)', act:'var(--s6)',
+          kvSliding:'color-mix(in srgb, var(--s5) 45%, var(--page))',
+          linState:'var(--s4)' };
 var COMPS = [
   {k:'embed',     label:'embed',        color:C.embed},
   {k:'lmHead',    label:'lm_head',      color:C.lmHead},
@@ -514,27 +546,40 @@ function gpuMemory(s, P){
   // KV demand: bytes this GPU must hold to serve ctx × req at the chosen sharding.
   // Stored token-positions honor sliding-window caps (kvLayerTokens); scale to
   // this pipeline stage's share of layers (exact when pp=1: n===L).
-  var stageLayerTokens = kvLayerTokens(P.ctx) * n / D.L;
-  var kvStage = D.kvElemsPerLayer * kvBytesPer(P.kvDtype) * stageLayerTokens * P.req;
-  var kv = P.dpAttn  ? kvStage/P.tp
-         : D.kvIsMla ? kvStage
-                     : kvStage/Math.min(P.tp, D.kvNKvHeads);
+  var kvShard = P.dpAttn  ? 1/P.tp
+              : D.kvIsMla ? 1
+                          : 1/Math.min(P.tp, D.kvNKvHeads);
+  // per storage group (full-context vs sliding-capped), for the split fill in
+  // kvUtilBar; kv is their sum, identical to the old aggregate formula.
+  var kvParts = (D.kvGroups && D.kvGroups.length ? D.kvGroups : [[D.nKvLayers||D.L, 0]])
+    .map(function(g0){
+      var tokens = g0[1] ? Math.min(P.ctx, g0[1]) : P.ctx;
+      return { layers:g0[0], window:g0[1],
+               b: D.kvElemsPerLayer * kvBytesPer(P.kvDtype) * g0[0] * tokens
+                  * (n/D.L) * P.req * kvShard };
+    });
+  var kv = 0; kvParts.forEach(function(g0){ kv += g0.b; });
   var act = D.actBytes/P.tp;
+  // linear/SSM fixed state (hybrid models): per-request, grows with concurrency
+  // not context. SGLang allocates it as a separate mamba pool inside the static
+  // region, so it competes with the paged-KV pool for the same budget. Assumes
+  // linear layers spread evenly across pp stages; heads shard by tp.
+  var linState = (D.linStateBytes||0) * P.req * n / D.L / P.tp;
   var cap = P.memGib*GIB, fixed = D.fixedGib*GIB;
   // SGLang-style allocation: the static region (frac × cap) is pre-allocated at
   // startup as weights + KV pool; whatever the weights don't take becomes KV
   // capacity. Activation / CUDA graph live in the (1-frac) non-static region.
   var staticBudget = P.frac*cap;
-  var kvCap = staticBudget - fixed - weights;
+  var kvCap = staticBudget - fixed - weights - linState;
   var canStart = kvCap > 0;
-  var used = canStart ? staticBudget + act : weights + fixed + act;
+  var used = canStart ? staticBudget + act : weights + fixed + linState + act;
   var maxReq = (canStart && kv > 0) ? Math.floor(kvCap*P.req/kv) : 0;
   // pool capacity in tokens (= SGLang max_total_num_tokens for this GPU):
   // demand kv covers ctx*req tokens, so tokens/byte = ctx*req/kv
   var maxTokens = (canStart && kv > 0) ? kvCap*P.ctx*P.req/kv : 0;
-  return { w:w, weights:weights, kv:kv, kvCap:Math.max(kvCap,0), kvCapRaw:kvCap,
-           canStart:canStart, act:act, used:used, maxReq:maxReq, maxTokens:maxTokens,
-           layers:[lo,hi], nDense:nd, nMoe:nm };
+  return { w:w, weights:weights, kv:kv, kvParts:kvParts, kvCap:Math.max(kvCap,0),
+           kvCapRaw:kvCap, canStart:canStart, act:act, used:used, maxReq:maxReq,
+           maxTokens:maxTokens, linState:linState, layers:[lo,hi], nDense:nd, nMoe:nm };
 }
 
 // experts held by tp rank t (EP grouping)
@@ -555,6 +600,8 @@ function memBar(m, P){
   var parts = [];
   COMPS.forEach(function(c){ if (m.w[c.k] > 0) parts.push({label:c.label, b:m.w[c.k], color:c.color}); });
   parts.push({label:Tr('fixedOverhead')(), b:D.fixedGib*GIB, color:'var(--fixed)'});
+  if (m.linState > 0) parts.push({label:Tr('linStateLabel')(P.req), b:m.linState,
+                                  color:C.linState, note:Tr('linStateTipNote')()});
   if (m.canStart) parts.push({label:Tr('kvCapLabel')(), b:m.kvCap, color:C.kv});
   function seg(s0){
     // clamp tiny-but-real segments to ~0.6% so they stay visible (activation
@@ -562,7 +609,8 @@ function memBar(m, P){
     var frac = Math.min(Math.max(s0.b/cap, 0.006), 1);
     return "<div class='seg' style='flex:"+frac.toFixed(6)+" 0 0;background:"+s0.color+
          "' data-tip='<b>"+s0.label+"</b>&emsp;"+gib(s0.b)+" GiB "+
-         "<span class=\"tpct\">"+Tr('gpuPctTip')(P.memGib, (s0.b/cap*100).toFixed(1))+"</span>'></div>";
+         "<span class=\"tpct\">"+Tr('gpuPctTip')(P.memGib, (s0.b/cap*100).toFixed(1))+"</span>"+
+         (s0.note ? "<br>"+s0.note : "")+"'></div>";
   }
   parts.forEach(function(s0){ h += seg(s0); });
   var free = cap - m.used;
@@ -583,22 +631,35 @@ function memBar(m, P){
 // max(demand, capacity); the capacity mark is a thick tick on a light track,
 // demand is the dark fill. Overflow past the tick turns red, so 216% and 500%
 // look different (the tick sits at a different position).
+// Hybrid-attention models get one fill segment per storage group (full-context
+// vs sliding-capped) so the two growth regimes are visually distinct: the full
+// segment scales with context, the sliding one saturates at its window.
 function kvUtilBar(m, P){
   if (!m.canStart || m.kvCap <= 0) return '';
   var ratio = m.kv/m.kvCap, pct = (ratio*100).toFixed(0), over = ratio > 1;
   var scale = Math.max(m.kv, m.kvCap);
   var capPos = m.kvCap/scale*100, fillW = m.kv/scale*100;
-  var okW = Math.min(fillW, capPos);
   var tip = Tr('kvUtilTip')(gib(m.kv), gib(m.kvCap), pct);
+  var fills = '', x = 0, split = m.kvParts.length > 1;
+  m.kvParts.forEach(function(g0){
+    var w0 = g0.b/scale*100, lo = Math.min(x, capPos), hi = Math.min(x+w0, capPos);
+    if (hi > lo){
+      var gtip = split ? Tr('kvGroupTip')(g0.layers, g0.window, gib(g0.b)) : tip;
+      fills += "<div class='kvutil-fill' style='left:"+lo.toFixed(2)+"%;width:"+(hi-lo).toFixed(2)+
+        "%;background:"+(g0.window ? C.kvSliding : C.kv)+"' data-tip='"+gtip+"'></div>";
+    }
+    x += w0;
+  });
+  // full-width track matching the membar above; the percentage lives in the
+  // kvUtilLine text below the bar, not beside it.
   var h = "<div class='kvutil' data-tip='"+tip+"'>"+
-    "<span class='kvutil-lb'>"+Tr('kvUtilBarLabel')()+"</span>"+
     "<div class='kvutil-track'>"+
       "<div class='kvutil-capzone' style='width:"+capPos.toFixed(2)+"%'></div>"+
-      "<div class='kvutil-fill' style='width:"+okW.toFixed(2)+"%'></div>"+
+      fills+
       (over ? "<div class='kvutil-fill over' style='left:"+capPos.toFixed(2)+"%;width:"+
               (fillW-capPos).toFixed(2)+"%'></div>" : '')+
       "<div class='kvutil-capline' style='left:"+capPos.toFixed(2)+"%'></div>"+
-    "</div><span class='kvutil-pct"+(over?' over':'')+"'>"+pct+"%</span></div>";
+    "</div></div>";
   return h;
 }
 
@@ -665,8 +726,8 @@ function updateParallel(){
         "<div class='gpu-head'><span class='gpu-name'>GPU-"+g+"</span>"+
         "<span class='gpu-rank'>pp"+s0+"·tp"+t+"</span>"+memTxt+"</div>"+
         memBar(m, P)+
-        kvUtilBar(m, P)+
         "<div class='gpu-line'>"+Tr('gpuLine')(gib(m.weights), gib(m.canStart?m.kvCap:0), gib(m.act), oom?'':Tr('freeTail')(gib(free)))+"</div>"+
+        kvUtilBar(m, P)+
         utilLine+
         chips(m, s0, t, P)+"</div>";
     }
@@ -697,6 +758,10 @@ function updateParallel(){
     }
   });
   lg += "<span class='lg'><i style='background:"+C.kv+"'></i>"+Tr('kvCapLabel')()+" ("+P.kvDtype+")</span>";
+  if ((D.kvGroups||[]).some(function(g0){ return g0[1] > 0; }))
+    lg += "<span class='lg'><i style='background:"+C.kvSliding+"'></i>"+Tr('kvSlidingLegend')()+"</span>";
+  if (D.linStateBytes > 0)
+    lg += "<span class='lg'><i style='background:"+C.linState+"'></i>"+Tr('linStateLabel')(P.req)+"</span>";
   lg += "<span class='lg'><i style='background:"+C.act+"'></i>activation</span>";
   lg += "<span class='lg'><i style='background:var(--fixed)'></i>"+Tr('fixedOverhead')()+"</span>";
   el('legend').innerHTML = lg;
