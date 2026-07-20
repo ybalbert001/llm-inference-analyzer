@@ -332,17 +332,23 @@ function Tr(key) { return (I18N[D.lang] || I18N.zh)[key]; }
 
 /* ============================ tab switching ============================ */
 function setTab(name) {
+  // evidence is the default (no body class); estimate/parallel/roofline are class-gated
+  document.body.classList.toggle('tab-estimate', name === 'estimate');
   document.body.classList.toggle('tab-parallel', name === 'parallel');
   document.body.classList.toggle('tab-roofline', name === 'roofline');
+  el('tab-btn-evidence').classList.toggle('active', name === 'evidence');
   el('tab-btn-estimate').classList.toggle('active', name === 'estimate');
   el('tab-btn-parallel').classList.toggle('active', name === 'parallel');
   el('tab-btn-roofline').classList.toggle('active', name === 'roofline');
   el('fnote').style.display = name === 'estimate' ? '' : 'none';
 }
+el('tab-btn-evidence').addEventListener('click', function(){ setTab('evidence'); });
 el('tab-btn-estimate').addEventListener('click', function(){ setTab('estimate'); });
 el('tab-btn-parallel').addEventListener('click', function(){ setTab('parallel'); });
 el('tab-btn-roofline').addEventListener('click', function(){ setTab('roofline'); });
 if (typeof location !== 'undefined') {
+  if (location.hash === '#evidence') setTab('evidence');
+  if (location.hash === '#estimate') setTab('estimate');
   if (location.hash === '#parallel') setTab('parallel');
   if (location.hash === '#roofline') setTab('roofline');
 }
@@ -1559,6 +1565,7 @@ if (D.nMoe){ el('f-ep').value = String(EP_INIT); }
 // numbers (KV/parallel/roofline) are re-derived by updateAll() below, which
 // already reads every string through Tr() and so picks up D.lang for free.
 var FRAG_IDS = {
+  'tab-evidence': 'evidence',
   'h-title': 'title', 'h-subtitle': 'subtitle', 'h-meta': 'meta',
   'h-struct-title': 'struct_title', 'h-struct': 'struct',
   'h-grp-static': 'grp_static', 'h-static-cards': 'static_cards',
@@ -1597,6 +1604,7 @@ function applyLangFragments(lang){
     if (prev && e.querySelector("option[value='" + prev + "']")) e.value = prev;
   });
   document.title = fr.page_title;
+  el('tab-btn-evidence').textContent = fr.tab_evidence;
   el('tab-btn-estimate').textContent = fr.tab_estimate;
   el('tab-btn-parallel').textContent = fr.tab_parallel;
   el('tab-btn-roofline').textContent = fr.tab_roofline;

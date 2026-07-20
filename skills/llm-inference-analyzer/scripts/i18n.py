@@ -136,9 +136,109 @@ MSG = {
     "html.lbl_custom_cards": {"zh": "卡", "en": "GPUs"},
     "html.fnote": {"zh": "KV Cache 与总占用随选择实时重算；权重（静态）部分不变",
                    "en": "KV cache and totals recompute live on selection; weights (static) stay fixed"},
+    "html.tab_evidence": {"zh": "推导依据", "en": "How We Know"},
     "html.tab_estimate": {"zh": "显存拆解", "en": "Memory Breakdown"},
     "html.tab_parallel": {"zh": "并行切分", "en": "Parallel Sharding"},
     "html.tab_roofline": {"zh": "性能 Roofline", "en": "Perf Roofline"},
+
+    # ---- evidence tab (build_evidence): why the weight numbers are trustworthy
+    # fused A+B: one row per component (config it uses → formula → param count)
+    "ev.sec_ab_title": {"zh": "A · 从 config 到参数量（每部件：用到哪些配置 → 套什么公式 → 得出多少参数）",
+                         "en": "A · From config to parameter count (per component: which fields → which formula → how many params)"},
+    "ev.sec_ab_note": {"zh": "每行 = 一个部件：左列是它在公式里用到的 config 字段（悬停看含义），右列套结构公式：符号 → 代入 config 数值 → 参数量。顶部一条是所有公式共用的全局输入。",
+                        "en": "Each row = one component: the left column lists the config fields its formula consumes (hover a chip for its meaning); the right column applies the structural formula: symbolic → config substituted → param count. The band on top holds the global inputs every formula shares."},
+    "ev.grp_global": {"zh": "全局输入（所有公式共用）", "en": "global inputs (shared by all formulas)"},
+    "ev.col_component": {"zh": "部件", "en": "component"},
+    "ev.col_config": {"zh": "用到的 config（悬停看含义）", "en": "config used (hover for meaning)"},
+    "ev.col_paramformula": {"zh": "参数量公式：符号 = 代入 = 结果", "en": "param formula: symbolic = substituted = result"},
+    "ev.sec_c_title": {"zh": "B · 双来源对账（独立第二证据）★",
+                        "en": "B · Two-source reconciliation (independent second evidence) ★"},
+    "ev.sec_c_note": {"zh": "每个部件有两个独立算出的参数量：① 上面的 config 公式；② 直接读真实权重文件（safetensors）的张量形状。两条等长 = 对上了 = 可信。",
+                       "en": "Each component has two independently derived parameter counts: ① the config formula above; ② the real tensor shapes read from the weight files (safetensors). Two equal bars = they agree = trustworthy."},
+    "ev.params": {"zh": "参数", "en": "params"},
+    # per-field hover explanations (Section A): <b>是什么</b> · 原理/好处（面向初学者）.
+    # Rendered inside the shared #tip bubble via innerHTML, so <b> works; text sits
+    # in a single-quoted data-tip='...' attribute, so NO apostrophes in the en strings.
+    "ev.f.hidden_size": {
+        "zh": "<b>每个 token 的向量宽度 H</b> · 几乎每个权重矩阵都有一条边是它，H 越大模型越「宽」，参数量随 H（常是 H²）增长。",
+        "en": "<b>Per-token vector width (H)</b> · one edge of almost every weight matrix, so params grow with H (often H squared); the single biggest size knob."},
+    "ev.f.num_hidden_layers": {
+        "zh": "<b>Transformer 层数 L</b> · 每层结构相同，权重 ≈ 单层 × L；层数越多越「深」、越强，但显存随 L 线性增长。",
+        "en": "<b>Number of layers (L)</b> · layers are identical, so weights are about one layer times L; deeper means stronger but memory grows linearly."},
+    "ev.f.vocab_size": {
+        "zh": "<b>词表大小</b> · embedding 和输出 lm_head 都是 vocab×hidden 的大矩阵；词表越大这两块越吃显存，小模型尤其明显。",
+        "en": "<b>Vocabulary size</b> · both the embedding and output lm_head are vocab×hidden matrices; a large vocab dominates memory, especially in small models."},
+    "ev.f.q_lora_rank": {
+        "zh": "<b>query 的低秩压缩维度</b> · MLA 先把 query 压到这个小维度再展开，省掉巨大的 Q 投影权重（原理：低秩分解 W ≈ A·B）。",
+        "en": "<b>Query low-rank dim</b> · MLA compresses the query to this small rank then expands it, shrinking the huge Q projection (principle: low-rank factorization W = A times B)."},
+    "ev.f.kv_lora_rank": {
+        "zh": "<b>KV 压成的共享 latent 宽度</b> · MLA 只缓存这个几百维的 latent、而非完整 K/V，KV cache 缩小约 10 倍 —— 长上下文省显存的关键。",
+        "en": "<b>Shared KV latent width</b> · MLA caches only this few-hundred-dim latent instead of full K/V, shrinking the KV cache roughly 10x — the key to cheap long context."},
+    "ev.f.qk_nope_head_dim": {
+        "zh": "<b>不带 RoPE 的 QK 分量</b> · 负责「内容」匹配；与 rope 分量相加得到每个 head 的 QK 总维度。",
+        "en": "<b>QK dim without RoPE</b> · carries content-based matching; added to the rope part to form each head total QK width."},
+    "ev.f.qk_rope_head_dim": {
+        "zh": "<b>带 RoPE 旋转位置编码的 QK 分量</b> · 让注意力感知 token 的「位置」；MLA 把位置与内容拆开分别处理。",
+        "en": "<b>QK dim carrying RoPE</b> · gives attention its positional sense; MLA separates position from content and handles each apart."},
+    "ev.f.v_head_dim": {
+        "zh": "<b>每个 value head 的维度</b> · 决定注意力输出宽度，进而决定 o 投影大小；MLA 里可与 qk 维度不同。",
+        "en": "<b>Per value-head dim</b> · sets the attention output width and thus the o-projection size; in MLA it may differ from the qk dim."},
+    "ev.f.num_attention_heads": {
+        "zh": "<b>注意力头数</b> · 把 attention 拆成多个并行子空间，各自关注不同模式；总维度 = heads × head_dim。",
+        "en": "<b>Number of attention heads</b> · splits attention into parallel subspaces that each focus on different patterns; total dim = heads times head_dim."},
+    "ev.f.num_key_value_heads": {
+        "zh": "<b>KV 头数</b> · GQA 让多个 query 头共享少数 KV 头，KV cache 按 KV 头数缩小（原理：K/V 比 Q 更可压缩）。",
+        "en": "<b>KV heads</b> · GQA lets many query heads share a few KV heads, shrinking the KV cache in proportion (principle: K/V compress better than Q)."},
+    "ev.f.head_dim": {
+        "zh": "<b>每个注意力头的维度</b> · 点积在这个维度上进行，决定单头的表达力与计算量。",
+        "en": "<b>Per attention-head dim</b> · the dot-product runs over this dim, setting the capacity and compute of each head."},
+    "ev.f.first_k_dense_replace": {
+        "zh": "<b>前几层用 Dense FFN</b> · 靠前的层用普通「胖」FFN 更稳定，之后才换成 MoE；这个数就是分界层。",
+        "en": "<b>First N layers stay Dense FFN</b> · early layers use a plain wide FFN for stability before switching to MoE; this is the cutover count."},
+    "ev.f.n_routed_experts": {
+        "zh": "<b>路由专家总数</b> · 显存绝对大头 —— 所有专家都要常驻显存，哪怕每 token 只用几个（原理：容量靠「多专家」，算力靠「稀疏激活」）。",
+        "en": "<b>Total routed experts</b> · the memory hog — every expert stays resident in VRAM even though each token uses only a few (principle: capacity from many experts, compute stays sparse)."},
+    "ev.f.num_experts_per_tok": {
+        "zh": "<b>每 token 激活的专家数 (top-k)</b> · 只影响计算量、不影响显存；这正是 MoE「省算力不省显存」的原因。",
+        "en": "<b>Experts activated per token (top-k)</b> · affects compute only, not memory — exactly why MoE saves flops but not VRAM."},
+    "ev.f.moe_intermediate_size": {
+        "zh": "<b>每个专家的中间层宽度</b> · 比 Dense FFN「瘦」很多；乘以专家数才是总量。",
+        "en": "<b>Per-expert intermediate width</b> · much narrower than a Dense FFN; multiply by the expert count for the total."},
+    "ev.f.n_shared_experts": {
+        "zh": "<b>每层常驻的共享专家</b> · 所有 token 都会经过，负责通用知识，与被路由的专属专家互补。",
+        "en": "<b>Always-on shared experts</b> · every token passes through them for common knowledge, complementing the routed specialists."},
+    "ev.f.intermediate_size": {
+        "zh": "<b>FFN 中间层宽度</b> · FFN 先升维到这里再降回，通常是 hidden 的 3–4 倍，是 Dense 模型的参数大头。",
+        "en": "<b>FFN intermediate width</b> · the FFN expands to this (usually 3-4x hidden) then back down; the bulk of a dense model params."},
+    "ev.f.index_n_heads": {
+        "zh": "<b>DSA 稀疏索引头数</b> · 只用来挑「该关注哪些 token」，省的是算力不是显存；本身几乎不产生权重。",
+        "en": "<b>DSA sparse-index heads</b> · used only to choose which tokens to attend to — saves compute, not memory, and adds almost no weights."},
+    "ev.f.num_nextn_predict_layers": {
+        "zh": "<b>MTP 额外预测层数</b> · 投机解码：一次前向多猜几个 token 来提速；不需要时可不加载、省显存。",
+        "en": "<b>Extra MTP predict layers</b> · speculative decoding guesses several tokens per forward pass for speed; skip loading them to save memory."},
+    "ev.f.quant": {
+        "zh": "<b>有效精度 {bpp} 字节/参数</b> · 把「参数量」换算成「字节数」的乘数；fp8=1、bf16=2、fp4≈0.5，越低越省显存。",
+        "en": "<b>Effective {bpp} bytes/param</b> · the multiplier turning param count into bytes; fp8=1, bf16=2, fp4=0.5 — lower saves memory."},
+    "ev.mtp_composite": {"zh": "一整套额外的 attention + MoE 专家 + eh_proj",
+                          "en": "a full extra attention + MoE experts + eh_proj"},
+    "ev.col_formula": {"zh": "① 公式", "en": "① formula"},
+    "ev.col_apparent": {"zh": "② 实测", "en": "② safetensors"},
+    "ev.verdict_match": {"zh": "吻合", "en": "match"},
+    "ev.verdict_pack": {"zh": "打包", "en": "packed"},
+    "ev.match_caption": {"zh": "↑ 两条等长 = 两个独立来源算出同一个数 = 可信",
+                          "en": "↑ equal bars = two independent sources produced the same number = trustworthy"},
+    "ev.pack_box_title": {"zh": "为什么实测只有一半？", "en": "Why is the measured bar half-length?"},
+    "ev.pack_box_body": {
+        "zh": "两个 {true}-bit 值被打包进 1 个 {bits}-bit 字节（safetensors 头因此显示成整数类型、宽度砍半）。存储省了 {pack}×，参数一个没少 —— 真实位宽 = {bits} ÷ {pack}：",
+        "en": "Two {true}-bit values are packed into one {bits}-bit byte (so the safetensors header shows an integer type at half width). Storage shrinks {pack}×, no parameters are lost — true bit width = {bits} ÷ {pack}:"},
+    "ev.sigma_ok": {"zh": "Σ 逐部件加总 = {sigma} GiB　✓ 与 index.json 声明的 total_size {idx} GiB 一致（偏差 {dev}）",
+                     "en": "Σ over components = {sigma} GiB　✓ matches index.json's declared total_size {idx} GiB (dev {dev})"},
+    "ev.sigma_line": {"zh": "Σ 逐部件加总 = {sigma} GiB", "en": "Σ over components = {sigma} GiB"},
+    "ev.no_exact": {"zh": "本次未读取 safetensors（--no-exact 或网络失败）——仅有 config 公式估算，无法交叉验证。上面 A/B 的推导依然成立，但缺少独立第二来源的核对。",
+                     "en": "safetensors was not read this run (--no-exact or network failure) — formula estimate only, no cross-check available. The A/B derivations above still hold, but lack the independent second source."},
+    "ev.kv_foot_title": {"zh": "KV cache 每 token 公式（运行时）：", "en": "KV cache per-token formula (runtime):"},
+    "ev.kv_foot_body": {"zh": "纯公式、无 safetensors 对账（KV 是运行时分配，不在权重文件里）；总量见「显存拆解」页。",
+                         "en": "formula only, no safetensors reconciliation (KV is allocated at runtime, not in the weight files); see the Memory Breakdown tab for totals."},
     "html.grp_static": {"zh": "静态 · 模型权重（加载即占用，与流量无关）", "en": "Static · Model Weights (paid at load, independent of traffic)"},
     "html.grp_runtime": {"zh": "动态 · 运行时内存（随 context × 并发请求增长）", "en": "Dynamic · Runtime Memory (grows with context × concurrent requests)"},
     "html.details_table_all": {"zh": "表格视图（全部部件）", "en": "Table view (all components)"},
