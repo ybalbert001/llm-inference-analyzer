@@ -48,6 +48,8 @@
   body:not(.tab-estimate):not(.tab-parallel):not(.tab-roofline) .filters { display:none }
   #custom-box { display:none; gap:10px; align-items:center }
   .warnmsg { color:var(--s6); font-size:12.5px; width:100%; display:none }
+  .kvwarn { margin:6px 0 0 }
+  .kvwarn .kvw { color:var(--s6); font-size:12px; line-height:1.5; margin:2px 0 }
 
   /* tabs */
   .tabs { display:flex; gap:8px; margin:0 0 20px }
@@ -298,6 +300,7 @@
       <h1 id="h-title">$title</h1>
       <p class="subtitle" id="h-subtitle">$subtitle</p>
       <p class="meta" id="h-meta">$meta</p>
+      <div id="kv-warnings" class="kvwarn"></div>
     </div>
     <div class="langsw" id="langsw">
       <button data-lang="zh" id="lang-btn-zh">中文</button>

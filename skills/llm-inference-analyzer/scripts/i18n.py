@@ -56,6 +56,17 @@ MSG = {
     "struct.mtp_entry": {"zh": "MTP 预测层 ×{n_mtp}", "en": "MTP predict layer ×{n_mtp}"},
     "struct.lmhead_exit": {"zh": "lm_head（出口）", "en": "lm_head (output)"},
     "struct.lmhead_shared": {"zh": "lm_head（与 embed 共享）", "en": "lm_head (shared with embed)"},
+    # attention-type annotations on the layer's attention sub-block
+    "struct.attn_swa": {"zh": " · 滑窗 KV≤{window}", "en": " · sliding KV≤{window}"},
+    "struct.attn_dsa": {"zh": " · DSA 稀疏读 top-{topk}", "en": " · DSA sparse read top-{topk}"},
+    "struct.attn_sparse": {"zh": " · 块稀疏读 top-{cap}", "en": " · block-sparse read top-{cap}"},
+    # hybrid models: linear-attention layers are a structurally distinct block
+    "struct.linear_block": {"zh": "① Linear attention（定长 state，无 KV）",
+                            "en": "① Linear attention (fixed state, no KV)"},
+    "struct.hybrid_ellipsis": {"zh": "⋮ 共 {L} 层：{n_full} 层 full attention（存 KV）+ {n_linear} 层 linear（无 KV）交替",
+                               "en": "⋮ {L} layers: {n_full} full-attention (KV) + {n_linear} linear (no KV), interleaved"},
+    "struct.swa_ellipsis": {"zh": "⋮ 共 {L} 层：{n_full} 层全局 + {n_sliding} 层滑窗（KV≤{window}）",
+                            "en": "⋮ {L} layers: {n_full} global + {n_sliding} sliding (KV≤{window})"},
 
     # ---- static weight cards (render_html)
     "card.embed_lmhead_line": {"zh": "{mult} {vocab}（词表）× {H}", "en": "{mult} {vocab} (vocab) × {H}"},

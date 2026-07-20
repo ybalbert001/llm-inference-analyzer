@@ -10,6 +10,18 @@ function el(id) { return document.getElementById(id); }
 function setText(id, txt) { var e = el(id); if (e) e.textContent = txt; }
 // fp4 = mxfp4: 0.5 B data + 1 uint8 scale per 16 elements
 function kvBytesPer(dtype) { return dtype === 'fp8' ? 1 : dtype === 'fp4' ? 0.5625 : 2; }
+// stored KV token-positions summed over layers, honoring sliding-window caps.
+// kvGroups: [[layerCount, window], ...]; window=0 = full context. Falls back to
+// nKvLayers×ctx (or L×ctx) when no group model is present.
+function kvLayerTokens(ctx) {
+  var g = D.kvGroups;
+  if (g && g.length) {
+    var s = 0;
+    for (var i = 0; i < g.length; i++) s += g[i][0] * (g[i][1] ? Math.min(ctx, g[i][1]) : ctx);
+    return s;
+  }
+  return (D.nKvLayers || D.L) * ctx;
+}
 function ctxLabel(v) { return v % 1048576 === 0 ? (v / 1048576) + 'M' : (v / 1024) + 'K'; }
 // human token count: 1.94M / 317K / 512
 function tokLabel(v) {
@@ -380,8 +392,8 @@ function updateEstimate() {
   var req = +el('f-req').value;
   var kvSel = el('f-kv').value;
   var kvDtype = kvDtypeNow();
-  var kvPerTok = D.kvElemsPerLayer * D.L * kvBytesPer(kvDtype);
-  var kvPerReq = kvPerTok * ctx;
+  var kvPerTok = D.kvElemsPerLayer * (D.nKvLayers || D.L) * kvBytesPer(kvDtype);
+  var kvPerReq = D.kvElemsPerLayer * kvLayerTokens(ctx) * kvBytesPer(kvDtype);
   var kvTotal = kvPerReq * req;
   var runtime = kvTotal + D.actBytes;
   var total = D.weightsBytes + runtime;
@@ -499,8 +511,11 @@ function gpuMemory(s, P){
   w.others = n*(L.norms + L.indexer) + nm*L.moeGate;
 
   var weights = 0; for (var k in w) weights += w[k];
-  // KV demand: bytes this GPU must hold to serve ctx × req at the chosen sharding
-  var kvStage = D.kvElemsPerLayer * kvBytesPer(P.kvDtype) * n * P.ctx * P.req;
+  // KV demand: bytes this GPU must hold to serve ctx × req at the chosen sharding.
+  // Stored token-positions honor sliding-window caps (kvLayerTokens); scale to
+  // this pipeline stage's share of layers (exact when pp=1: n===L).
+  var stageLayerTokens = kvLayerTokens(P.ctx) * n / D.L;
+  var kvStage = D.kvElemsPerLayer * kvBytesPer(P.kvDtype) * stageLayerTokens * P.req;
   var kv = P.dpAttn  ? kvStage/P.tp
          : D.kvIsMla ? kvStage
                      : kvStage/Math.min(P.tp, D.kvNKvHeads);
@@ -665,7 +680,7 @@ function updateParallel(){
 
   // summary + legend
   var repl = clusterWeights - D.weightsBytes;
-  var kvSingle = D.kvElemsPerLayer*kvBytesPer(P.kvDtype)*D.L*P.ctx*P.req;
+  var kvSingle = D.kvElemsPerLayer*kvBytesPer(P.kvDtype)*kvLayerTokens(P.ctx)*P.req;
   var kvRepl = clusterKv/kvSingle;
   el('sum-head').textContent = 'TP'+P.tp+' × PP'+P.pp+(D.nMoe?' × EP'+P.ep:'')+
     Tr('sumHeadTail')(world, nNodes, P.instLabel,
@@ -1022,7 +1037,34 @@ function calculateDsaAttentionPattern(workload, pattern) {
 }
 
 /**
- * Select the dense or DSA access-pattern calculator.
+ * Capped attention (sliding window or block-sparse) across a subset of layers.
+ *
+ * `capLayers` of the total layers cap each query at min(context, cap) keys; the
+ * remaining layers are dense (full context). This splits the per-layer read
+ * accordingly, so MiniMax-style 57/60-sparse or Gemma-style 5:1-sliding models
+ * are not treated as fully dense.
+ */
+function calculateCappedAttentionPattern(workload, pattern) {
+  var S = workload.contextTokens, B = workload.decodeTokens, T = workload.prefillTokens;
+  var capL = Math.min(pattern.capLayers, workload.layers);
+  var denseL = workload.layers - capL;
+  var attended = Math.min(S, pattern.cap);
+  var decodeKvReads = B * (attended * capL + S * denseL);
+  var prefillPairsCapped = cappedCausalPairs(T, pattern.cap) * capL
+                         + denseCausalPairs(T) * denseL;
+  return {
+    label: Tr('dsaLabel') ? Tr('dsaLabel')(pattern.cap) : 'capped',
+    decodePairs: decodeKvReads,
+    prefillPairs: prefillPairsCapped,
+    decodeKvReads: decodeKvReads,
+    prefillKvReads: T * workload.layers,
+    decodeNote: Tr('dsaDecodeNote')(ctxLabel(S), attended) + ' × ' + capL + 'L',
+    prefillNote: Tr('dsaPrefillNote')(pattern.cap)
+  };
+}
+
+/**
+ * Select the dense / DSA / capped access-pattern calculator.
  *
  * Output: pair counts for FLOPs and KV-key read counts for ideal HBM traffic.
  */
@@ -1030,6 +1072,7 @@ function calculateAttentionPattern(workload) {
   var pattern = workload.attentionPattern;
   if (pattern.kind === 'dense') return calculateDenseAttentionPattern(workload);
   if (pattern.kind === 'dsa') return calculateDsaAttentionPattern(workload, pattern);
+  if (pattern.kind === 'capped') return calculateCappedAttentionPattern(workload, pattern);
   throw new Error('Unsupported attention pattern: ' + pattern.kind);
 }
 
@@ -1541,6 +1584,14 @@ function updateRoofline() {
 })();
 
 function updateAll(){ updateEstimate(); updateParallel(); updateRoofline(); }
+
+function renderKvWarnings(){
+  var box = el('kv-warnings');
+  if (!box) return;
+  var ws = D.kvWarnings || [];
+  box.innerHTML = ws.map(function(w){ return "<div class='kvw'>⚠ "+w+"</div>"; }).join('');
+}
+renderKvWarnings();
 // shared filters drive all tabs; parallel/instance filters drive their tabs
 ['f-ctx','f-req','f-kv'].forEach(function(id){
   el(id).addEventListener('change', updateAll);

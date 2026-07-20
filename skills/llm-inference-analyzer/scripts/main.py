@@ -400,12 +400,24 @@ def count_params(cfg: dict) -> dict:
     inter = cfg.get("intermediate_size") or 4 * H  # some configs omit it (all-MoE nets)
     n_routed = cfg.get("n_routed_experts") or cfg.get("num_experts") or cfg.get("num_local_experts") or 0
     if n_routed:
-        first_dense = cfg.get("first_k_dense_replace", 0)
+        # Field-alias trap: most models use `intermediate_size` for dense layers
+        # and `moe_intermediate_size` for experts. MiniMax reverses it —
+        # `intermediate_size` is the expert size and `dense_intermediate_size`
+        # holds the dense-layer size — so pick the dense size explicitly.
+        dense_inter = cfg.get("dense_intermediate_size") or inter
+        moe_inter = (cfg.get("moe_intermediate_size")
+                     or cfg.get("intermediate_size") or 4 * H)
+        # dense-layer count: `first_k_dense_replace`, or the leading 0s of a
+        # per-layer `moe_layer_freq` array (MiniMax-style), else 0.
+        mlf = cfg.get("moe_layer_freq")
+        if isinstance(mlf, list) and mlf:
+            first_dense = sum(1 for x in mlf if not x)
+        else:
+            first_dense = cfg.get("first_k_dense_replace", 0)
         moe_layers = L - first_dense
-        moe_inter = cfg.get("moe_intermediate_size", inter)
         n_shared = cfg.get("n_shared_experts", 0) or 0
         expert = 3 * H * moe_inter                 # gate/up/down
-        p["dense_ffn"] = 3 * H * inter * first_dense
+        p["dense_ffn"] = 3 * H * dense_inter * first_dense
         p["moe_routed"] = expert * n_routed * moe_layers
         p["moe_shared"] = expert * n_shared * moe_layers
         p["moe_gate"] = (H * n_routed + n_routed) * moe_layers  # router + e_score bias
@@ -450,6 +462,117 @@ def kv_per_token_elems(cfg: dict) -> tuple[int, str]:
     return elems, t("kv.gqa_desc", kind=kind, n_kv=n_kv, head_dim=head_dim, elems=elems)
 
 
+def kv_structure(cfg: dict) -> dict:
+    """Classify layers into KV-storage groups and derive a decode read cap.
+
+    Two independent things matter, and the tool used to conflate them:
+
+    * **KV storage (VRAM pool)** — how many token-positions each layer keeps.
+      Global full-attention layers store the whole context; sliding-window
+      layers store only `min(context, window)`; linear/SSM layers keep a fixed
+      recurrent state (no paged KV). Block-sparse layers still store the full
+      context (all blocks must be retained to select top-k), so they save no
+      storage — only reads.
+    * **decode read (roofline)** — how many KV positions each query attends per
+      step. Sliding, block-sparse, and DSA all cap this below full context.
+
+    Returns:
+      n_layers        — total transformer blocks
+      n_kv_layers     — layers that hold paged KV (storage side)
+      linear_layers   — layers with fixed-size state instead of paged KV
+      kv_groups       — [[count, window], ...] storage model; window=0 means
+                        full context, window>0 means capped at min(ctx, window)
+      read_cap        — decode per-layer read cap in tokens (0 = full context)
+      read_cap_layers — how many layers the read cap applies to
+      warnings        — notes for structures whose numbers are still upper bounds
+    """
+    L = cfg["num_hidden_layers"]
+    warnings = []
+    sliding_window = cfg.get("sliding_window") or 0
+    swp = cfg.get("sliding_window_pattern")
+    layer_types = cfg.get("layer_types")
+
+    # --- classify each layer into: 'full', 'sliding', or 'linear' ------------
+    # 'full' = holds full-context paged KV (incl. sparse-attention variants like
+    # deepseek_sparse_attention — DSA caps *reads*, not storage). 'linear' = a
+    # fixed-size recurrent/SSM state, no paged KV. 'sliding' = capped KV storage.
+    kinds = []
+    if isinstance(layer_types, list) and layer_types:
+        for x in layer_types:
+            xs = str(x).lower()
+            if "sliding" in xs:
+                kinds.append("sliding")
+            elif any(k in xs for k in ("linear", "mamba", "recurrent", "conv", "ssm")):
+                kinds.append("linear")
+            else:                       # full_attention / *_sparse_attention / attention
+                kinds.append("full")
+    elif sliding_window and isinstance(swp, int) and swp > 1:
+        # Gemma-style: every swp-th layer is global, the rest sliding.
+        kinds = ["full" if (i + 1) % swp == 0 else "sliding" for i in range(L)]
+    else:
+        kinds = ["full"] * L
+
+    n_full = kinds.count("full")
+    n_sliding = kinds.count("sliding")
+    n_linear = kinds.count("linear")
+    n_kv_layers = n_full + n_sliding    # both hold paged KV; sliding is capped
+
+    # --- storage groups ------------------------------------------------------
+    kv_groups = []
+    if n_full:
+        kv_groups.append([n_full, 0])
+    if n_sliding:
+        kv_groups.append([n_sliding, sliding_window])
+
+    if n_linear:
+        warnings.append(
+            f"混合架构：{n_kv_layers}/{L} 层为 attention 存 KV，"
+            f"其余 {n_linear} 层为 linear/SSM 定长 state（不计入 KV 池）；"
+            f"linear-attention state 显存暂未建模。")
+    if n_sliding:
+        warnings.append(
+            f"滑窗注意力：{n_sliding} 层 KV 存储上限已按 min(context, {sliding_window}) 计。")
+
+    # sliding_window present but layers not identifiable → do NOT cap storage
+    if sliding_window and not n_sliding:
+        warnings.append(
+            f"检出 sliding_window={sliding_window} 但无法从 config 判定哪些层滑窗；"
+            f"KV 存储未封顶（保守按全 context 计，可能高估）。")
+
+    # --- decode read cap (roofline) ------------------------------------------
+    read_cap = 0
+    read_cap_layers = 0
+    sparse = cfg.get("sparse_attention_config")
+    if isinstance(sparse, dict) and sparse.get("use_sparse_attention"):
+        cap = (sparse.get("sparse_topk_blocks", 0)
+               * sparse.get("sparse_block_size", 0)) or 0
+        freq = sparse.get("sparse_attention_freq")
+        n_sparse = sum(freq) if isinstance(freq, list) else L
+        read_cap, read_cap_layers = cap, n_sparse
+        warnings.append(
+            f"块稀疏注意力：{n_sparse} 层 decode 读取封顶 min(context, {cap}) tokens；"
+            f"KV 存储仍为全量（块稀疏需保留全部块）。")
+    elif cfg.get("index_topk") is not None:
+        read_cap, read_cap_layers = int(cfg["index_topk"]), L
+        warnings.append(
+            f"DSA top-k 稀疏：decode 读取封顶 min(context, {cfg['index_topk']})；"
+            f"逐层稀疏频率（index_topk_freq 等）未区分。")
+    elif n_sliding:
+        read_cap, read_cap_layers = sliding_window, n_sliding
+
+    return {
+        "n_layers": L,
+        "n_kv_layers": n_kv_layers,
+        "linear_layers": n_linear,
+        "sliding_layers": n_sliding,
+        "sliding_window": sliding_window,
+        "kv_groups": kv_groups,
+        "read_cap": read_cap,
+        "read_cap_layers": read_cap_layers,
+        "warnings": warnings,
+    }
+
+
 def attention_core_spec(cfg: dict) -> dict:
     """Raw dimensions needed by the in-page attention-core roofline model.
 
@@ -483,12 +606,20 @@ def attention_core_spec(cfg: dict) -> dict:
             "valueHeadDim": head_dim,
         }
 
+    # decode read pattern: DSA / block-sparse / sliding all cap the per-step KV
+    # read below full context. ks carries the cap and how many of the L layers
+    # it applies to (capLayers); the JS treats the remaining layers as dense.
+    ks = kv_structure(cfg)
+    L = cfg["num_hidden_layers"]
     index_topk = cfg.get("index_topk")
-    pattern = (
-        {"kind": "dsa", "topk": int(index_topk)}
-        if index_topk is not None
-        else {"kind": "dense"}
-    )
+    if index_topk is not None:
+        pattern = {"kind": "dsa", "topk": int(index_topk),
+                   "capLayers": ks["read_cap_layers"] or L, "totalLayers": L}
+    elif ks["read_cap"]:
+        pattern = {"kind": "capped", "cap": ks["read_cap"],
+                   "capLayers": ks["read_cap_layers"] or L, "totalLayers": L}
+    else:
+        pattern = {"kind": "dense"}
     return {"geometry": geometry, "pattern": pattern}
 
 
@@ -575,7 +706,7 @@ def analyze(model_id: str, cfg: dict, ctx: int, requests: int, kv_dtype: str,
     if p["moe_layers"]:
         topk = cfg.get("num_experts_per_tok", 0)
         H = cfg["hidden_size"]
-        moe_inter = cfg.get("moe_intermediate_size")
+        moe_inter = cfg.get("moe_intermediate_size") or cfg.get("intermediate_size") or 4 * H
         moe_routed_params = next((c["params"] for c in comps if c["key"] == "moe_routed"), 0)
         mtp_params = next((c["params"] for c in comps if c["key"] == "mtp"), 0)
         active = (total_params - moe_routed_params - mtp_params
@@ -583,16 +714,22 @@ def analyze(model_id: str, cfg: dict, ctx: int, requests: int, kv_dtype: str,
 
     # ---- runtime: KV cache scales with context x running requests
     elems, kv_desc = kv_per_token_elems(cfg)
+    kv_struct = kv_structure(cfg)
+    kv_layers = kv_struct["n_kv_layers"]   # layers holding paged KV (full + sliding)
     # fp4 (mxfp4/e2m1): 0.5 B data + 1 uint8 scale per 16 elements (SGLang memory_pool)
     kvb = {"fp16": 2, "bf16": 2, "fp8": 1, "fp4": 0.5 + 1 / 16}[kv_dtype]
-    kv_per_tok = elems * L * kvb
-    kv_per_req = kv_per_tok * ctx
+    # sum stored token-positions across storage groups: full layers keep ctx,
+    # sliding layers keep min(ctx, window). layer_tokens is the ctx-weighted
+    # layer count that a single request's KV occupies.
+    layer_tokens = sum(n * (min(ctx, w) if w else ctx) for n, w in kv_struct["kv_groups"])
+    kv_per_tok = elems * kv_layers * kvb    # nominal (all KV layers at full ctx), for display
+    kv_per_req = elems * layer_tokens * kvb
     kv_total = kv_per_req * requests
     mha_total = mha_ratio = None
     if p["is_mla"]:
         n_heads = cfg["num_attention_heads"]
         mha_elems = n_heads * (cfg["qk_nope_head_dim"] + cfg["qk_rope_head_dim"] + cfg["v_head_dim"])
-        mha_total = mha_elems * L * kvb * ctx * requests
+        mha_total = mha_elems * layer_tokens * kvb * requests
         mha_ratio = mha_elems / elems
 
     # ---- runtime: activation workspace scales with tokens in flight
@@ -606,7 +743,8 @@ def analyze(model_id: str, cfg: dict, ctx: int, requests: int, kv_dtype: str,
         "wbytes": wbytes, "wname": wname, "p": p, "comps": comps,
         "total_params": total_params, "total_bytes": total_bytes, "active": active,
         "ctx": ctx, "requests": requests, "kv_dtype": kv_dtype, "kv_desc": kv_desc,
-        "kv_elems_total": elems * L,  # dtype-independent: elements per token, all layers
+        "kv_struct": kv_struct,
+        "kv_elems_total": elems * kv_layers,  # dtype-independent: elements/token over KV-bearing layers
         "kv_per_tok": kv_per_tok, "kv_per_req": kv_per_req, "kv_total": kv_total,
         "mha_total": mha_total, "mha_ratio": mha_ratio,
         "batch_tokens": batch_tokens, "act_total": act_total, "act_desc": act_desc,
@@ -767,6 +905,8 @@ def report(a: dict):
           f"{', exact from safetensors' if a.get('exact') else ''})")
     print(f"{'=' * 68}")
     print(f"\n-- STATIC: weights {a['total_params'] / 1e9:,.1f} B params -> {human(a['total_bytes'])} --\n")
+    for w in a.get("weight_warnings", []):
+        print(f"  ⚠ {w}")
     print(f"  {'component':<38}{'params':>12}{'memory':>12}{'share':>7}")
     for c in sorted(a["comps"], key=lambda x: -x["params"]):
         if c["params"] == 0:
@@ -776,14 +916,19 @@ def report(a: dict):
         print(f"\n  active params per token ~ {a['active'] / 1e9:,.0f}B "
               f"(top-{cfg.get('num_experts_per_tok')} + {cfg.get('n_shared_experts', 0)} shared)")
     print(f"\n-- RUNTIME: context {a['ctx']:,} x {a['requests']} running requests --\n")
+    kv_layers = a["kv_struct"]["n_kv_layers"]
+    layers_note = (f"all {L} layers" if kv_layers == L
+                   else f"{kv_layers} of {L} full-attn layers")
     print(f"  KV cache ({a['kv_dtype']}): {a['kv_desc']}")
-    print(f"    per token (all {L} layers) {a['kv_per_tok'] / 1024:,.1f} KiB"
+    print(f"    per token ({layers_note}) {a['kv_per_tok'] / 1024:,.1f} KiB"
           f" -> per request {human(a['kv_per_req'])} -> x{a['requests']} = {human(a['kv_total'])}")
     if a["mha_total"]:
         print(f"    (uncompressed MHA equivalent {human(a['mha_total'])}, MLA saves {a['mha_ratio']:,.0f}x)")
     print(f"  Activation workspace ({a['batch_tokens']:,} tokens/forward): {human(a['act_total'])}")
     print(f"    {a['act_desc']}")
     print(f"  runtime total: {human(a['runtime_total'])}")
+    for w in a["kv_struct"]["warnings"]:
+        print(f"  ⚠ {w}")
     print(f"\n-- TOTAL --\n")
     print(f"  weights {human(a['total_bytes'])} + runtime {human(a['runtime_total'])} "
           f"+ fragmentation ~{a['overhead']:.0%} = ~{human(a['grand'])}")
@@ -974,10 +1119,12 @@ def build_evidence(a: dict, cfg: dict, p: dict) -> str:
                          p["attention"])
     if is_moe:
         n_routed = cfg.get("n_routed_experts") or cfg.get("num_experts") or cfg.get("num_local_experts")
-        moe_inter = cfg.get("moe_intermediate_size")
+        # same field-alias fallback as analyze(): MiniMax puts the expert size
+        # in `intermediate_size` and the dense size in `dense_intermediate_size`
+        moe_inter = cfg.get("moe_intermediate_size") or cfg.get("intermediate_size")
         dense_n, moe_n = p["dense_layers"], p["moe_layers"]
         if dense_n and p.get("dense_ffn"):
-            inter = cfg.get("intermediate_size")
+            inter = cfg.get("dense_intermediate_size") or cfg.get("intermediate_size")
             dense_chips = [
                 chip("intermediate_size", f"{inter:,}", t("ev.f.intermediate_size")),
                 chip("first_k_dense_replace", dense_n, t("ev.f.first_k_dense_replace"))]
@@ -1089,17 +1236,53 @@ def _build_lang_fragments(a: dict, cfg: dict, p: dict, is_moe: bool, short: str,
     a whole fragment's innerHTML instead of re-deriving it in JS."""
 
     # ---- left structure column
-    attn_label = "① Attention (MLA)" if p["is_mla"] else "① Attention (GQA)" if \
-        cfg.get("num_key_value_heads", cfg["num_attention_heads"]) < cfg["num_attention_heads"] else "① Attention (MHA)"
+    attn_geo = "MLA" if p["is_mla"] else "GQA" if \
+        cfg.get("num_key_value_heads", cfg["num_attention_heads"]) < cfg["num_attention_heads"] else "MHA"
 
-    def layer_block(ffn_label, ffn_slot, tag):
+    # attention-type annotation: same weights, different runtime KV behavior.
+    # DSA/block-sparse cap reads; sliding caps stored KV. Shown as a suffix on
+    # the attention sub-block so heterogeneous models don't look uniform.
+    ks = a["kv_struct"]
+    attn_note = ""
+    pat = a.get("attention_core", {}).get("pattern") if a.get("attention_core") else None
+    pat = pat or attention_core_spec(cfg)["pattern"]
+    if pat.get("kind") == "dsa":
+        attn_note = t("struct.attn_dsa", topk=pat["topk"])
+    elif pat.get("kind") == "capped" and ks["sliding_layers"] == 0:
+        attn_note = t("struct.attn_sparse", cap=pat["cap"])
+    attn_label = f"① Attention ({attn_geo}){attn_note}"
+
+    def layer_block(ffn_label, ffn_slot, tag, alabel=None):
+        alabel = alabel if alabel is not None else attn_label
         return f"""<div class='layer'><span class='ltag'>{tag}</span>
-          <div class='sub' style='border-color:{_var(1)}'><i class='dot' style='background:{_var(1)}'></i>{attn_label}</div>
+          <div class='sub' style='border-color:{_var(1)}'><i class='dot' style='background:{_var(1)}'></i>{alabel}</div>
           <div class='sub' style='border-color:{_var(ffn_slot)}'><i class='dot' style='background:{_var(ffn_slot)}'></i>② {ffn_label}</div>
         </div>"""
 
     struct = f"<div class='io' style='border-color:{_var(0)}'><i class='dot' style='background:{_var(0)}'></i>{t('struct.embed_entry')}</div>"
-    if is_moe:
+    if ks["linear_layers"]:
+        # hybrid (e.g. Qwen3.5): full-attention layers hold KV, linear layers a
+        # fixed-size state. Show both as distinct blocks so it doesn't read as
+        # one uniform attention stack.
+        ffn_lbl = "MoE FFN" if is_moe else "FFN"
+        ffn_slot = 3 if is_moe else 2
+        struct += layer_block(ffn_lbl, ffn_slot, "full",
+                              alabel=f"① Attention ({attn_geo})")
+        struct += layer_block(ffn_lbl, ffn_slot, "linear",
+                              alabel=t("struct.linear_block"))
+        struct += (f"<div class='ell'>{t('struct.hybrid_ellipsis', L=L, n_full=ks['n_kv_layers'] - ks['sliding_layers'], n_linear=ks['linear_layers'])}</div>")
+    elif ks["sliding_layers"]:
+        # sliding-window model (e.g. Gemma): global vs sliding layers share
+        # weights but differ in KV cap. Show one of each, annotated.
+        ffn_lbl = "MoE FFN" if is_moe else "FFN"
+        ffn_slot = 3 if is_moe else 2
+        n_full = ks["n_kv_layers"] - ks["sliding_layers"]
+        struct += layer_block(ffn_lbl, ffn_slot, "global",
+                              alabel=f"① Attention ({attn_geo})")
+        struct += layer_block(ffn_lbl, ffn_slot, "sliding",
+                              alabel=f"① Attention ({attn_geo})" + t("struct.attn_swa", window=ks["sliding_window"]))
+        struct += (f"<div class='ell'>{t('struct.swa_ellipsis', L=L, n_full=n_full, n_sliding=ks['sliding_layers'], window=ks['sliding_window'])}</div>")
+    elif is_moe:
         if dense_n:
             struct += layer_block("Dense FFN", 2, "L0")
             if dense_n > 1:
@@ -1175,7 +1358,7 @@ def _build_lang_fragments(a: dict, cfg: dict, p: dict, is_moe: bool, short: str,
                        [t("card.indexer_line", n_i=cfg['index_n_heads'], d_i=cfg.get('index_head_dim'))],
                        dtype=cdtype("indexer"))
 
-    inter = cfg.get("intermediate_size")
+    inter = cfg.get("dense_intermediate_size") or cfg.get("intermediate_size")
     if is_moe:
         if dense_n and "dense_ffn" in cb:
             cards += _card(2, t("card.dense_ffn_title", dense_n=dense_n),
@@ -1184,7 +1367,7 @@ def _build_lang_fragments(a: dict, cfg: dict, p: dict, is_moe: bool, short: str,
                            dtype=cdtype("dense_ffn"))
         moe_lines = [
             t("card.moe_routed_line", n_routed=n_routed, H=cfg['hidden_size'],
-              moe_inter=cfg.get('moe_intermediate_size'), moe_n=moe_n,
+              moe_inter=cfg.get('moe_intermediate_size') or cfg.get('intermediate_size'), moe_n=moe_n,
               gib=_gib(cbytes('moe_routed')), dt=cdt('moe_routed')),
         ]
         if cbytes("moe_shared"):
@@ -1418,6 +1601,11 @@ def render_html(a: dict, out_path: str, ctx_options: list, req_options: list,
         "lang": display_lang,
         "frags": frags,
         "L": L,
+        "nKvLayers": a["kv_struct"]["n_kv_layers"],   # full-attn layers that hold paged KV
+        "kvGroups": a["kv_struct"]["kv_groups"],       # [[count, window], ...] storage groups
+        "readCap": a["kv_struct"]["read_cap"],         # decode per-layer read cap (0=full ctx)
+        "readCapLayers": a["kv_struct"]["read_cap_layers"],
+        "kvWarnings": a.get("weight_warnings", []) + a["kv_struct"]["warnings"],
         "kvElemsPerLayer": elems_per_layer,
         "kvAuto": kv_auto,                # what "auto" resolves to for this model
         "kvChoice": kv_choice,
@@ -1546,22 +1734,28 @@ def main():
 
     catalog = None
     declared = None
+    weight_warnings = []
     if not args.no_exact:
         try:
             catalog, declared = fetch_safetensors_catalog(args.model_id)
             got = sum(tv["bytes"] for tv in catalog.values())
             if declared and abs(got - declared) / declared > 0.01:
-                print(f"warning: safetensors headers sum to {got / GIB:,.1f} GiB "
-                      f"but index declares {declared / GIB:,.1f} GiB", file=sys.stderr)
+                msg = (f"权重总量存疑：safetensors 头求和 {got / GIB:,.1f} GiB "
+                       f"vs index 声明 {declared / GIB:,.1f} GiB"
+                       f"（差 {abs(got - declared) / declared:.1%}，可能有分片头未读到或含未加载张量）。")
+                weight_warnings.append(msg)
+                print(f"warning: {msg}", file=sys.stderr)
         except Exception as e:
-            print(f"note: could not read safetensors headers ({e}); "
-                  f"falling back to formula estimate", file=sys.stderr)
+            msg = f"未能读取 safetensors 头（{e}），回退到公式估算，权重为估算值。"
+            weight_warnings.append(msg)
+            print(f"note: {msg}", file=sys.stderr)
 
     a = analyze(args.model_id, cfg, args.context, args.requests, args.kv_dtype,
                 args.batch_tokens, args.overhead, catalog=catalog)
     a["kv_auto"] = kv_auto
     a["kv_choice"] = kv_choice
     a["index_total"] = declared            # official total_size for the Σ cross-check
+    a["weight_warnings"] = weight_warnings
     report(a)
     if args.html:
         ctx_options = [int(v) for v in args.ctx_options.split(",")]
