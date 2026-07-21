@@ -85,9 +85,29 @@ var I18N = {
       return 'KV 需求 <b>' + d + '</b> / 容量 <b>' + c + '</b> GiB（<b>' + pct + '%</b>）· 池容量 ≈ <b>' +
         maxTok + '</b> tokens（≈ ' + maxReq + ' 个 ' + ctxLbl + ' 满 context 请求）';
     },
+    kvReqExprDp: function (req, dp) { return req + ' 并发 ÷ DP' + dp; },
+    kvReqExprAll: function (req) { return req + ' 并发'; },
+    kvUtilNoteDp: function (dp, clusterReq) {
+      return '本 rank 口径（各 rank 独立池）；×DP' + dp + ' ≈ 集群 ' + clusterReq + ' 个请求';
+    },
+    kvUtilNoteMla: function (tp, req) {
+      return 'MLA latent 无 head 维不可按 TP' + tp + ' 切：全部 ' + req + ' 个请求的 KV 每卡整份复制';
+    },
+    kvUtilBreakdown: function (reqExpr, ctxLbl, perTokKiB, demand, cap, pct, maxTok, maxReq, note) {
+      return 'KV 需求 = ' + reqExpr + ' × ' + ctxLbl + ' context × ' + perTokKiB + ' KiB/token = <b>' +
+        demand + '</b> GiB' +
+        '<br>KV 需求/容量比例 = ' + demand + ' GiB / ' + cap + ' GiB = <b>' + pct + '%</b>' +
+        '<br>Token 容量 ≈ ' + cap + ' GiB ÷ ' + perTokKiB + ' KiB/token = <b>' + maxTok +
+        '</b> tokens（≈ ' + maxReq + ' 个 ' + ctxLbl + ' 满 context 请求）' +
+        (note ? '<br><span style="opacity:.65">注意：' + note + '</span>' : '');
+    },
     sumCapLine: function (maxTok, ctxLbl, maxReq, frac) {
       return 'mem-fraction-static ' + frac + ' 下 KV 池容量 ≈ <b>' + maxTok +
         '</b> tokens（max_total_num_tokens，按瓶颈 stage）≈ ' + maxReq + ' 个 ' + ctxLbl + ' 满 context 请求';
+    },
+    sumCapDpSuffix: function (dp, clusterTok, clusterReq) {
+      return '（每 rank 池，完整 cell 口径，与 SGLang 日志对账；×DP' + dp + ' = 集群 ' + clusterTok +
+        ' tokens ≈ ' + clusterReq + ' 个请求）';
     },
     pctParen: function (pct) { return '（' + pct + '%）'; },
     layerChipLabel: function (lo, hi, count) { return 'L' + lo + '–L' + hi + ' ×' + count + ' 层'; },
@@ -247,9 +267,30 @@ var I18N = {
       return 'KV demand <b>' + d + '</b> / capacity <b>' + c + '</b> GiB (<b>' + pct + '%</b>) · pool ≈ <b>' +
         maxTok + '</b> tokens (≈ ' + maxReq + ' full-' + ctxLbl + '-context requests)';
     },
+    kvReqExprDp: function (req, dp) { return req + ' requests ÷ DP' + dp; },
+    kvReqExprAll: function (req) { return req + ' requests'; },
+    kvUtilNoteDp: function (dp, clusterReq) {
+      return 'per-rank (each rank owns its pool); ×DP' + dp + ' ≈ ' + clusterReq + ' requests cluster-wide';
+    },
+    kvUtilNoteMla: function (tp, req) {
+      return 'MLA latent has no head dim to shard across TP' + tp + ": all " + req +
+        " requests' KV is replicated on every GPU";
+    },
+    kvUtilBreakdown: function (reqExpr, ctxLbl, perTokKiB, demand, cap, pct, maxTok, maxReq, note) {
+      return 'KV demand = ' + reqExpr + ' × ' + ctxLbl + ' context × ' + perTokKiB + ' KiB/token = <b>' +
+        demand + '</b> GiB' +
+        '<br>Demand/capacity ratio = ' + demand + ' GiB / ' + cap + ' GiB = <b>' + pct + '%</b>' +
+        '<br>Token capacity ≈ ' + cap + ' GiB ÷ ' + perTokKiB + ' KiB/token = <b>' + maxTok +
+        '</b> tokens (≈ ' + maxReq + ' full-' + ctxLbl + '-context requests)' +
+        (note ? '<br><span style="opacity:.65">Note: ' + note + '</span>' : '');
+    },
     sumCapLine: function (maxTok, ctxLbl, maxReq, frac) {
       return 'At mem-fraction-static ' + frac + ', KV pool ≈ <b>' + maxTok +
         '</b> tokens (max_total_num_tokens, bottleneck stage) ≈ ' + maxReq + ' full-' + ctxLbl + '-context requests';
+    },
+    sumCapDpSuffix: function (dp, clusterTok, clusterReq) {
+      return ' (per-rank pool at the full cell, matches the SGLang log; ×DP' + dp + ' = cluster ' + clusterTok +
+        ' tokens ≈ ' + clusterReq + ' requests)';
     },
     pctParen: function (pct) { return ' (' + pct + '%)'; },
     layerChipLabel: function (lo, hi, count) { return 'L' + lo + '–L' + hi + ' ×' + count + ' layers'; },
@@ -532,17 +573,35 @@ function gpuMemory(s, P){
   var nd = Math.max(0, Math.min(hi, D.nDense) - Math.min(lo, D.nDense));
   var nm = n - nd;
   var L = D.layer, w = {};
-  w.embed  = (s===0) ? D.embed/P.tp : 0;
+  // attn-TP sharding divisor: dp-attention sets the attention TP group to
+  // tp/dp = 1, so everything in that group (attention projections, embed,
+  // MLA w_kc/w_vc, draft embed) becomes one full copy per rank. lm_head is
+  // NOT in the group (enable_dp_lm_head defaults off) — it stays /tp.
+  var attnTpDiv = P.dpAttn ? 1 : P.tp;
+  w.embed  = (s===0) ? D.embed/attnTpDiv : 0;
   w.lmHead = 0;
   if (s===P.pp-1) w.lmHead = D.tied ? (P.pp>1 ? D.embed/P.tp : 0) : D.lmHead/P.tp;
   w.attention = n * (P.dpAttn
     ? L.attnQo + L.attnKvProj + L.attnRepl
     : L.attnQo/P.tp + L.attnKvProj/Math.min(P.tp, D.kvNKvHeads||P.tp) + L.attnRepl);
+  // MLA absorption: SGLang materializes bf16 w_kc/w_vc from kv_b_proj at load
+  // (original kept for the MHA prefill path) — extra bytes beyond safetensors,
+  // sharded by attn-TP. Verified S1 E4: GLM-5.2 +0.27 GiB @TP8, +2.13 @dpAttn.
+  w.attention += n * (D.absorbPerLayer||0) / attnTpDiv;
   w.denseFfn  = nd * L.denseFfn/P.tp;
   w.moeRouted = nm * L.moeRouted/P.tp;
   w.moeShared = nm * L.moeShared/P.tp;
-  w.mtp = (s===P.pp-1 && L.mtpTotal)
-    ? L.mtpTotal*(L.mtpSlicedFrac/P.tp + (1-L.mtpSlicedFrac)) : 0;
+  // MTP draft: expert FFN always /tp; attention flips to replicated under
+  // dp-attention (mtpAttnFrac); plus the draft's own bf16 embed + w_kc/w_vc,
+  // allocated at load (aliased to target later, but pool sizing sees them).
+  w.mtp = 0;
+  if (s===P.pp-1 && L.mtpTotal) {
+    var mtpFfnFrac = L.mtpSlicedFrac - (L.mtpAttnFrac||0);
+    w.mtp = P.dpAttn
+      ? L.mtpTotal*(mtpFfnFrac/P.tp + (1-mtpFfnFrac))
+      : L.mtpTotal*(L.mtpSlicedFrac/P.tp + (1-L.mtpSlicedFrac));
+    w.mtp += ((D.draftEmbedBytes||0) + (D.absorbPerLayer||0)) / attnTpDiv;
+  }
   w.others = n*(L.norms + L.indexer) + nm*L.moeGate;
 
   var weights = 0; for (var k in w) weights += w[k];
@@ -576,10 +635,15 @@ function gpuMemory(s, P){
   var kvCap = staticBudget - fixed - weights - linState;
   var canStart = kvCap > 0;
   var used = canStart ? staticBudget + act : weights + fixed + linState + act;
-  var maxReq = (canStart && kv > 0) ? Math.floor(kvCap*P.req/kv) : 0;
-  // pool capacity in tokens (= SGLang max_total_num_tokens for this GPU):
-  // demand kv covers ctx*req tokens, so tokens/byte = ctx*req/kv
-  var maxTokens = (canStart && kv > 0) ? kvCap*P.ctx*P.req/kv : 0;
+  // pool capacity: demand kv covers ctx*req tokens, so tokens/byte = ctx*req/kv.
+  // Under dp-attention each rank runs its own pool at the FULL cell (it stores
+  // only its own requests' KV): both numbers become per-rank — this matches
+  // SGLang's logged max_total_num_tokens; cluster capacity = dp × per-rank
+  // (the display appends the ×dp cluster equivalent so it can be compared
+  // against the requests filter).
+  var capShard = P.dpAttn ? P.tp : 1;
+  var maxReq = (canStart && kv > 0) ? Math.floor(kvCap*P.req/kv/capShard) : 0;
+  var maxTokens = (canStart && kv > 0) ? kvCap*P.ctx*P.req/kv/capShard : 0;
   return { w:w, weights:weights, kv:kv, kvParts:kvParts, kvCap:Math.max(kvCap,0),
            kvCapRaw:kvCap, canStart:canStart, act:act, used:used, maxReq:maxReq,
            maxTokens:maxTokens, linState:linState, layers:[lo,hi], nDense:nd, nMoe:nm };
@@ -668,11 +732,13 @@ function kvUtilBar(m, P){
 
 function chips(m, s, t, P){
   var h = '';
-  if (m.w.embed>0) h += "<span class='chip-io' style='background:"+C.embed+"'>embed ⁄"+P.tp+"</span>";
+  // embed follows the attn-TP group: sliced 1/tp in pure TP, one full copy
+  // per rank under dp-attention (lm_head stays /tp either way).
+  if (m.w.embed>0) h += "<span class='chip-io' style='background:"+C.embed+"'>embed"+(P.dpAttn?'':" ⁄"+P.tp)+"</span>";
   var lo=m.layers[0], hi=m.layers[1];
   h += "<span class='chip'><i style='background:"+C.attn+"'></i><i style='background:"+C.ffn+
        "'></i><span class='lb'>"+Tr('layerChipLabel')(lo, hi-1, hi-lo)+(P.dpAttn?'':Tr('perLayerFrac')(P.tp))+"</span></span>";
-  if (m.w.mtp>0) h += "<span class='chip-io' style='background:"+C.mtp+"'>MTP</span>";
+  if (m.w.mtp>0) h += "<span class='chip-io' style='background:"+C.mtp+"'>MTP"+(P.dpAttn?'':" ⁄"+P.tp)+"</span>";
   if (m.w.lmHead>0) h += "<span class='chip-io' style='background:"+C.lmHead+"'>lm_head ⁄"+P.tp+"</span>";
   var eh = '';
   var ei = expertInfo(t, P);
@@ -721,9 +787,24 @@ function updateParallel(){
         : oom
           ? "<span class='oombadge'>"+Tr('oomExceeds')(gib(-free))+"</span>"
           : "<span class='gpu-mem'><b>"+gib(m.used)+"</b> / "+P.memGib+" GiB</span>";
+      // KV arithmetic, spelled out line by line so every number on the card
+      // can be reproduced by hand. Demand scope by mode: dp-attention → this
+      // rank serves req/dp requests (each rank owns its pool); pure TP → the
+      // demand covers ALL requests' tokens (MLA: full cell replicated, no
+      // head dim to shard; GQA: per-token bytes sharded by kv heads). The
+      // effective per-token KiB is derived from m.kv so the printed formula
+      // is exact for every geometry, pp stage, and kv dtype.
+      var demandTokens = P.ctx * P.req / (P.dpAttn ? P.tp : 1);
+      var perTokKiB = (m.kv / demandTokens / 1024)
+        .toLocaleString('en-US', {minimumFractionDigits:1, maximumFractionDigits:1});
+      var reqExpr = P.dpAttn ? Tr('kvReqExprDp')(P.req, P.tp) : Tr('kvReqExprAll')(P.req);
+      var utilNote = P.dpAttn ? Tr('kvUtilNoteDp')(P.tp, m.maxReq*P.tp)
+                   : D.kvIsMla ? Tr('kvUtilNoteMla')(P.tp, P.req)
+                               : '';
       var utilLine = m.canStart
-        ? "<div class='gpu-line'>"+Tr('kvUtilLine')(gib(m.kv), gib(m.kvCap),
-            (m.kv/m.kvCap*100).toFixed(0), tokLabel(m.maxTokens), ctxLabel(P.ctx), m.maxReq)+"</div>"
+        ? "<div class='gpu-line'>"+Tr('kvUtilBreakdown')(reqExpr, ctxLabel(P.ctx), perTokKiB,
+            gib(m.kv), gib(m.kvCap), (m.kv/m.kvCap*100).toFixed(0),
+            tokLabel(m.maxTokens), m.maxReq, utilNote)+"</div>"
         : '';
       cards += "<div class='gpu"+(oom?' oom':'')+"'>"+
         "<div class='gpu-head'><span class='gpu-name'>GPU-"+g+"</span>"+
@@ -782,7 +863,8 @@ function updateParallel(){
     else { minMaxReq = Math.min(minMaxReq, m.maxReq); minMaxTok = Math.min(minMaxTok, m.maxTokens); }
   });
   var capLine = allStart && isFinite(minMaxTok)
-    ? '<br>'+Tr('sumCapLine')(tokLabel(minMaxTok), ctxLabel(P.ctx), minMaxReq, P.frac.toFixed(2)) : '';
+    ? '<br>'+Tr('sumCapLine')(tokLabel(minMaxTok), ctxLabel(P.ctx), minMaxReq, P.frac.toFixed(2))
+      + (P.dpAttn ? Tr('sumCapDpSuffix')(P.tp, tokLabel(minMaxTok*P.tp), minMaxReq*P.tp) : '') : '';
   el('sum-line').innerHTML =
     Tr('sumLine')(gib(maxUsed), P.memGib, gib(clusterWeights), gib(D.weightsBytes), gib(Math.max(repl,0)))+
     '<br>'+kvNote+capLine;

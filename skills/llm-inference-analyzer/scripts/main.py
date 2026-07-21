@@ -786,6 +786,23 @@ def analyze(model_id: str, cfg: dict, ctx: int, requests: int, kv_dtype: str,
         mha_total = mha_elems * layer_tokens * kvb * requests
         mha_ratio = mha_elems / elems
 
+    # ---- runtime weight materializations (SGLang-specific, beyond safetensors)
+    # MLA absorption: at load SGLang dequantizes kv_b_proj into bf16 w_kc/w_vc
+    # for the absorbed decode path and KEEPS the original (MHA prefill still
+    # uses it). Shape carries num_local_heads, so it shards by attn-TP: /tp in
+    # pure TP, one full copy per rank under dp-attention. Verified on S1 E4:
+    # GLM-5.2 28 MiB/layer full -> +1.86 GiB/GPU going TP8 -> TP8+DP8.
+    absorb_per_layer = 0
+    if p["is_mla"] and cfg.get("qk_nope_head_dim") and cfg.get("v_head_dim"):
+        absorb_per_layer = (cfg["num_attention_heads"] * cfg["kv_lora_rank"]
+                            * (cfg["qk_nope_head_dim"] + cfg["v_head_dim"]) * 2)
+    # NextN/EAGLE draft allocates its own bf16 embed at load (not in the
+    # checkpoint — the weight loader skips it and later aliases it to the
+    # target's), but the KV pool is sized at the pre-release watermark, so it
+    # costs pool capacity. Shards like the embedding: by attn-TP.
+    n_mtp = cfg.get("num_nextn_predict_layers", 0) or 0
+    draft_embed_bytes = cfg["vocab_size"] * cfg["hidden_size"] * 2 if n_mtp else 0
+
     # ---- runtime: activation workspace scales with tokens in flight
     act_total, act_desc = activation_bytes(cfg, p, batch_tokens)
 
@@ -804,6 +821,8 @@ def analyze(model_id: str, cfg: dict, ctx: int, requests: int, kv_dtype: str,
         "kv_struct": kv_struct,
         "kv_elems_total": elems * kv_layers,  # dtype-independent: elements/token over KV-bearing layers
         "kv_indexer_bytes": idx_kv_b,  # DSA index-key cache, bytes/token/layer (0 if no indexer)
+        "absorb_per_layer": absorb_per_layer,   # MLA w_kc/w_vc bf16, full-heads bytes/layer
+        "draft_embed_bytes": draft_embed_bytes,  # NextN draft's own bf16 embed (load-time)
         "kv_per_tok": kv_per_tok, "kv_per_req": kv_per_req, "kv_total": kv_total,
         "lin_state_total": lin_state_total,
         "mha_total": mha_total, "mha_ratio": mha_ratio,
@@ -872,9 +891,11 @@ def per_layer_breakdown(a: dict, cfg: dict) -> dict:
     }
 
     # MTP: fraction of one MTP copy that is TP-sliceable (attention sliced part
-    # + expert FFN); eh_proj / norms / indexer treated as replicated
+    # + expert FFN); eh_proj / norms / indexer treated as replicated. The
+    # attention share is tracked separately because dp-attention flips it to
+    # replicated while the expert FFN stays TP-sliced.
     mtp_b = cb.get("mtp", 0)
-    sliced_frac = 0.0
+    sliced_frac = attn_frac = 0.0
     if mtp_b:
         H = cfg["hidden_size"]
         inter = cfg.get("intermediate_size") or 4 * H
@@ -885,8 +906,10 @@ def per_layer_breakdown(a: dict, cfg: dict) -> dict:
         idx = p["indexer"] // L if p["indexer"] else 0
         per_copy = tot + idx + ffn + 2 * H * H
         sliced_frac = (qo + kvp + ffn) / per_copy
+        attn_frac = (qo + kvp) / per_copy
     layer["mtpTotal"] = mtp_b
     layer["mtpSlicedFrac"] = round(sliced_frac, 4)
+    layer["mtpAttnFrac"] = round(attn_frac, 4)
     return layer
 
 
@@ -1710,6 +1733,11 @@ def render_html(a: dict, out_path: str, ctx_options: list, req_options: list,
         "kvIsMla": bool(p["is_mla"]),
         "kvNKvHeads": cfg.get("num_key_value_heads", cfg["num_attention_heads"]),
         "fixedGib": pargs.fixed_overhead_gib if pargs else 1.0,
+        # SGLang load-time weight materializations (bytes, full/unsharded):
+        # MLA w_kc/w_vc bf16 per layer; NextN draft's own bf16 embed. Both
+        # shard by attn-TP: /tp in pure TP, full copy under dp-attention.
+        "absorbPerLayer": a.get("absorb_per_layer", 0),
+        "draftEmbedBytes": a.get("draft_embed_bytes", 0),
         "instances": instances or {},
         # roofline tab
         "activeParams": a["active"] or a["total_params"],
@@ -1839,6 +1867,13 @@ def main():
     a["kv_auto"] = kv_auto
     a["kv_choice"] = kv_choice
     a["index_total"] = declared            # official total_size for the Σ cross-check
+    if a.get("absorb_per_layer"):
+        n_mtp = cfg.get("num_nextn_predict_layers", 0) or 0
+        full = a["absorb_per_layer"] * (cfg["num_hidden_layers"] + n_mtp)
+        weight_warnings.append(
+            f"MLA 权重吸收：SGLang 加载时将 kv_b_proj 反量化为 bf16 w_kc/w_vc（fp8 原件保留），"
+            f"全尺寸 ≈ {full / GIB:.2f} GiB，随 attention-TP 切分（纯 TP÷tp；dp-attention 每卡整份）。"
+            f"未计入上方 safetensors 权重表；并行 tab 已计入。")
     a["weight_warnings"] = weight_warnings
     report(a)
     if args.html:
