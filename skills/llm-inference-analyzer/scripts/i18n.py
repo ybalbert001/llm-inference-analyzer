@@ -57,6 +57,8 @@ MSG = {
     "struct.which_all": {"zh": "全部", "en": "all"},
     "struct.same_layers_ellipsis": {"zh": "⋮ 共 {L} 层（每层结构相同）", "en": "⋮ {L} layers total (identical structure)"},
     "struct.mtp_entry": {"zh": "MTP 预测层 ×{n_mtp}", "en": "MTP predict layer ×{n_mtp}"},
+    "struct.vision_entry": {"zh": "vision tower（ViT {Lv} 层）+ projector（图像入口）",
+                            "en": "vision tower (ViT {Lv} layers) + projector (image input)"},
     "struct.lmhead_exit": {"zh": "lm_head（出口）", "en": "lm_head (output)"},
     "struct.lmhead_shared": {"zh": "lm_head（与 embed 共享）", "en": "lm_head (shared with embed)"},
     # attention-type annotations on the layer's attention sub-block
@@ -106,6 +108,10 @@ MSG = {
                        "en": "a full extra Attention + FFN, used for speculative decoding; skip loading it if unneeded"},
     "card.norms_title": {"zh": "norms & 其他（layernorm、hyper-connection、量化 scale 等）",
                           "en": "norms & misc (layernorm, hyper-connection, quant scales, etc.)"},
+    "card.vision_title": {"zh": "vision tower + projector（多模态图像入口）",
+                          "en": "vision tower + projector (multimodal image input)"},
+    "card.vision_line": {"zh": "ViT {Lv} 层 × (attention 4H² + MLP 2×{H}×{inter}) + patch embed + projector；量化 checkpoint 中也保持 bf16",
+                         "en": "ViT {Lv} layers × (attention 4H² + MLP 2×{H}×{inter}) + patch embed + projector; stays bf16 even in quantized checkpoints"},
     "card.dtype_storage_note": {"zh": "（{label} 存储）", "en": " ({label} storage)"},
 
     # ---- runtime cards
@@ -135,6 +141,12 @@ MSG = {
                         "en": "one forward pass handles at most {batch_tokens} tokens (chunked-prefill cap); layers execute sequentially, only the current layer's intermediates are live"},
     "card.act_line3": {"zh": "工作区估算（vLLM profile 的量级），与请求数无关、与单次批处理 token 数有关",
                         "en": "workspace estimate (same order as vLLM's profiler); independent of request count, depends on tokens per forward batch"},
+    "card.vision_act_title": {"zh": "Vision encoder 工作区 — ViT {Lv} 层编码一张最大图",
+                              "en": "Vision encoder workspace — ViT {Lv} layers encoding one max-size image"},
+    "card.vision_act_line": {"zh": "每图最多 {patches} patches × ≈{kib} KiB/patch（残差/attn 缓冲 + MLP 中间层，逐层执行）——编码期瞬时占用，非常驻",
+                             "en": "up to {patches} patches per image × ≈{kib} KiB/patch (residual/attn buffers + MLP intermediate, layer-by-layer) — transient during encoding, not resident"},
+    "card.vision_act_line2": {"zh": "merge {merge}:1 后每图 {tokens} 个图像 token 进入 KV cache —— 与文本 token 同 cell、占用 context 位置，KV 无需单列",
+                              "en": "after {merge}:1 merging each image yields {tokens} image tokens into the KV cache — same cell as text tokens, consuming context positions; no separate KV pool"},
 
     # ---- stacked bars / totals
     "bar.weights_static_label": {"zh": "权重（静态）", "en": "Weights (static)"},
@@ -143,6 +155,7 @@ MSG = {
     "bar.total_head": {"zh": "静态 + 动态 · 部署总占用 ≈ {gib} GiB（context {ctx} × {req} 并发）",
                         "en": "Static + dynamic · total deployment footprint ≈ {gib} GiB (context {ctx} × {req} concurrent)"},
     "bar.lin_part": {"zh": " + linear state {lin}", "en": " + linear state {lin}"},
+    "bar.vision_act_label": {"zh": "Vision encoder", "en": "Vision encoder"},
     "bar.total_line": {
         "zh": "权重 {w}（静态） + KV {kv}{lin_part} + Activation {act}（动态） + 碎片 ~{ov}% ≈ <b>{grand} GiB</b>"
               "<span class='pct'>　·　KV 随 context × 并发线性增长：每并发 +{kv_per_req} GiB</span>",
@@ -247,6 +260,20 @@ MSG = {
         "en": "<b>Effective {bpp} bytes/param</b> · the multiplier turning param count into bytes; fp8=1, bf16=2, fp4=0.5 — lower saves memory."},
     "ev.mtp_composite": {"zh": "一整套额外的 attention + MoE 专家 + eh_proj",
                           "en": "a full extra attention + MoE experts + eh_proj"},
+    "ev.vision_composite": {"zh": "标准 pre-norm ViT block（qkv/o 带 bias）+ patch conv + 位置嵌入 + patchmerger projector",
+                             "en": "standard pre-norm ViT blocks (qkv/o with bias) + patch conv + pos-emb + patchmerger projector"},
+    "ev.f.vt_hidden_size": {
+        "zh": "<b>ViT 每 patch 的向量宽度</b> · vision tower 的 H；attention/MLP 权重都随它平方增长。",
+        "en": "<b>ViT per-patch vector width</b> · the vision tower H; attention/MLP weights grow with its square."},
+    "ev.f.vt_intermediate_size": {
+        "zh": "<b>ViT MLP 中间层宽度</b> · 每个 ViT block 的 FFN 升维宽度，vision 权重的大头。",
+        "en": "<b>ViT MLP intermediate width</b> · the FFN expansion width of each ViT block, the bulk of vision weights."},
+    "ev.f.vt_num_hidden_layers": {
+        "zh": "<b>ViT 层数</b> · vision tower 的深度，权重 ≈ 单 block × 层数。",
+        "en": "<b>ViT layer count</b> · depth of the vision tower; weights are one block times this."},
+    "ev.f.vt_patch_size": {
+        "zh": "<b>图像切块边长（像素）</b> · 图像被切成 patch_size² 的小块，每块变成 1 个 ViT token；决定 patch conv 权重与每图 token 数。",
+        "en": "<b>Image patch side (pixels)</b> · images are cut into patch_size² tiles, one ViT token each; sets the patch-conv size and tokens per image."},
     "ev.col_formula": {"zh": "① 公式", "en": "① formula"},
     "ev.col_apparent": {"zh": "② 实测", "en": "② safetensors"},
     "ev.verdict_match": {"zh": "吻合", "en": "match"},
@@ -298,6 +325,7 @@ MSG = {
 
     # ---- main() console notes
     "cli.kv_dsa_note": {"zh": "（DSA/稀疏注意力模型，对齐 SGLang 默认 fp8_e4m3）", "en": " (DSA/sparse-attention model, matches SGLang default fp8_e4m3)"},
+    "pstruct.vision_block": {"zh": "Vision tower + projector（图像入口）", "en": "Vision tower + projector (image input)"},
 }
 
 _lang = "zh"

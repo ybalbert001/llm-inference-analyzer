@@ -39,7 +39,7 @@ SCRIPT_PATH = os.path.join(BASE_DIR, "template.js")
 # categorical slots in fixed order (dataviz reference palette; values live in template.html)
 COMP_SLOT = {"embed": 0, "lm_head": 0, "attention": 1, "dense_ffn": 2,
              "moe_routed": 3, "moe_shared": 3, "moe_gate": 3,
-             "mtp": 4, "indexer": 7, "norms": 7,
+             "mtp": 4, "indexer": 7, "norms": 7, "vision": 8,
              "kv": 5, "act": 6}
 
 # GPU instance types offered in the parallel-tab dropdown (order = display order).
@@ -179,6 +179,12 @@ def classify_tensor(name: str, num_layers: int) -> str:
     """Map a tensor name to a component key. Handles HF-standard naming
     (model.layers.N.self_attn...) and DeepSeek-style (layers.N.attn.wkv...)."""
     n = name.lower()
+    # vision tower + multimodal projector, checked first: ViT tensors contain
+    # substrings ("embed" in patch_embed, "norm" in layernorms) that would
+    # otherwise leak into text components.
+    if re.search(r"(?:^|\.)(?:vision_tower|vision_model|vision_encoder|visual"
+                 r"|mm_projector|multi_modal_projector)\.", n):
+        return "vision"
     m = re.search(r"(?:^|\.)(?:mtp|nextn)\.", n)
     if m:
         return "mtp"
@@ -240,7 +246,7 @@ def exact_components(catalog: dict, cfg: dict) -> tuple[dict, dict, dict, dict]:
     # components whose closed-form param count is reliable enough to reconcile
     formula = {"embed": p["embed"], "lm_head": p["lm_head"], "attention": p["attention"],
                "dense_ffn": p["dense_ffn"], "moe_routed": p["moe_routed"],
-               "moe_shared": p["moe_shared"], "mtp": p["mtp"]}
+               "moe_shared": p["moe_shared"], "mtp": p["mtp"], "vision": p["vision"]}
 
     groups = {}
     for name, t in catalog.items():
@@ -443,7 +449,87 @@ def count_params(cfg: dict) -> dict:
     else:
         p["mtp"] = 0
 
+    # ---- vision tower + mm projector (VLMs)
+    vspec = vision_tower_spec(cfg)
+    p["vision"] = vspec["params"] if vspec else 0
+
     return p
+
+
+# ---------------------------------------------------------------- vision tower
+
+def vision_tower_spec(cfg: dict) -> dict | None:
+    """Vision tower (ViT) + multimodal projector: weight formula, encoder
+    activation workspace, and image-token arithmetic.
+
+    Field aliases across the four in-scope VLMs:
+      hidden: vt_hidden_size (Kimi) | hidden_size (Qwen/MiniMax/Gemma)
+      inter : vt_intermediate_size | intermediate_size
+      layers: vt_num_hidden_layers | num_hidden_layers | depth (Qwen)
+      heads : vt_num_attention_heads | num_attention_heads | num_heads (Qwen)
+
+    Weight model (standard pre-norm ViT block, qkv/o with bias):
+      per layer qkv+o = 4H²+4H, MLP = 2HI+I+H, 2 layernorms = 4H; plus the
+      patch-embed conv (in_ch·ps²·tps·H), learned pos-emb when dims are in the
+      config, final layernorm, and the projector (Kimi 'patchmerger':
+      pre_norm + (H·merge)² + (H·merge)·text_H; generic fallback: one linear
+      to the text hidden). Verified byte-exact against moonshotai/Kimi-K2.6
+      safetensors (471,143,920 params).
+
+    Runtime model: image tokens enter the text KV cache as ordinary tokens
+    (per-token KV cell identical to text), so KV needs no separate pool —
+    each image just consumes tokens_per_image context positions. What IS
+    extra is the ViT encoder's transient activation over max_patches tokens.
+    """
+    vc = cfg.get("vision_config") or {}
+    H = vc.get("vt_hidden_size") or vc.get("hidden_size")
+    inter = vc.get("vt_intermediate_size") or vc.get("intermediate_size")
+    Lv = (vc.get("vt_num_hidden_layers") or vc.get("num_hidden_layers")
+          or vc.get("depth"))
+    if not (H and inter and Lv):
+        return None
+    heads = (vc.get("vt_num_attention_heads") or vc.get("num_attention_heads")
+             or vc.get("num_heads") or 16)
+    ps = vc.get("patch_size") or 14
+    in_ch = vc.get("num_channels") or vc.get("in_channels") or 3
+    tps = vc.get("temporal_patch_size") or 1
+    mk = vc.get("merge_kernel_size") or vc.get("spatial_merge_size") or 1
+    merge = mk[0] * mk[1] if isinstance(mk, (list, tuple)) else int(mk) ** 2
+
+    attn = (4 * H * H + 4 * H) * Lv
+    mlp = (2 * H * inter + inter + H) * Lv
+    norms = 4 * H * Lv + 2 * H
+    pos = (vc.get("init_pos_emb_height", 0) * vc.get("init_pos_emb_width", 0)
+           or vc.get("num_position_embeddings", 0)
+           or ((vc["image_size"] // ps) ** 2 if vc.get("image_size") else 0)) * H
+    patch_embed = in_ch * ps * ps * tps * H + H + pos
+    text_h = (vc.get("text_hidden_size") or vc.get("out_hidden_size")
+              or cfg.get("hidden_size") or 0)
+    merged = H * merge
+    if vc.get("mm_projector_type") == "patchmerger":
+        proj = 2 * H + merged * merged + merged + merged * text_h + text_h
+    elif text_h:
+        proj = merged * text_h + text_h    # generic single-linear projector (approx)
+    else:
+        proj = 0
+    params = patch_embed + attn + mlp + norms + proj
+
+    # max ViT sequence per image: fixed-resolution models expose image_size;
+    # dynamic-resolution models (Kimi/Qwen) are capped by the preprocessor's
+    # patch limit (Kimi media_proc in_patch_limit = 16384).
+    max_patches = ((vc["image_size"] // ps) ** 2 if vc.get("image_size") else 16384)
+    # same per-token workspace shape as the LLM estimate: residual/attn
+    # buffers (~8·H) + MLP intermediate (2·I), bf16, one layer live at a time
+    act_per_patch = 2 * (8 * H + 2 * inter)
+    return {
+        "hidden": H, "inter": inter, "layers": Lv, "heads": heads,
+        "patch_size": ps, "merge": merge,
+        "params": params, "attn_params": attn,
+        "max_patches": max_patches,
+        "act_per_patch": act_per_patch,
+        "act_bytes": max_patches * act_per_patch,
+        "tokens_per_image": max_patches // merge,
+    }
 
 
 # ---------------------------------------------------------------- runtime memory
@@ -720,9 +806,10 @@ def analyze(model_id: str, cfg: dict, ctx: int, requests: int, kv_dtype: str,
         "moe_routed": f"MoE routed experts ({p['moe_layers']} layers)",
         "moe_shared": "MoE shared experts", "moe_gate": "MoE router/gate",
         "norms": "norms & misc", "mtp": "MTP layer(s)",
+        "vision": "vision tower + projector",
     }
     order = ["embed", "lm_head", "attention", "indexer", "dense_ffn",
-             "moe_routed", "moe_shared", "moe_gate", "norms", "mtp"]
+             "moe_routed", "moe_shared", "moe_gate", "norms", "mtp", "vision"]
 
     exact = comp_dtypes = recon = None
     if catalog:
@@ -738,12 +825,15 @@ def analyze(model_id: str, cfg: dict, ctx: int, requests: int, kv_dtype: str,
                           "params": exact[key]["params"], "bytes": exact[key]["bytes"]})
         else:
             params = p.get(key, 0)
-            if key in ("indexer", "mtp") and not params:
+            if key in ("indexer", "mtp", "vision") and not params:
                 continue
             if key in ("moe_routed", "moe_shared", "moe_gate") and not p["moe_layers"]:
                 continue
+            # vision towers stay bf16 even in quantized checkpoints (quant
+            # configs ignore vision_tower/mm_projector), so never sub-2-byte
+            kb = max(wbytes, 2.0) if key == "vision" else wbytes
             comps.append({"key": key, "name": names[key],
-                          "params": params, "bytes": params * wbytes})
+                          "params": params, "bytes": params * kb})
 
     total_params = sum(c["params"] for c in comps)
     total_bytes = sum(c["bytes"] for c in comps)
@@ -810,7 +900,22 @@ def analyze(model_id: str, cfg: dict, ctx: int, requests: int, kv_dtype: str,
     # mamba pool) — scales with concurrency, not context
     lin_state_total = kv_struct["lin_state_per_req"] * requests
 
-    runtime_total = kv_total + act_total + lin_state_total
+    # ---- vision tower runtime (VLMs): image tokens are ordinary KV-cache
+    # tokens (same cell as text — they consume context positions, already
+    # covered by ctx above); the extra cost is the ViT encoder's transient
+    # activation while encoding one max-size image batch. It lives in the
+    # non-static region, alongside the LLM activation workspace.
+    vision = vision_tower_spec(cfg)
+    vision_act = vision["act_bytes"] if vision else 0
+    if vision:
+        kv_struct["warnings"].append(
+            f"多模态：vision tower {vision['layers']} 层（hidden {vision['hidden']}），"
+            f"每图最多 {vision['max_patches']:,} patches → merge 后 "
+            f"{vision['tokens_per_image']:,} 个图像 token 进入 KV cache（与文本 token 同 cell，"
+            f"占用 context 位置，已含在 context 预算内）；"
+            f"ViT encoder 峰值 activation ≈ {vision_act / GIB:.2f} GiB（编码期瞬时，非常驻）。")
+
+    runtime_total = kv_total + act_total + lin_state_total + vision_act
     grand = (total_bytes + runtime_total) * (1 + overhead)
 
     return {
@@ -825,6 +930,7 @@ def analyze(model_id: str, cfg: dict, ctx: int, requests: int, kv_dtype: str,
         "draft_embed_bytes": draft_embed_bytes,  # NextN draft's own bf16 embed (load-time)
         "kv_per_tok": kv_per_tok, "kv_per_req": kv_per_req, "kv_total": kv_total,
         "lin_state_total": lin_state_total,
+        "vision": vision, "vision_act": vision_act,
         "mha_total": mha_total, "mha_ratio": mha_ratio,
         "batch_tokens": batch_tokens, "act_total": act_total, "act_desc": act_desc,
         "runtime_total": runtime_total, "overhead": overhead, "grand": grand,
@@ -955,6 +1061,7 @@ def parallel_self_check(a: dict, layer: dict, cfg: dict):
     L = cfg["num_hidden_layers"]
     cb = {c["key"]: c["bytes"] for c in a["comps"]}
     rebuilt = (cb.get("embed", 0) + cb.get("lm_head", 0) + layer["mtpTotal"]
+               + cb.get("vision", 0)
                + L * (layer["attnQo"] + layer["attnKvProj"] + layer["attnRepl"]
                       + layer["indexer"] + layer["norms"])
                + p["dense_layers"] * layer["denseFfn"]
@@ -1013,6 +1120,11 @@ def report(a: dict):
               f" -> x{a['requests']} = {human(a['lin_state_total'])}")
     print(f"  Activation workspace ({a['batch_tokens']:,} tokens/forward): {human(a['act_total'])}")
     print(f"    {a['act_desc']}")
+    if a.get("vision"):
+        v = a["vision"]
+        print(f"  Vision encoder activation (ViT {v['layers']}L, hidden {v['hidden']}, "
+              f"{v['max_patches']:,} patches/image): {human(a['vision_act'])}")
+        print(f"    每图 {v['tokens_per_image']:,} 个图像 token 进 KV cache（与文本同 cell，占 context 位置）")
     print(f"  runtime total: {human(a['runtime_total'])}")
     for w in a["kv_struct"]["warnings"]:
         print(f"  ⚠ {w}")
@@ -1086,7 +1198,11 @@ def build_parallel_struct(a: dict, cfg: dict) -> str:
                 f"<div class='sblab'>{label}</div>{rows}</div>")
 
     emb_label = "Embedding" if p["lm_head"] else t("pstruct.emb_lmhead_shared")
-    h = block(emb_label, sqrow(EMB), EMB)
+    h = ""
+    if p.get("vision"):
+        VIS = "var(--s9)"
+        h += block(t("pstruct.vision_block"), sqrow(VIS), VIS)
+    h += block(emb_label, sqrow(EMB), EMB)
     if is_moe:
         if dense_n:
             h += block(f"L0–L{dense_n - 1} · Attention + Dense FFN ×{dense_n}",
@@ -1243,6 +1359,16 @@ def build_evidence(a: dict, cfg: dict, p: dict) -> str:
         rows_ab += abrow(4, f"MTP × {n_mtp}", mtp_chips,
                          "n_mtp × (attention + MoE expert stack + eh_proj 2·H·H)",
                          t("ev.mtp_composite"), p["mtp"])
+    if p.get("vision"):
+        v = a.get("vision") or vision_tower_spec(cfg)
+        vis_chips = [
+            chip("vt_hidden_size", v["hidden"], t("ev.f.vt_hidden_size")),
+            chip("vt_intermediate_size", v["inter"], t("ev.f.vt_intermediate_size")),
+            chip("vt_num_hidden_layers", v["layers"], t("ev.f.vt_num_hidden_layers")),
+            chip("patch_size", v["patch_size"], t("ev.f.vt_patch_size"))]
+        rows_ab += abrow(8, "vision tower + projector", vis_chips,
+                         "L_v × (qkv/o 4H² + MLP 2HI + norms) + patch_embed + projector",
+                         t("ev.vision_composite"), p["vision"])
 
     ab_table = (f"{global_band}<table class='ev-abtab'><thead><tr>"
                 f"<th>{t('ev.col_component')}</th><th>{t('ev.col_config')}</th>"
@@ -1255,7 +1381,7 @@ def build_evidence(a: dict, cfg: dict, p: dict) -> str:
     else:
         cb = {c["key"]: c for c in a["comps"]}
         order = ["embed", "lm_head", "attention", "dense_ffn",
-                 "moe_routed", "moe_shared", "mtp"]
+                 "moe_routed", "moe_shared", "mtp", "vision"]
         rows = [(k, recon[k]) for k in order
                 if k in recon and recon[k].get("formula") and recon[k].get("apparent")]
         max_f = max((r["formula"] for _, r in rows), default=1)
@@ -1382,6 +1508,9 @@ def _build_lang_fragments(a: dict, cfg: dict, p: dict, is_moe: bool, short: str,
         struct += layer_block("FFN", 2, "L0")
         struct += f"<div class='ell'>{t('struct.same_layers_ellipsis', L=L)}</div>"
         struct += layer_block("FFN", 2, f"L{L - 1}")
+    if a.get("vision"):
+        struct = (f"<div class='io' style='border-color:{_var(8)}'><i class='dot' style='background:{_var(8)}'></i>"
+                  f"{t('struct.vision_entry', Lv=a['vision']['layers'])}</div>") + struct
     if p["mtp"]:
         struct += f"<div class='io' style='border-color:{_var(4)}'><i class='dot' style='background:{_var(4)}'></i>{t('struct.mtp_entry', n_mtp=cfg.get('num_nextn_predict_layers'))}</div>"
     head_note = t("struct.lmhead_exit") if p["lm_head"] else t("struct.lmhead_shared")
@@ -1480,6 +1609,14 @@ def _build_lang_fragments(a: dict, cfg: dict, p: dict, is_moe: bool, short: str,
                        [t("card.mtp_line")],
                        dtype=cdtype("mtp"))
 
+    if "vision" in cb and cbytes("vision"):
+        v = a["vision"]
+        vlines = ([t("card.vision_line", Lv=v['layers'], H=v['hidden'], inter=v['inter'])]
+                  if v else [])
+        cards += _card(8, t("card.vision_title"),
+                       f"{_gib(cbytes('vision'))} GiB", cshare("vision"), vlines,
+                       dtype=cdtype("vision"))
+
     if a.get("exact") and cbytes("norms") / a["total_bytes"] >= 0.005:
         cards += _card(7, t("card.norms_title"),
                        f"{_gib(cbytes('norms'))} GiB", cshare("norms"), [],
@@ -1511,6 +1648,17 @@ def _build_lang_fragments(a: dict, cfg: dict, p: dict, is_moe: bool, short: str,
     runtime_cards += _card(6, t("card.act_title", batch_tokens=f"{a['batch_tokens']:,}"),
                            f"{_gib(a['act_total'])} GiB", None, act_lines, dtype="bf16")
 
+    if a.get("vision"):
+        v = a["vision"]
+        runtime_cards += _card(8, t("card.vision_act_title", Lv=v['layers']),
+                               f"{_gib(a['vision_act'])} GiB", None,
+                               [t("card.vision_act_line",
+                                  patches=f"{v['max_patches']:,}",
+                                  kib=f"{v['act_per_patch'] / 1024:.0f}"),
+                                t("card.vision_act_line2",
+                                  tokens=f"{v['tokens_per_image']:,}", merge=v['merge'])],
+                               dtype="bf16")
+
     # ---- stacked bars
     ranked = sorted((c for c in a["comps"] if c["bytes"] > 0), key=lambda c: -c["bytes"])
     big = [c for c in ranked if c["share"] >= 0.015][:5]
@@ -1528,6 +1676,9 @@ def _build_lang_fragments(a: dict, cfg: dict, p: dict, is_moe: bool, short: str,
         tsegs.append({"label": "linear/SSM state", "bytes": a["lin_state_total"],
                       "share": a["lin_state_total"] / tot, "slot": 7})
     tsegs.append({"label": "Activation", "bytes": a["act_total"], "share": a["act_total"] / tot, "slot": 6})
+    if a.get("vision_act"):
+        tsegs.append({"label": t("bar.vision_act_label"), "bytes": a["vision_act"],
+                      "share": a["vision_act"] / tot, "slot": 8})
     total_segs, total_legend = _stacked_bar(tsegs)
 
     lin_part = t("bar.lin_part", lin=_gib(a['lin_state_total'])) if a["lin_state_total"] else ""
@@ -1554,6 +1705,10 @@ def _build_lang_fragments(a: dict, cfg: dict, p: dict, is_moe: bool, short: str,
     trows += (f"<tr><td><i class='dot' style='background:{_var(6)}'></i>"
               f"activation ({a['batch_tokens']:,} tokens/forward)</td><td>bf16</td>"
               f"<td class='num'>—</td><td class='num'>{_gib(a['act_total'])}</td><td class='num'>—</td></tr>")
+    if a.get("vision_act"):
+        trows += (f"<tr><td><i class='dot' style='background:{_var(8)}'></i>"
+                  f"vision encoder activation ({a['vision']['max_patches']:,} patches/image)</td><td>bf16</td>"
+                  f"<td class='num'>—</td><td class='num'>{_gib(a['vision_act'])}</td><td class='num'>—</td></tr>")
 
     if is_moe:
         subtitle = t("html.subtitle_moe", dense_n=dense_n, moe_n=moe_n,
@@ -1738,6 +1893,13 @@ def render_html(a: dict, out_path: str, ctx_options: list, req_options: list,
         # shard by attn-TP: /tp in pure TP, full copy under dp-attention.
         "absorbPerLayer": a.get("absorb_per_layer", 0),
         "draftEmbedBytes": a.get("draft_embed_bytes", 0),
+        # vision tower + projector (VLMs): SGLang shards only VisionAttention's
+        # qkv/o by attn-TP; the ViT MLP (plain nn.Linear) and the projector
+        # (ReplicatedLinear) are one full copy per rank.
+        "visionBytes": next((c["bytes"] for c in a["comps"] if c["key"] == "vision"), 0),
+        "visionAttnFrac": (round(a["vision"]["attn_params"] / a["vision"]["params"], 4)
+                           if a.get("vision") else 0),
+        "visionActBytes": a.get("vision_act", 0),
         "instances": instances or {},
         # roofline tab
         "activeParams": a["active"] or a["total_params"],
@@ -1823,12 +1985,16 @@ def main():
     except Exception as e:
         sys.exit(f"failed to fetch config for {args.model_id}: {e}")
 
-    # multimodal configs nest the LLM under text_config
+    # multimodal configs nest the LLM under text_config; keep quantization and
+    # the vision tower config (vision weights/activation are modeled too)
     if "num_hidden_layers" not in cfg and "text_config" in cfg:
         qc = cfg.get("quantization_config")
+        vc = cfg.get("vision_config")
         cfg = cfg["text_config"]
         if qc and "quantization_config" not in cfg:
             cfg["quantization_config"] = qc
+        if vc and "vision_config" not in cfg:
+            cfg["vision_config"] = vc
 
     # resolve kv-dtype "auto" the way SGLang does (server_args + deepseek_v4_hook):
     # DSA/V4 sparse-attention models default to fp8_e4m3 KV, everything else

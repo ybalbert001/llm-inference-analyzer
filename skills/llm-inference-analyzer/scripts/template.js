@@ -464,7 +464,7 @@ function updateEstimate() {
   var kvPerReq = kvCellBytes(kvDtype) * kvLayerTokens(ctx);
   var kvTotal = kvPerReq * req;
   var linTotal = (D.linStateBytes || 0) * req;
-  var runtime = kvTotal + linTotal + D.actBytes;
+  var runtime = kvTotal + linTotal + D.actBytes + (D.visionActBytes || 0);
   var total = D.weightsBytes + runtime;
   var grand = total * (1 + D.overhead);
   var ctxStr = ctx.toLocaleString('en-US');
@@ -488,6 +488,7 @@ function updateEstimate() {
   ];
   if (linTotal > 0) segs.push({label: 'linear/SSM state', bytes: linTotal, slot: 7});
   segs.push({label: 'Activation', bytes: D.actBytes, slot: 6});
+  if (D.visionActBytes > 0) segs.push({label: 'Vision encoder', bytes: D.visionActBytes, slot: 8});
   setText('d-tot-head', Tr('totalHead')(gib(total), ctxStr, req));
   el('d-tot-bar').innerHTML = barHtml(segs, total);
   el('d-tot-legend').innerHTML = legendHtml(segs);
@@ -510,10 +511,11 @@ function updateEstimate() {
 var C = { embed:'var(--s3)', lmHead:'var(--lmh)', attn:'var(--s2)', ffn:'var(--s1)',
           mtp:'var(--s7)', others:'var(--s8)', kv:'var(--s5)', act:'var(--s6)',
           kvSliding:'color-mix(in srgb, var(--s5) 45%, var(--page))',
-          linState:'var(--s4)' };
+          linState:'var(--s4)', vision:'var(--s9)' };
 var COMPS = [
   {k:'embed',     label:'embed',        color:C.embed},
   {k:'lmHead',    label:'lm_head',      color:C.lmHead},
+  {k:'vision',    label:'vision tower', color:C.vision},
   {k:'attention', label:'attention',    color:C.attn},
   {k:'denseFfn',  label:'dense FFN',    color:C.ffn},
   {k:'moeRouted', label:'MoE experts',  color:C.ffn},
@@ -579,6 +581,14 @@ function gpuMemory(s, P){
   // NOT in the group (enable_dp_lm_head defaults off) — it stays /tp.
   var attnTpDiv = P.dpAttn ? 1 : P.tp;
   w.embed  = (s===0) ? D.embed/attnTpDiv : 0;
+  // vision tower (VLMs) sits on the embedding stage. Only VisionAttention's
+  // qkv/o shard by attn-TP (visionAttnFrac); the ViT MLP (plain nn.Linear)
+  // and the projector are replicated on every rank.
+  w.vision = 0;
+  if (s===0 && D.visionBytes) {
+    var vAttn = D.visionAttnFrac || 0;
+    w.vision = D.visionBytes * (vAttn/attnTpDiv + (1-vAttn));
+  }
   w.lmHead = 0;
   if (s===P.pp-1) w.lmHead = D.tied ? (P.pp>1 ? D.embed/P.tp : 0) : D.lmHead/P.tp;
   w.attention = n * (P.dpAttn
@@ -621,7 +631,10 @@ function gpuMemory(s, P){
                   * (n/D.L) * P.req * kvShard };
     });
   var kv = 0; kvParts.forEach(function(g0){ kv += g0.b; });
-  var act = D.actBytes/P.tp;
+  // vision encoder activation: the ViT MLP is replicated (only its attention
+  // shards by TP), so each rank needs close to the full workspace while
+  // encoding — added unsharded, conservative.
+  var act = D.actBytes/P.tp + (D.visionActBytes||0);
   // linear/SSM fixed state (hybrid models): per-request, grows with concurrency
   // not context. SGLang allocates it as a separate mamba pool inside the static
   // region, so it competes with the paged-KV pool for the same budget. Assumes
