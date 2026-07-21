@@ -10,6 +10,9 @@ function el(id) { return document.getElementById(id); }
 function setText(id, txt) { var e = el(id); if (e) e.textContent = txt; }
 // fp4 = mxfp4: 0.5 B data + 1 uint8 scale per 16 elements
 function kvBytesPer(dtype) { return dtype === 'fp8' ? 1 : dtype === 'fp4' ? 0.5625 : 2; }
+// KV cell: bytes per token per KV-bearing layer. DSA models add a fixed
+// fp8 index-key + scale (kvIndexerBytes) that does NOT follow the KV dtype.
+function kvCellBytes(dtype) { return D.kvElemsPerLayer * kvBytesPer(dtype) + (D.kvIndexerBytes || 0); }
 // stored KV token-positions summed over layers, honoring sliding-window caps.
 // kvGroups: [[layerCount, window], ...]; window=0 = full context. Falls back to
 // nKvLayers×ctx (or L×ctx) when no group model is present.
@@ -416,8 +419,8 @@ function updateEstimate() {
   var req = +el('f-req').value;
   var kvSel = el('f-kv').value;
   var kvDtype = kvDtypeNow();
-  var kvPerTok = D.kvElemsPerLayer * (D.nKvLayers || D.L) * kvBytesPer(kvDtype);
-  var kvPerReq = D.kvElemsPerLayer * kvLayerTokens(ctx) * kvBytesPer(kvDtype);
+  var kvPerTok = kvCellBytes(kvDtype) * (D.nKvLayers || D.L);
+  var kvPerReq = kvCellBytes(kvDtype) * kvLayerTokens(ctx);
   var kvTotal = kvPerReq * req;
   var linTotal = (D.linStateBytes || 0) * req;
   var runtime = kvTotal + linTotal + D.actBytes;
@@ -555,7 +558,7 @@ function gpuMemory(s, P){
     .map(function(g0){
       var tokens = g0[1] ? Math.min(P.ctx, g0[1]) : P.ctx;
       return { layers:g0[0], window:g0[1],
-               b: D.kvElemsPerLayer * kvBytesPer(P.kvDtype) * g0[0] * tokens
+               b: kvCellBytes(P.kvDtype) * g0[0] * tokens
                   * (n/D.L) * P.req * kvShard };
     });
   var kv = 0; kvParts.forEach(function(g0){ kv += g0.b; });
@@ -741,7 +744,7 @@ function updateParallel(){
 
   // summary + legend
   var repl = clusterWeights - D.weightsBytes;
-  var kvSingle = D.kvElemsPerLayer*kvBytesPer(P.kvDtype)*kvLayerTokens(P.ctx)*P.req;
+  var kvSingle = kvCellBytes(P.kvDtype)*kvLayerTokens(P.ctx)*P.req;
   var kvRepl = clusterKv/kvSingle;
   el('sum-head').textContent = 'TP'+P.tp+' × PP'+P.pp+(D.nMoe?' × EP'+P.ep:'')+
     Tr('sumHeadTail')(world, nNodes, P.instLabel,

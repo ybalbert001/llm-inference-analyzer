@@ -449,17 +449,41 @@ def count_params(cfg: dict) -> dict:
 # ---------------------------------------------------------------- runtime memory
 
 def kv_per_token_elems(cfg: dict) -> tuple[int, str]:
-    """Elements stored per token per layer, and a description."""
+    """Elements stored per token per layer, and a description.
+
+    Elements only — the DSA indexer cache is a *byte* add-on independent of the
+    KV dtype, so it lives in indexer_kv_bytes_per_token_layer(), not here. The
+    description does mention it so every surface that prints the formula shows
+    the full cell.
+    """
     if cfg.get("kv_lora_rank"):
         elems = cfg["kv_lora_rank"] + cfg["qk_rope_head_dim"]
         desc = t("kv.mla_desc", kv_lora=cfg["kv_lora_rank"], rope=cfg["qk_rope_head_dim"], elems=elems)
-        return elems, desc
-    n_heads = cfg["num_attention_heads"]
-    n_kv = cfg.get("num_key_value_heads", n_heads)
-    head_dim = cfg.get("head_dim") or cfg["hidden_size"] // n_heads
-    elems = 2 * n_kv * head_dim
-    kind = t("kv.kind_mha") if n_kv == n_heads else t("kv.kind_gqa", n_kv=n_kv)
-    return elems, t("kv.gqa_desc", kind=kind, n_kv=n_kv, head_dim=head_dim, elems=elems)
+    else:
+        n_heads = cfg["num_attention_heads"]
+        n_kv = cfg.get("num_key_value_heads", n_heads)
+        head_dim = cfg.get("head_dim") or cfg["hidden_size"] // n_heads
+        elems = 2 * n_kv * head_dim
+        kind = t("kv.kind_mha") if n_kv == n_heads else t("kv.kind_gqa", n_kv=n_kv)
+        desc = t("kv.gqa_desc", kind=kind, n_kv=n_kv, head_dim=head_dim, elems=elems)
+    idx_b = indexer_kv_bytes_per_token_layer(cfg)
+    if idx_b:
+        desc += t("kv.indexer_suffix", d_i=idx_b - 4, b=idx_b)
+    return elems, desc
+
+
+def indexer_kv_bytes_per_token_layer(cfg: dict) -> int:
+    """DSA indexer per-token index-key cache, bytes per token per layer.
+
+    DSA/NSA models (index_topk set) cache one fp8 index-key vector of
+    index_head_dim per token per layer plus a 4-byte scale, paged alongside the
+    KV pool but sized independently of --kv-dtype. Verified on 8xB200 (S1 E2):
+    GLM-5.x cell = layers x (576 x kv_bytes + 132), the +132 = 128 + 4 held
+    across fp8/bf16 KV, GLM-FP8/NVFP4, and dp-attention runs.
+    """
+    if cfg.get("index_topk") is None:
+        return 0
+    return (cfg.get("index_head_dim") or 128) + 4
 
 
 def kv_structure(cfg: dict) -> dict:
@@ -747,8 +771,13 @@ def analyze(model_id: str, cfg: dict, ctx: int, requests: int, kv_dtype: str,
     # sliding layers keep min(ctx, window). layer_tokens is the ctx-weighted
     # layer count that a single request's KV occupies.
     layer_tokens = sum(n * (min(ctx, w) if w else ctx) for n, w in kv_struct["kv_groups"])
-    kv_per_tok = elems * kv_layers * kvb    # nominal (all KV layers at full ctx), for display
-    kv_per_req = elems * layer_tokens * kvb
+    # DSA models cache an fp8 index key + scale per token per layer alongside
+    # the KV pool; its size does not follow kv_dtype, so it adds bytes/token/layer
+    # rather than elements.
+    idx_kv_b = indexer_kv_bytes_per_token_layer(cfg)
+    cell_b = elems * kvb + idx_kv_b         # bytes per token per KV-bearing layer
+    kv_per_tok = cell_b * kv_layers         # nominal (all KV layers at full ctx), for display
+    kv_per_req = cell_b * layer_tokens
     kv_total = kv_per_req * requests
     mha_total = mha_ratio = None
     if p["is_mla"]:
@@ -774,6 +803,7 @@ def analyze(model_id: str, cfg: dict, ctx: int, requests: int, kv_dtype: str,
         "ctx": ctx, "requests": requests, "kv_dtype": kv_dtype, "kv_desc": kv_desc,
         "kv_struct": kv_struct,
         "kv_elems_total": elems * kv_layers,  # dtype-independent: elements/token over KV-bearing layers
+        "kv_indexer_bytes": idx_kv_b,  # DSA index-key cache, bytes/token/layer (0 if no indexer)
         "kv_per_tok": kv_per_tok, "kv_per_req": kv_per_req, "kv_total": kv_total,
         "lin_state_total": lin_state_total,
         "mha_total": mha_total, "mha_ratio": mha_ratio,
@@ -1660,6 +1690,7 @@ def render_html(a: dict, out_path: str, ctx_options: list, req_options: list,
         "readCapLayers": a["kv_struct"]["read_cap_layers"],
         "kvWarnings": a.get("weight_warnings", []) + a["kv_struct"]["warnings"],
         "kvElemsPerLayer": elems_per_layer,
+        "kvIndexerBytes": a.get("kv_indexer_bytes", 0),  # DSA index cache, bytes/token/layer, kv-dtype-independent
         "kvAuto": kv_auto,                # what "auto" resolves to for this model
         "kvChoice": kv_choice,
         "actBytes": a["act_total"],

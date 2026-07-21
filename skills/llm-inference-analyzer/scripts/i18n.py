@@ -34,6 +34,9 @@ MSG = {
                      "en": "{kind}: 2 x {n_kv} x {head_dim} = {elems}/token/layer"},
     "kv.kind_mha": {"zh": "MHA", "en": "MHA"},
     "kv.kind_gqa": {"zh": "GQA（{n_kv} kv heads）", "en": "GQA ({n_kv} kv heads)"},
+    "kv.indexer_suffix": {
+        "zh": "；+ DSA indexer 索引缓存 fp8×{d_i} + scale = {b} B/token/layer（不随 kv-dtype 变）",
+        "en": "; + DSA indexer index-key cache fp8×{d_i} + scale = {b} B/token/layer (kv-dtype-independent)"},
 
     # ---- parallel-tab left column (build_parallel_struct)
     "pstruct.emb_lmhead_shared": {"zh": "Embedding + LM Head（共享）", "en": "Embedding + LM Head (shared)"},
@@ -81,8 +84,10 @@ MSG = {
                                  "en": "{heads} q heads / {n_kv} kv heads, head_dim {hd}{extra}"},
     "card.attention_lora_extra": {"zh": "，q/o 低秩分解", "en": ", q/o low-rank factorized"},
     "card.indexer_title": {"zh": "attn indexer（DSA 稀疏注意力索引）", "en": "attn indexer (DSA sparse-attention index)"},
-    "card.indexer_line": {"zh": "index_n_heads={n_i}, index_head_dim={d_i}，省的是计算，非存储",
-                           "en": "index_n_heads={n_i}, index_head_dim={d_i} — saves compute, not memory"},
+    "card.indexer_line": {"zh": "index_n_heads={n_i}, index_head_dim={d_i}，省 attention 计算；"
+                                "另有 index-key 缓存 {d_i}+4 B/token/layer 计入 KV cell",
+                           "en": "index_n_heads={n_i}, index_head_dim={d_i} — saves attention compute; "
+                                 "its index-key cache adds {d_i}+4 B/token/layer to the KV cell"},
     "card.dense_ffn_title": {"zh": "② Dense FFN（前 {dense_n} 层）", "en": "② Dense FFN (first {dense_n} layers)"},
     "card.dense_ffn_line": {"zh": "3 矩阵 × {H} × {inter}（胖）× {dense_n} 层", "en": "3 matrices × {H} × {inter} (wide) × {dense_n} layers"},
     "card.moe_routed_line": {"zh": "routed experts：{n_routed} × 3 矩阵 × {H} × {moe_inter}（瘦）× {moe_n} 层 = <b>{gib} GiB</b>{dt}",
