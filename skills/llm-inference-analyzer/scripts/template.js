@@ -172,6 +172,13 @@ var I18N = {
     },
     roofFallback: function (fallback) { return '（该 GPU 无 ' + fallback + ' 算力，按 bf16 口径）'; },
     attnCoreLabel: function () { return 'Attn core（KV/score）'; },
+    linStateLabel: function () { return 'Linear/SSM state'; },
+    linStateDecodeNote: function (nLin) {
+      return nLin + ' 个 linear 层定长 state 每步读+写各一遍，随并发不随 context 增长';
+    },
+    linStatePrefillNote: function (nLin) {
+      return nLin + ' 个 linear 层定长 state 每 chunk 读+写各一遍，O(1) 不随 chunk 长度增长';
+    },
     roofNote: function (kneeStr) {
       return '每个<b>点是一个 kernel</b>：● = decode 阶段，▲ = prefill 阶段。落点强度 &lt; 拐点（峰值 ÷ 带宽 ≈ ' +
         kneeStr + ' FLOPs/B）→ 受显存带宽限制（memory-bound），GPU 算力用不满；反之受算力限制。' +
@@ -355,6 +362,13 @@ var I18N = {
     },
     roofFallback: function (fallback) { return ' (this GPU has no ' + fallback + ' compute; falling back to bf16)'; },
     attnCoreLabel: function () { return 'Attn core (KV/score)'; },
+    linStateLabel: function () { return 'Linear/SSM state'; },
+    linStateDecodeNote: function (nLin) {
+      return 'fixed state of ' + nLin + ' linear layers read+written once per step; grows with concurrency, not context';
+    },
+    linStatePrefillNote: function (nLin) {
+      return 'fixed state of ' + nLin + ' linear layers read+written once per chunk; O(1), independent of chunk length';
+    },
     roofNote: function (kneeStr) {
       return 'Each <b>point is one kernel</b>: ● = decode phase, ▲ = prefill phase. Intensity below the knee (peak ÷ bandwidth ≈ ' +
         kneeStr + ' FLOPs/B) → memory-bound, GPU compute goes underused; otherwise compute-bound. ' +
@@ -915,7 +929,11 @@ function fmtNum(x) {
  *   prefillTokens  - T, tokens processed by one prefill chunk
  *   contextTokens  - S, cached tokens read by each decode request
  *   kvBytes        - storage bytes per KV element at the selected precision
- *   layers         - number of transformer layers
+ *   kvLayers       - layers that hold paged KV; hybrid models' linear/SSM
+ *                    layers keep a fixed state instead and must not be charged
+ *                    per-context attention reads/pairs
+ *   linLayers/linStateBytes - linear/SSM layer count and their fixed per-request
+ *                    state bytes (read+written every step, O(1) in context)
  *   attentionGeometry/pattern - model structure serialized by Python
  *   topk/nExperts  - routed experts selected per token / total routed experts
  */
@@ -925,7 +943,9 @@ function currentRooflineWorkload() {
     prefillTokens: D.batchTokens,
     contextTokens: +el('f-ctx').value,
     kvBytes: kvBytesPer(kvDtypeNow()),
-    layers: D.L,
+    kvLayers: D.nKvLayers || D.L,
+    linLayers: D.linLayers || 0,
+    linStateBytes: D.linStateBytes || 0,
     attentionGeometry: D.attentionCore.geometry,
     attentionPattern: D.attentionCore.pattern,
     topk: D.topk,
@@ -1156,21 +1176,23 @@ function cappedCausalPairs(tokens, limit) {
 }
 
 /**
- * Dense attention access pattern across all transformer layers.
+ * Dense attention access pattern across the KV-bearing layers.
  *
- * Inputs: B decode queries, context S, prefill chunk T, and layer count L.
- * Decode pairs and KV reads = B*S*L.
- * Prefill pairs = T*(T+1)/2*L. Prefill KV reads = T*L, the ideal one-pass
+ * Inputs: B decode queries, context S, prefill chunk T, and KV layer count Lkv
+ * (= all layers for pure transformers; hybrid models' linear/SSM layers are
+ * excluded — their O(1) state traffic is the separate linear_state kernel).
+ * Decode pairs and KV reads = B*S*Lkv.
+ * Prefill pairs = T*(T+1)/2*Lkv. Prefill KV reads = T*Lkv, the ideal one-pass
  * HBM lower bound; FlashAttention tiling/reloads are intentionally excluded.
  */
 function calculateDenseAttentionPattern(workload) {
-  var decodePairs = workload.decodeTokens * workload.contextTokens * workload.layers;
+  var decodePairs = workload.decodeTokens * workload.contextTokens * workload.kvLayers;
   return {
     label: 'dense',
     decodePairs: decodePairs,
-    prefillPairs: denseCausalPairs(workload.prefillTokens) * workload.layers,
+    prefillPairs: denseCausalPairs(workload.prefillTokens) * workload.kvLayers,
     decodeKvReads: decodePairs,
-    prefillKvReads: workload.prefillTokens * workload.layers,
+    prefillKvReads: workload.prefillTokens * workload.kvLayers,
     decodeNote: Tr('denseDecodeNote')(ctxLabel(workload.contextTokens)),
     prefillNote: Tr('densePrefillNote')()
   };
@@ -1190,10 +1212,10 @@ function calculateDsaAttentionPattern(workload, pattern) {
   var attended = Math.min(workload.contextTokens, pattern.topk);
   return {
     label: Tr('dsaLabel')(pattern.topk),
-    decodePairs: workload.decodeTokens * attended * workload.layers,
-    prefillPairs: cappedCausalPairs(workload.prefillTokens, pattern.topk) * workload.layers,
-    decodeKvReads: workload.decodeTokens * attended * workload.layers,
-    prefillKvReads: workload.prefillTokens * workload.layers,
+    decodePairs: workload.decodeTokens * attended * workload.kvLayers,
+    prefillPairs: cappedCausalPairs(workload.prefillTokens, pattern.topk) * workload.kvLayers,
+    decodeKvReads: workload.decodeTokens * attended * workload.kvLayers,
+    prefillKvReads: workload.prefillTokens * workload.kvLayers,
     decodeNote: Tr('dsaDecodeNote')(ctxLabel(workload.contextTokens), attended),
     prefillNote: Tr('dsaPrefillNote')(pattern.topk)
   };
@@ -1209,8 +1231,8 @@ function calculateDsaAttentionPattern(workload, pattern) {
  */
 function calculateCappedAttentionPattern(workload, pattern) {
   var S = workload.contextTokens, B = workload.decodeTokens, T = workload.prefillTokens;
-  var capL = Math.min(pattern.capLayers, workload.layers);
-  var denseL = workload.layers - capL;
+  var capL = Math.min(pattern.capLayers, workload.kvLayers);
+  var denseL = workload.kvLayers - capL;
   var attended = Math.min(S, pattern.cap);
   var decodeKvReads = B * (attended * capL + S * denseL);
   var prefillPairsCapped = cappedCausalPairs(T, pattern.cap) * capL
@@ -1220,7 +1242,7 @@ function calculateCappedAttentionPattern(workload, pattern) {
     decodePairs: decodeKvReads,
     prefillPairs: prefillPairsCapped,
     decodeKvReads: decodeKvReads,
-    prefillKvReads: T * workload.layers,
+    prefillKvReads: T * workload.kvLayers,
     decodeNote: Tr('dsaDecodeNote')(ctxLabel(S), attended) + ' × ' + capL + 'L',
     prefillNote: Tr('dsaPrefillNote')(pattern.cap)
   };
@@ -1264,6 +1286,35 @@ function calculateAttentionCoreWork(workload) {
       geometry.flopsPerPair * pattern.prefillPairs,
       geometry.kvElementsPerKey * pattern.prefillKvReads * workload.kvBytes,
       prefix + pattern.prefillNote
+    )
+  };
+}
+
+/**
+ * Weight-free linear/SSM recurrent-state kernel for hybrid models.
+ *
+ * The linear layers keep a fixed per-request state (conv + ssm, linStateBytes
+ * total across all linear layers) instead of paged KV. Every decode step each
+ * active request reads and writes that state once — O(1) in context, O(B) in
+ * concurrency. Chunked prefill reads+writes the one request's state once per
+ * chunk. FLOPs are an order-of-magnitude delta-rule estimate (~2 FLOPs per
+ * state element per token, state elements ≈ bytes/2); the term is bandwidth-
+ * dominated so the bytes side carries the roofline placement.
+ */
+function calculateLinearStateWork(workload) {
+  var B = workload.decodeTokens;
+  var T = workload.prefillTokens;
+  var stateElems = workload.linStateBytes / 2;
+  return {
+    dec: phaseWork(
+      2 * stateElems * B,
+      2 * workload.linStateBytes * B,
+      Tr('linStateDecodeNote')(workload.linLayers)
+    ),
+    pre: phaseWork(
+      2 * stateElems * T,
+      2 * workload.linStateBytes,
+      Tr('linStatePrefillNote')(workload.linLayers)
     )
   };
 }
@@ -1312,6 +1363,18 @@ function rooflineKernels() {
     dec: attentionCore.dec,
     pre: attentionCore.pre
   });
+
+  if (workload.linStateBytes > 0) {
+    var linearState = calculateLinearStateWork(workload);
+    rows.push({
+      key: 'linear_state',
+      label: Tr('linStateLabel')(),
+      color: C.linState,
+      kind: 'attn',
+      dec: linearState.dec,
+      pre: linearState.pre
+    });
+  }
 
   return { rows: rows, B: workload.decodeTokens, T: workload.prefillTokens };
 }
