@@ -206,14 +206,15 @@ var I18N = {
     decodeFootCompute: function () {
       return '已 compute-bound：加并发只会线性加长 step 时间，吞吐不再提升；关注算力利用率与更高算力精度（fp8/fp4）。';
     },
-    prefillFormula: function (chunkMs, tp, ctxLbl, seconds) {
-      return "<div class='vformula'>一个 chunk ≈ " + chunkMs + " ms（TP" + tp + "）→ 处理 " +
-        ctxLbl + " prompt ≈ " + seconds + " s</div>";
+    prefillFormula: function (sumMs, chunkMs, tp, ctxLbl, seconds) {
+      return "<div class='vformula'>∑ 各 kernel 时间 " + sumMs + " ms ÷ TP" + tp +
+        " ≈ 一个 chunk " + chunkMs + " ms → 处理 " +
+        ctxLbl + " prompt ≈ " + seconds + " s（理想下界）</div>";
     },
     prefillFootMem: function () { return 'memory-bound（少见，多为小 chunk / 大模型）。'; },
     prefillFootCompute: function () { return 'compute-bound：prefill 吃算力，量化权重省不了时间（除非用低精度算力）；'; },
     prefillFootTail: function () { return '缩短 TTFT 的手段：更高算力 GPU、prefix cache、chunked prefill 与 decode 重叠。'; },
-    kernelDetailsSummary: function () { return '逐 kernel 明细（FLOPs / HBM / 强度 / 时间占比）'; },
+    kernelDetailsSummary: function () { return '逐 kernel 明细（FLOPs / HBM / 强度 / 时间）'; },
     kbPhaseStep: function () { return '步'; },
     kbPhaseChunk: function () { return ' chunk'; },
     kbHeadFlops: function (suffix) { return 'FLOPs（每' + suffix + '）'; },
@@ -222,6 +223,7 @@ var I18N = {
     compTblIntensity: function () { return '强度 F/B'; },
     compTblBoundBy: function () { return '受限于'; },
     compTblTimeShare: function () { return '时间占比'; },
+    compTblTimeMs: function () { return '时间 (ms，单卡)'; },
     compTblNote: function () { return '说明'; },
     compTblTotal: function () { return '合计'; },
     boundByMem: function () { return '带宽'; },
@@ -401,14 +403,15 @@ var I18N = {
     decodeFootCompute: function () {
       return 'Already compute-bound: adding concurrency only lengthens step time linearly with no throughput gain; focus on compute utilization and higher-throughput dtypes (fp8/fp4).';
     },
-    prefillFormula: function (chunkMs, tp, ctxLbl, seconds) {
-      return "<div class='vformula'>one chunk ≈ " + chunkMs + " ms (TP" + tp + ") → processing a " +
-        ctxLbl + " prompt ≈ " + seconds + " s</div>";
+    prefillFormula: function (sumMs, chunkMs, tp, ctxLbl, seconds) {
+      return "<div class='vformula'>∑ kernel times " + sumMs + " ms ÷ TP" + tp +
+        " ≈ " + chunkMs + " ms per chunk → processing a " +
+        ctxLbl + " prompt ≈ " + seconds + " s (ideal lower bound)</div>";
     },
     prefillFootMem: function () { return 'Memory-bound (uncommon — usually small chunks / large models).'; },
     prefillFootCompute: function () { return 'Compute-bound: prefill is compute-hungry; quantizing weights alone won’t save time (unless using lower-precision compute); '; },
     prefillFootTail: function () { return 'Ways to shorten TTFT: a higher-compute GPU, prefix caching, overlapping chunked prefill with decode.'; },
-    kernelDetailsSummary: function () { return 'Per-kernel detail (FLOPs / HBM / intensity / time share)'; },
+    kernelDetailsSummary: function () { return 'Per-kernel detail (FLOPs / HBM / intensity / time)'; },
     kbPhaseStep: function () { return 'step'; },
     kbPhaseChunk: function () { return 'chunk'; },
     kbHeadFlops: function (suffix) { return 'FLOPs (per ' + suffix + ')'; },
@@ -417,6 +420,7 @@ var I18N = {
     compTblIntensity: function () { return 'intensity F/B'; },
     compTblBoundBy: function () { return 'bound by'; },
     compTblTimeShare: function () { return 'time share'; },
+    compTblTimeMs: function () { return 'time (ms, 1 GPU)'; },
     compTblNote: function () { return 'note'; },
     compTblTotal: function () { return 'total'; },
     boundByMem: function () { return 'bandwidth'; },
@@ -1749,7 +1753,10 @@ function kernelBars(rows, phase) {
     "</span><span class='kbh-b'>HBM Access</span></div>" + rowsHtml;
 }
 
-function compTableHtml(comps, perf, total) {
+// showMs: prefill shows each kernel's roofline time in ms (single GPU, before
+// ÷TP) so the chunk-time formula below the table reads as ∑ rows ÷ TP;
+// decode keeps the relative time-share column.
+function compTableHtml(comps, perf, total, showMs) {
   var totalTime = 0;
   comps.forEach(function (c) { totalTime += compTime(c, perf); });
   var rows = comps.map(function (c) {
@@ -1761,18 +1768,19 @@ function compTableHtml(comps, perf, total) {
       "<td class='num'>" + gib(c.bytes) + "</td>" +
       "<td class='num'>" + fmtNum(iv) + "</td>" +
       "<td class='num'>" + (isMem ? Tr('boundByMem')() : Tr('boundByCompute')()) + "</td>" +
-      "<td class='num'><b>" + Math.round(t / totalTime * 100) + "%</b></td>" +
+      "<td class='num'><b>" + (showMs ? (t * 1000).toFixed(1) : Math.round(t / totalTime * 100) + "%") + "</b></td>" +
       "<td>" + c.note + "</td></tr>";
   }).join('');
   rows += "<tr class='sep'><td><b>" + Tr('compTblTotal')() + "</b></td>" +
     "<td class='num'><b>" + (total.flops / 1e12).toFixed(2) + "</b></td>" +
     "<td class='num'><b>" + gib(total.bytes) + "</b></td>" +
     "<td class='num'><b>" + fmtNum(total.intensity) + "</b></td><td></td>" +
-    "<td class='num'>100%</td><td></td></tr>";
+    "<td class='num'><b>" + (showMs ? (totalTime * 1000).toFixed(1) : "100%") + "</b></td><td></td></tr>";
   return "<div style='overflow-x:auto'><table style='width:100%'>" +
     "<thead><tr><th>" + Tr('compTblComponent')() + "</th><th class='num'>TFLOPs</th><th class='num'>" + Tr('compTblHbm')() + "</th>" +
     "<th class='num'>" + Tr('compTblIntensity')() + "</th><th class='num'>" + Tr('compTblBoundBy')() +
-    "</th><th class='num'>" + Tr('compTblTimeShare')() + "</th><th>" + Tr('compTblNote')() + "</th></tr></thead>" +
+    "</th><th class='num'>" + (showMs ? Tr('compTblTimeMs')() : Tr('compTblTimeShare')()) +
+    "</th><th>" + Tr('compTblNote')() + "</th></tr></thead>" +
     "<tbody>" + rows + "</tbody></table></div>";
 }
 
@@ -1844,7 +1852,8 @@ function updateRoofline() {
         "</div>";
     } else {
       head = ph.label + Tr('prefillHeadSuffix')(fmtNum(D.batchTokens));
-      foot = Tr('prefillFormula')((phTime * 1000).toFixed(0), tpNow, ctxLabel(+el('f-ctx').value),
+      foot = Tr('prefillFormula')((phTime * tpNow * 1000).toFixed(0), (phTime * 1000).toFixed(0),
+        tpNow, ctxLabel(+el('f-ctx').value),
         (phTime * (+el('f-ctx').value) / D.batchTokens).toFixed(1)) +
         "<div class='cl'>" +
         (isMem ? Tr('prefillFootMem')() : Tr('prefillFootCompute')()) +
@@ -1856,7 +1865,7 @@ function updateRoofline() {
       "<span class='ct'>" + head + "</span>" + badge + "</div>" +
       "<div class='kbchart'>" + kernelBars(w.rows, ph) + "</div>" +
       "<details class='ktbl'><summary>" + Tr('kernelDetailsSummary')() + "</summary>" +
-      compTableHtml(comps, perf, agg) + "</details>" + foot + "</div>";
+      compTableHtml(comps, perf, agg, ph.key === 'pre') + "</details>" + foot + "</div>";
   });
 
   el('roof-verdicts').innerHTML = vh;
