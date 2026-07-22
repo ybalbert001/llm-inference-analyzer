@@ -516,8 +516,13 @@ def vision_tower_spec(cfg: dict) -> dict | None:
 
     # max ViT sequence per image: fixed-resolution models expose image_size;
     # dynamic-resolution models (Kimi/Qwen) are capped by the preprocessor's
-    # patch limit (Kimi media_proc in_patch_limit = 16384).
+    # patch limit (Kimi media_proc in_patch_limit = 16384; verified: a 7168²
+    # image yields exactly 16384/merge = 4096 image tokens).
     max_patches = ((vc["image_size"] // ps) ** 2 if vc.get("image_size") else 16384)
+    # LLM-side tokens per image: models with a pooling projector declare it
+    # directly (Gemma mm_tokens_per_image: avg-pool to a fixed 256); otherwise
+    # it is the merge-kernel reduction of the patch count.
+    tokens_per_image = cfg.get("mm_tokens_per_image") or max_patches // merge
     # same per-token workspace shape as the LLM estimate: residual/attn
     # buffers (~8·H) + MLP intermediate (2·I), bf16, one layer live at a time
     act_per_patch = 2 * (8 * H + 2 * inter)
@@ -528,7 +533,7 @@ def vision_tower_spec(cfg: dict) -> dict | None:
         "max_patches": max_patches,
         "act_per_patch": act_per_patch,
         "act_bytes": max_patches * act_per_patch,
-        "tokens_per_image": max_patches // merge,
+        "tokens_per_image": tokens_per_image,
     }
 
 
@@ -1990,11 +1995,14 @@ def main():
     if "num_hidden_layers" not in cfg and "text_config" in cfg:
         qc = cfg.get("quantization_config")
         vc = cfg.get("vision_config")
+        mm_tok = cfg.get("mm_tokens_per_image")
         cfg = cfg["text_config"]
         if qc and "quantization_config" not in cfg:
             cfg["quantization_config"] = qc
         if vc and "vision_config" not in cfg:
             cfg["vision_config"] = vc
+        if mm_tok and "mm_tokens_per_image" not in cfg:
+            cfg["mm_tokens_per_image"] = mm_tok
 
     # resolve kv-dtype "auto" the way SGLang does (server_args + deepseek_v4_hook):
     # DSA/V4 sparse-attention models default to fp8_e4m3 KV, everything else
