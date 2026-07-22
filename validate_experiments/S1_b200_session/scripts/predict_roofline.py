@@ -9,9 +9,14 @@ chunked prefill = per-chunk sum with causal pairs accumulated over the prefix
 
 TP model: ideal aggregation — a TP-N deployment is one virtual GPU with N×BW
 and N×peak (weights/FLOPs shard evenly; comm overhead is part of the common
-efficiency factor the ratio method cancels).
+efficiency factor the ratio method cancels). Replicated components do not
+shard, so their bytes scale ×factor before aggregation (mirrors template.js):
+indexer/moe_gate weights are per-rank copies even in pure TP; attention
+weights become per-rank copies under dp-attention; the attention-core KV read
+is replicated per rank under pure-TP MLA (or tp > kv_heads for GQA) and
+evenly sharded under dp-attention — the opposite polarity of the weights.
 
-Usage: predict_roofline.py <report.html> <tp> <decode_ctx> "<prefill_lens>"
+Usage: predict_roofline.py <report.html> <tp> <decode_ctx> "<prefill_lens>" [dp]
 """
 import json, re, sys
 
@@ -35,6 +40,7 @@ def main():
     tp = int(sys.argv[2])
     decode_ctx = int(sys.argv[3])
     prefill_lens = [int(x) for x in sys.argv[4].split()]
+    dp_attn = len(sys.argv) > 5 and sys.argv[5] == "dp"
 
     perf = D["gpuPerf"]["B200"]
     dt = D["weightDtype"]
@@ -52,6 +58,24 @@ def main():
     def t(flops, bytes_):
         return max(bytes_ / bw, flops / peak)
 
+    def repl(key):
+        # per-rank replication multiplier on weight bytes (see module docstring)
+        if key in ("indexer", "moe_gate"):
+            return tp
+        if key == "attention" and dp_attn:
+            return tp
+        return 1
+
+    # attention-core KV read replication: pure-TP MLA (or tp > kv_heads) reads
+    # the full cache on every rank; dp-attention shards it by request
+    if dp_attn or tp <= 1:
+        kv_repl = 1
+    elif D.get("kvIsMla"):
+        kv_repl = tp
+    else:
+        kv_heads = D.get("kvNKvHeads") or tp
+        kv_repl = tp / min(tp, kv_heads)
+
     def kernel_times(tokens, is_decode, B=1):
         total = 0.0
         for k in D["kernels"]:
@@ -63,7 +87,7 @@ def main():
                 else:
                     total += t(2 * k["params"] * ar * tokens, k["bytes"])
             else:
-                total += t(2 * k["params"] * tokens, k["bytes"])
+                total += t(2 * k["params"] * tokens, k["bytes"] * repl(k["key"]))
         return total
 
     # ---- decode step (TPOT), B=1, context S -------------------------------
@@ -74,7 +98,7 @@ def main():
         dec_pairs = att * cap_l + S * (L - cap_l)
     else:
         dec_pairs = S * L
-    dec_core = t(flops_pair * dec_pairs, kv_elems * dec_pairs * kv_b)
+    dec_core = t(flops_pair * dec_pairs, kv_elems * dec_pairs * kv_b * kv_repl)
     # hybrid linear/SSM state: read+written once per request per step
     dec_lin = t(lin_state, 2 * lin_state) if lin_state else 0.0
     tpot = kernel_times(1, True) + dec_core + dec_lin
@@ -102,7 +126,7 @@ def main():
                       + (done * c + c * (c + 1) // 2) * (L - cap_l)
             else:
                 pairs = (done * c + c * (c + 1) // 2) * L
-            core = t(flops_pair * pairs, kv_elems * (done + c) * L * kv_b)
+            core = t(flops_pair * pairs, kv_elems * (done + c) * L * kv_b * kv_repl)
             lin = t(lin_state * c, 2 * lin_state) if lin_state else 0.0
             ttft += kernel_times(c, False) + core + lin
             done += c
@@ -113,7 +137,8 @@ def main():
         r["ratio_vs_first"] = round(r["ttft_s"] / base, 3)
 
     print(json.dumps({
-        "gpu": "B200", "tp": tp, "weight_dtype": dt,
+        "gpu": "B200", "tp": tp, "dp_attn": dp_attn, "kv_repl": kv_repl,
+        "weight_dtype": dt,
         "peak_tflops_aggregate": peak / 1e12, "bw_tbs_aggregate": bw / 1e12,
         "kv_dtype": D["kvAuto"] if D["kvChoice"] == "auto" else D["kvChoice"],
         "pattern": pat, "decode_ctx": S,

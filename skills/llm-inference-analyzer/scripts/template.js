@@ -172,6 +172,9 @@ var I18N = {
     },
     roofFallback: function (fallback) { return '（该 GPU 无 ' + fallback + ' 算力，按 bf16 口径）'; },
     attnCoreLabel: function () { return 'Attn core（KV/score）'; },
+    replNote: function (mult) {
+      return '；每卡整份复制不切分 → HBM 字节 ×' + mult + '（时间 ÷TP 后即每卡读整份）';
+    },
     linStateLabel: function () { return 'Linear/SSM state'; },
     linStateDecodeNote: function (nLin) {
       return nLin + ' 个 linear 层定长 state 每步读+写各一遍，随并发不随 context 增长';
@@ -183,7 +186,9 @@ var I18N = {
       return '每个<b>点是一个 kernel</b>：● = decode 阶段，▲ = prefill 阶段。落点强度 &lt; 拐点（峰值 ÷ 带宽 ≈ ' +
         kneeStr + ' FLOPs/B）→ 受显存带宽限制（memory-bound），GPU 算力用不满；反之受算力限制。' +
         '强度 = FLOPs ÷ HBM 搬运字节，由模型结构 + 当前 context/并发/KV 精度自动算出。' +
-        '本图为<b>单卡</b> roofline：TP 会把每个 kernel 的 FLOPs 与 HBM 字节同比例切分，强度是分片不变量，故切换 TP 时点与屋顶都不动；TP 仅影响下方卡片的延迟/吞吐数字。' +
+        '本图为<b>单卡</b> roofline：均匀切分的 kernel（FLOPs 与 HBM 字节同比例 ÷TP）强度不随 TP 变；' +
+        '<b>每卡整份复制</b>的部件不切分 —— dp-attention 下 attention 权重每卡读整份、纯 TP 下 MLA 的 KV 每卡读全量 —— ' +
+        '这些 kernel 的字节按复制倍数放大，切 TP / dp-attention 时其落点会左移（强度降低）。' +
         '峰值为 datasheet dense 口径近似值，真实 kernel 达不到 100%。';
     },
     decodeHeadSuffix: function (B) { return '（每步 ' + B + ' tokens，' + B + ' 并发）'; },
@@ -362,6 +367,9 @@ var I18N = {
     },
     roofFallback: function (fallback) { return ' (this GPU has no ' + fallback + ' compute; falling back to bf16)'; },
     attnCoreLabel: function () { return 'Attn core (KV/score)'; },
+    replNote: function (mult) {
+      return '; replicated per rank, not sharded → HBM bytes ×' + mult + ' (after ÷TP each rank reads one full copy)';
+    },
     linStateLabel: function () { return 'Linear/SSM state'; },
     linStateDecodeNote: function (nLin) {
       return 'fixed state of ' + nLin + ' linear layers read+written once per step; grows with concurrency, not context';
@@ -373,7 +381,9 @@ var I18N = {
       return 'Each <b>point is one kernel</b>: ● = decode phase, ▲ = prefill phase. Intensity below the knee (peak ÷ bandwidth ≈ ' +
         kneeStr + ' FLOPs/B) → memory-bound, GPU compute goes underused; otherwise compute-bound. ' +
         'Intensity = FLOPs ÷ HBM bytes moved, computed from model structure + current context/concurrency/KV dtype. ' +
-        'This is a <b>per-GPU</b> roofline: TP splits each kernel\'s FLOPs and HBM bytes by the same factor, so intensity is a sharding invariant — the points and the roof stay put when you change TP; TP only moves the latency/throughput figures in the cards below. ' +
+        'This is a <b>per-GPU</b> roofline: evenly-sharded kernels split FLOPs and HBM bytes by the same ÷TP, so their intensity does not move with TP; ' +
+        'components <b>replicated per rank</b> do not shard — under dp-attention every rank reads the full attention weights, and under pure TP every rank reads the full MLA KV cache — ' +
+        'their bytes are scaled by the replication factor, so those points shift left (lower intensity) as you change TP / dp-attention. ' +
         'Peak is a datasheet dense-throughput approximation; real kernels never reach 100%.';
     },
     decodeHeadSuffix: function (B) { return ' (per step ' + B + ' tokens, ' + B + ' concurrent)'; },
@@ -934,10 +944,19 @@ function fmtNum(x) {
  *                    per-context attention reads/pairs
  *   linLayers/linStateBytes - linear/SSM layer count and their fixed per-request
  *                    state bytes (read+written every step, O(1) in context)
+ *   tp/dpAttn      - sharding mode. All quantities here are GLOBAL (whole
+ *                    model × all requests) and the verdict cards divide time
+ *                    by tp assuming even sharding; components that are
+ *                    replicated per rank instead must scale their HBM bytes
+ *                    ×tp so the ÷tp comes out to one full copy per rank
+ *   kvIsMla/kvHeads - KV shardability: MLA latent KV has no head dim (every
+ *                    rank reads the whole cache under pure TP); GQA shards
+ *                    KV by min(tp, kvHeads)
  *   attentionGeometry/pattern - model structure serialized by Python
  *   topk/nExperts  - routed experts selected per token / total routed experts
  */
 function currentRooflineWorkload() {
+  var tp = +el('f-tp').value || 1;
   return {
     decodeTokens: +el('f-req').value,
     prefillTokens: D.batchTokens,
@@ -946,6 +965,10 @@ function currentRooflineWorkload() {
     kvLayers: D.nKvLayers || D.L,
     linLayers: D.linLayers || 0,
     linStateBytes: D.linStateBytes || 0,
+    tp: tp,
+    dpAttn: el('f-dp').checked && dpAvailable(tp),
+    kvIsMla: !!D.kvIsMla,
+    kvHeads: D.kvNKvHeads || 0,
     attentionGeometry: D.attentionCore.geometry,
     attentionPattern: D.attentionCore.pattern,
     topk: D.topk,
@@ -1319,6 +1342,51 @@ function calculateLinearStateWork(workload) {
   };
 }
 
+/**
+ * Per-rank replication multiplier for a kernel's HBM weight bytes.
+ *
+ * All roofline quantities are global and the verdict cards divide time by tp,
+ * which assumes every kernel's bytes shard evenly across ranks. Components the
+ * memory model replicates instead read one FULL copy on EVERY rank, so their
+ * cluster-wide traffic is ×factor; scaling the global bytes keeps the shared
+ * ÷tp honest. Mirrors gpuMemory()'s sharding:
+ *   attention - full copy per rank under dp-attention (attn-TP group = 1)
+ *   indexer / moe_gate - replicated per rank even in pure TP (w.others has
+ *               no /tp); small, but kept consistent with the memory model
+ * FLOPs never scale: each rank computes only its own token/head share.
+ */
+function kernelBytesReplication(key, workload) {
+  if (key === 'indexer' || key === 'moe_gate') return workload.tp;
+  if (key === 'attention') return workload.dpAttn ? workload.tp : 1;
+  return 1;
+}
+
+/**
+ * KV-read replication for the attention core — the OPPOSITE polarity of the
+ * weights term. Under pure TP, MLA's latent KV has no head dimension, so every
+ * rank streams the full B×S cache each step (the reason dp-attention exists);
+ * GQA shards KV reads only by min(tp, kvHeads). Under dp-attention each rank
+ * reads just its own B/tp requests' KV, so the even-shard ÷tp is exact.
+ */
+function attnCoreKvReplication(workload) {
+  if (workload.dpAttn || workload.tp <= 1) return 1;
+  if (workload.kvIsMla) return workload.tp;
+  return workload.tp / Math.min(workload.tp, workload.kvHeads || workload.tp);
+}
+
+// Scale a {dec, pre} work pair's HBM bytes by a replication factor, keeping
+// FLOPs, rebuilding intensity, and annotating the note so the detail table
+// shows why this kernel's traffic does not shard.
+function scaleWorkBytes(work, mult) {
+  if (mult === 1) return work;
+  return {
+    dec: phaseWork(work.dec.flops, work.dec.bytes * mult,
+                   work.dec.note + Tr('replNote')(fmtNum(mult))),
+    pre: phaseWork(work.pre.flops, work.pre.bytes * mult,
+                   work.pre.note + Tr('replNote')(fmtNum(mult)))
+  };
+}
+
 // Every emitted weight kernel must opt into one explicit calculator. Adding a
 // Python-side kernel without updating this table fails visibly instead of
 // silently applying an unrelated formula.
@@ -1343,7 +1411,8 @@ function rooflineKernels() {
   var rows = (D.kernels || []).map(function (kernel) {
     var calculate = ROOFLINE_KERNEL_CALCULATORS[kernel.key];
     if (!calculate) throw new Error('No roofline calculator for kernel: ' + kernel.key);
-    var work = calculate(kernel, workload);
+    var work = scaleWorkBytes(calculate(kernel, workload),
+                              kernelBytesReplication(kernel.key, workload));
     return {
       key: kernel.key,
       label: kernel.label,
@@ -1354,7 +1423,8 @@ function rooflineKernels() {
     };
   });
 
-  var attentionCore = calculateAttentionCoreWork(workload);
+  var attentionCore = scaleWorkBytes(calculateAttentionCoreWork(workload),
+                                     attnCoreKvReplication(workload));
   rows.push({
     key: 'attn_core',
     label: Tr('attnCoreLabel')(),
@@ -1827,7 +1897,7 @@ renderKvWarnings();
 });
 el('f-tp').addEventListener('change', function(){ updateParallel(); updateRoofline(); });
 el('f-inst').addEventListener('change', function(){ updateParallel(); updateRoofline(); });
-el('f-dp').addEventListener('change', updateParallel);
+el('f-dp').addEventListener('change', function(){ updateParallel(); updateRoofline(); });
 el('f-cmem').addEventListener('input', updateParallel);
 el('f-cgpn').addEventListener('input', updateParallel);
 el('f-frac').addEventListener('input', function(){ syncFracLabel(); updateParallel(); });
