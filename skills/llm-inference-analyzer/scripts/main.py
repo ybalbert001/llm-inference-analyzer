@@ -1726,6 +1726,16 @@ def _build_lang_fragments(a: dict, cfg: dict, p: dict, is_moe: bool, short: str,
         for v, lbl in [("auto", t("html.kv_auto_label", kv_auto=kv_auto)), ("bf16", "bf16"), ("fp8", "fp8"),
                        ("fp4", "fp4 (mxfp4)")])
 
+    # roofline what-if: weight dtype. Defaults to the checkpoint's own dtype
+    # (exact safetensors bytes); picking another dtype switches to ideal
+    # params × bytes/param + the matching peak line.
+    wdtype_model = ("fp4" if "fp4" in a["wname"] else
+                    "fp8" if "fp8" in a["wname"] else "bf16")
+    wdtype_options_html = "".join(
+        f"<option value='{v}'{' selected' if v == wdtype_model else ''}>"
+        f"{t('html.wdtype_model_label', wdtype=lbl) if v == wdtype_model else lbl}</option>"
+        for v, lbl in [("bf16", "bf16"), ("fp8", "fp8"), ("fp4", "fp4 (mxfp4)")])
+
     inst_options = "".join(
         f"<option value='{n}'{' selected' if n == '' else ''}>"
         f"{n} · {s['count']}×{s['gpu']} {s['memGib']:g} GiB</option>"
@@ -1744,6 +1754,7 @@ def _build_lang_fragments(a: dict, cfg: dict, p: dict, is_moe: bool, short: str,
                   heads=cfg['num_attention_heads'], vocab=f"{cfg['vocab_size']:,}",
                   batch_tokens=f"{a['batch_tokens']:,}", est_note=exact_note),
         "kv_options": kv_options_html,
+        "wdtype_options": wdtype_options_html,
         "struct_title": t("html.struct_title", L=L),
         "struct": struct,
         "static_cards": cards,
@@ -1768,6 +1779,8 @@ def _build_lang_fragments(a: dict, cfg: dict, p: dict, is_moe: bool, short: str,
         "lbl_dp": t("html.lbl_dp"),
         "lbl_inst": t("html.lbl_inst"),
         "lbl_frac": t("html.lbl_frac"),
+        "lbl_wdtype": t("html.lbl_wdtype"),
+        "lbl_chunk": t("html.lbl_chunk"),
         "lbl_custom_mem": t("html.lbl_custom_mem"),
         "lbl_custom_gpn": t("html.lbl_custom_gpn"),
         "lbl_custom_cards": t("html.lbl_custom_cards"),
@@ -1825,6 +1838,13 @@ def render_html(a: dict, out_path: str, ctx_options: list, req_options: list,
     def _popts(values, selected, labeler=str):
         return "".join(f"<option value='{v}'{' selected' if v == selected else ''}>"
                        f"{labeler(v)}</option>" for v in values)
+
+    # roofline chunked-prefill-size choices (sglang --chunked-prefill-size);
+    # default selection = --batch-tokens so the tab opens on the generated value
+    chunk_opts = sorted({1024, 2048, 4096, 8192, 16384, 32768} | {a["batch_tokens"]})
+    chunk_options_html = "".join(
+        f"<option value='{v}'{' selected' if v == a['batch_tokens'] else ''}>{v:,}</option>"
+        for v in chunk_opts)
 
     tp_init = pargs.tp if pargs else 8
     pp_init = pargs.pp if pargs else 1
@@ -1925,6 +1945,7 @@ def render_html(a: dict, out_path: str, ctx_options: list, req_options: list,
         "html_lang": display_lang,
         "ctx_options": ctx_options_html,
         "req_options": req_options_html,
+        "chunk_options": chunk_options_html,
         "tp_options": _popts(tp_opts, tp_init),
         "pp_options": _popts(pp_opts, pp_init),
         "ep_init": str(ep_init),

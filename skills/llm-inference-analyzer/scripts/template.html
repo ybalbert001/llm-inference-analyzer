@@ -46,6 +46,7 @@
   .fnote { color:var(--muted); font-size:12px; margin-left:auto }
   body:not(.tab-parallel) .pf { display:none !important }
   body:not(.tab-parallel):not(.tab-roofline) .pfi { display:none !important }
+  body:not(.tab-roofline) .pfr { display:none !important }
   /* evidence tab is fully static — hide the whole filter row (no body class) */
   body:not(.tab-estimate):not(.tab-parallel):not(.tab-roofline) .filters { display:none }
   #custom-box { display:none; gap:10px; align-items:center }
@@ -329,6 +330,10 @@
       <input type="range" id="f-frac" min="0.70" max="0.98" step="0.01" value="$mem_frac_init">
       <span id="f-frac-val"></span></label>
     <label class="pfi"><span id="lbl-inst">$lbl_inst</span> <select id="f-inst">$instance_options</select></label>
+    <label class="pfr"><span id="lbl-wdtype">$lbl_wdtype</span>
+      <select id="f-wdtype">$wdtype_options</select></label>
+    <label class="pfr"><span id="lbl-chunk">$lbl_chunk</span>
+      <select id="f-chunk">$chunk_options</select></label>
     <span class="pf" id="custom-box">
       <label><span id="lbl-custom-mem">$lbl_custom_mem</span> <input type="number" id="f-cmem" value="141" min="1"> GiB</label>
       <label><span id="lbl-custom-gpn">$lbl_custom_gpn</span> <input type="number" id="f-cgpn" value="8" min="1"> <span id="lbl-custom-cards">$lbl_custom_cards</span></label>

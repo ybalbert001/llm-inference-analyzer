@@ -36,6 +36,14 @@ function kvDtypeNow() {
   var sel = el('f-kv').value;
   return sel === 'auto' ? D.kvAuto : sel;
 }
+// roofline what-if controls: weight dtype and prefill chunk size.
+// The dropdown defaults to the checkpoint's own dtype, which keeps the exact
+// safetensors bytes; selecting a different dtype rescales every weight kernel
+// to ideal params × bytes/param (real quant configs keep some layers bf16,
+// so that conversion is idealized).
+function weightDtypeNow() { return el('f-wdtype').value; }
+function weightDtypeIsOverride() { return el('f-wdtype').value !== D.weightDtype; }
+function chunkTokensNow() { return +el('f-chunk').value || D.batchTokens; }
 
 /* ============================ i18n ============================ */
 // All user-facing strings assembled at runtime (not baked in by Python) live
@@ -190,6 +198,11 @@ var I18N = {
         '<b>每卡整份复制</b>的部件不切分 —— dp-attention 下 attention 权重每卡读整份、纯 TP 下 MLA 的 KV 每卡读全量 —— ' +
         '这些 kernel 的字节按复制倍数放大，切 TP / dp-attention 时其落点会左移（强度降低）。' +
         '峰值为 datasheet dense 口径近似值，真实 kernel 达不到 100%。';
+    },
+    wdtypeIdealNote: function (dt, bpp) {
+      return '<br><b>权重精度 what-if（' + dt + '）</b>：权重字节按参数量 × ' + bpp +
+        ' B/param 理想换算（真实量化 checkpoint 常保留 bf16 的 lm_head/embed/norm 等），峰值线同步切到 ' + dt +
+        ' 规格值——绝对值仅供方向参考。';
     },
     decodeHeadSuffix: function (B) { return '（每步 ' + B + ' tokens，' + B + ' 并发）'; },
     prefillHeadSuffix: function (tokens) { return '（chunk ' + tokens + ' tokens）'; },
@@ -387,6 +400,11 @@ var I18N = {
         'components <b>replicated per rank</b> do not shard — under dp-attention every rank reads the full attention weights, and under pure TP every rank reads the full MLA KV cache — ' +
         'their bytes are scaled by the replication factor, so those points shift left (lower intensity) as you change TP / dp-attention. ' +
         'Peak is a datasheet dense-throughput approximation; real kernels never reach 100%.';
+    },
+    wdtypeIdealNote: function (dt, bpp) {
+      return '<br><b>Weight-dtype what-if (' + dt + ')</b>: weight bytes are idealized as params × ' + bpp +
+        ' B/param (real quantized checkpoints usually keep lm_head/embed/norms in bf16), and the peak line switches to the ' + dt +
+        ' datasheet figure — treat absolute values as directional only.';
     },
     decodeHeadSuffix: function (B) { return ' (per step ' + B + ' tokens, ' + B + ' concurrent)'; },
     prefillHeadSuffix: function (tokens) { return ' (chunk ' + tokens + ' tokens)'; },
@@ -963,7 +981,7 @@ function currentRooflineWorkload() {
   var tp = +el('f-tp').value || 1;
   return {
     decodeTokens: +el('f-req').value,
-    prefillTokens: D.batchTokens,
+    prefillTokens: chunkTokensNow(),
     contextTokens: +el('f-ctx').value,
     kvBytes: kvBytesPer(kvDtypeNow()),
     kvLayers: D.nKvLayers || D.L,
@@ -1412,9 +1430,19 @@ var ROOFLINE_KERNEL_CALCULATORS = {
  */
 function rooflineKernels() {
   var workload = currentRooflineWorkload();
+  // weight-dtype what-if: an explicit selection replaces each kernel's exact
+  // stored bytes with ideal params × bytes/param at the chosen precision
+  // (same per-element sizes as KV: bf16 2, fp8 1, mxfp4 0.5625 incl. scales).
+  // FLOPs are unchanged; the peak line switches via currentGpuPerf().
+  var wOverride = weightDtypeIsOverride() ? kvBytesPer(weightDtypeNow()) : 0;
   var rows = (D.kernels || []).map(function (kernel) {
     var calculate = ROOFLINE_KERNEL_CALCULATORS[kernel.key];
     if (!calculate) throw new Error('No roofline calculator for kernel: ' + kernel.key);
+    if (wOverride) {
+      kernel = { key: kernel.key, label: kernel.label, color: kernel.color,
+                 kind: kernel.kind, params: kernel.params,
+                 bytes: kernel.params * wOverride };
+    }
     var work = scaleWorkBytes(calculate(kernel, workload),
                               kernelBytesReplication(kernel.key, workload));
     return {
@@ -1476,7 +1504,7 @@ function currentGpuPerf() {
   var gpu = D.instances[inst].gpu;
   var perf = D.gpuPerf[gpu];
   if (!perf) return null;
-  var dt = D.weightDtype;
+  var dt = weightDtypeNow();
   var peak = perf[dt], usedDt = dt;
   if (!peak) { peak = perf.bf16; usedDt = 'bf16'; }
   return { gpu: gpu, peak: peak, bw: perf.bw, dtype: usedDt,
@@ -1716,7 +1744,7 @@ function drawRoofline(perf, pts) {
        Tr('legendDecode')(+el('f-req').value) + "</text>";
   s += "<path d='M6,20 L12.5,32 L-0.5,32 Z' fill='var(--ink2)'/>";
   s += "<text x='18' y='31' fill='var(--ink2)' font-size='11.5'>" +
-       Tr('legendPrefill')(fmtNum(D.batchTokens)) + "</text>";
+       Tr('legendPrefill')(fmtNum(chunkTokensNow())) + "</text>";
   s += "</g>";
 
   s += "</svg>";
@@ -1819,7 +1847,10 @@ function updateRoofline() {
   el('roof-title').textContent = Tr('roofTitle')(perf.gpu, perf.dtype,
     perf.peak.toLocaleString('en-US'), perf.bw, perf.fallback ? Tr('roofFallback')(perf.fallback) : '');
   el('roof-svg').innerHTML = drawRoofline(perf, pts);
-  el('roof-note').innerHTML = Tr('roofNote')(fmtNum(knee));
+  el('roof-note').innerHTML = Tr('roofNote')(fmtNum(knee)) +
+    (weightDtypeIsOverride()
+      ? Tr('wdtypeIdealNote')(weightDtypeNow(), kvBytesPer(weightDtypeNow()))
+      : '');
 
   var tpNow = +el('f-tp').value || 1;
   var vh = "";
@@ -1851,10 +1882,10 @@ function updateRoofline() {
           : Tr('decodeFootCompute')()) +
         "</div>";
     } else {
-      head = ph.label + Tr('prefillHeadSuffix')(fmtNum(D.batchTokens));
+      head = ph.label + Tr('prefillHeadSuffix')(fmtNum(w.T));
       foot = Tr('prefillFormula')((phTime * tpNow * 1000).toFixed(0), (phTime * 1000).toFixed(0),
         tpNow, ctxLabel(+el('f-ctx').value),
-        (phTime * (+el('f-ctx').value) / D.batchTokens).toFixed(1)) +
+        (phTime * (+el('f-ctx').value) / w.T).toFixed(1)) +
         "<div class='cl'>" +
         (isMem ? Tr('prefillFootMem')() : Tr('prefillFootCompute')()) +
         Tr('prefillFootTail')() + "</div>";
@@ -1907,6 +1938,8 @@ renderKvWarnings();
 el('f-tp').addEventListener('change', function(){ updateParallel(); updateRoofline(); });
 el('f-inst').addEventListener('change', function(){ updateParallel(); updateRoofline(); });
 el('f-dp').addEventListener('change', function(){ updateParallel(); updateRoofline(); });
+el('f-wdtype').addEventListener('change', updateRoofline);
+el('f-chunk').addEventListener('change', updateRoofline);
 el('f-cmem').addEventListener('input', updateParallel);
 el('f-cgpn').addEventListener('input', updateParallel);
 el('f-frac').addEventListener('input', function(){ syncFracLabel(); updateParallel(); });
@@ -1937,13 +1970,15 @@ var FRAG_IDS = {
   'h-details-table-gpu': 'details_table_gpu',
   'lbl-ctx': 'lbl_ctx', 'lbl-req': 'lbl_req', 'lbl-kv': 'lbl_kv',
   'lbl-dp': 'lbl_dp', 'lbl-inst': 'lbl_inst', 'lbl-frac': 'lbl_frac',
+  'lbl-wdtype': 'lbl_wdtype', 'lbl-chunk': 'lbl_chunk',
   'lbl-custom-mem': 'lbl_custom_mem', 'lbl-custom-gpn': 'lbl_custom_gpn',
   'lbl-custom-cards': 'lbl_custom_cards',
   'fnote': 'fnote'
 };
 // selects whose <option> list itself is a per-language fragment (labels
 // differ, e.g. 'auto（bf16）' vs 'auto (bf16)'); value must survive the swap
-var FRAG_SELECTS = { 'f-kv': 'kv_options', 'f-inst': 'instance_options' };
+var FRAG_SELECTS = { 'f-kv': 'kv_options', 'f-inst': 'instance_options',
+                     'f-wdtype': 'wdtype_options' };
 
 function applyLangFragments(lang){
   var fr = D.frags[lang];
