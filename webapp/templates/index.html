@@ -156,8 +156,6 @@ function setLang(l) {
   render();
 }
 
-function fmtSize(b) { return (b / 1048576).toFixed(1) + ' MB'; }
-
 function filtered() {
   const q = document.getElementById('q').value.trim().toLowerCase();
   return reports.filter(r => !q || r.model_id.toLowerCase().includes(q) || r.slug.includes(q));
@@ -179,7 +177,7 @@ function card(r) {
           <svg viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.5">
             <path d="M1.5 8s2.5-4.5 6.5-4.5S14.5 8 14.5 8 12 12.5 8 12.5 1.5 8 1.5 8Z"/>
             <circle cx="8" cy="8" r="2"/>
-          </svg>${r.views || 0} · ${r.created_at.slice(0,10)} · ${fmtSize(r.size_bytes)}</span>
+          </svg>${r.views || 0} · ${r.created_at.slice(0,10)}</span>
       </span>
     </div>`;
 }
