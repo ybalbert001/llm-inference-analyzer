@@ -43,12 +43,16 @@ python3 scripts/main.py Qwen/Qwen3-32B --context 32768 --requests 64 \
 
 ## 已验证的模型
 
-> **说明：** 下列模型目前仅经过**理论层面的验证**——即 config 公式推导与真实 safetensors 头信息（参数量、dtype、总字节数）相互对账一致，且内部守恒律自检全部通过；**尚未与真实部署实测数据对照验证**（例如 SGLang/vLLM 在 GPU 上实际报告的显存占用）。实测实验数据后续会陆续放入 [`validate_experiments/`](validate_experiments/) 目录。
+> **说明：** 下列模型均通过**理论层面的验证**——即 config 公式推导与真实 safetensors 头信息（参数量、dtype、总字节数）相互对账一致，且内部守恒律自检全部通过。此外，其中一部分模型已经**与真实部署实测数据对照验证**（SGLang 真实 GPU 部署：每卡权重加载、KV cell size、显存预算闭合、dp-attention、decode/prefill roofline）。各实验会话与结论见 [`validate_experiments/`](validate_experiments/) 目录。
 
-| model_id | 模型结构类型 | 参数规模(总 / 激活) |
-|---|---|---|
-| deepseek-ai/DeepSeek-V4-Flash | MoE + MQA + DSA + MTP | 291B / 14B |
-| deepseek-ai/DeepSeek-V4-Pro | MoE + MLA + DSA + MTP | 1.6T / 50B |
-| zai-org/GLM-5.2-FP8 | MoE + MLA + DSA + MTP | 753B / 41B |
-| nvidia/GLM-5.2-NVFP4 | MoE + MLA + DSA + MTP | 753B / 41B |
-| Qwen/Qwen3-32B | Dense + GQA | 33B |
+| model_id | 模型结构类型 | 参数规模(总 / 激活) | 实测验证 |
+|---|---|---|---|
+| deepseek-ai/DeepSeek-V4-Flash | MoE + MQA + DSA + MTP | 291B / 14B | ✅ 8×B200（S1、S1R） |
+| deepseek-ai/DeepSeek-V4-Pro | MoE + MLA + DSA + MTP | 1.6T / 50B | — |
+| zai-org/GLM-5.2-FP8 | MoE + MLA + DSA + MTP | 753B / 41B | ✅ 8×B200（S1、S1R） |
+| nvidia/GLM-5.2-NVFP4 | MoE + MLA + DSA + MTP | 753B / 41B | ✅ 8×B200（S1） |
+| Qwen/Qwen3-32B | Dense + GQA | 33B | ✅ 8×B200（S1、S1R） |
+| moonshotai/Kimi-K2.6 | MoE + MLA + VLM | 1.03T / 33B | ✅ 8×B200（SV，vision tower） |
+| MiniMaxAI/MiniMax-M3 | MoE + GQA + Sparse Attention + MTP + VLM | 427B / 27B | — |
+| Qwen/Qwen3.5-4B | 混合架构（Linear Attention + GQA）+ VLM | 5B | ✅ 1×A10G（S0）+ 8×B200（S1R） |
+| google/gemma-3-4b-it | Dense + GQA（sliding window）+ VLM | 5B | — |

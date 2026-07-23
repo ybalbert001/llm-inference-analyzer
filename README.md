@@ -43,12 +43,16 @@ python3 scripts/main.py Qwen/Qwen3-32B --context 32768 --requests 64 \
 
 ## Validated models
 
-> **Note:** the models below are currently validated **theoretically only** — the config-derived formulas are reconciled against the real safetensors headers (parameter counts, dtypes, total bytes), and internal conservation checks pass. They have **not yet been verified against real deployment measurements** (e.g. actual VRAM usage reported by SGLang/vLLM on GPUs). Empirical experiment data will be added to the [`validate_experiments/`](validate_experiments/) directory as it is collected.
+> **Note:** all models below pass **theoretical validation** — the config-derived formulas are reconciled against the real safetensors headers (parameter counts, dtypes, total bytes), and internal conservation checks pass. In addition, a subset has been **verified against real deployment measurements** (SGLang on real GPUs: per-GPU weight loading, KV cell size, memory-budget closure, dp-attention, decode/prefill roofline). See the [`validate_experiments/`](validate_experiments/) directory for the experiment sessions and conclusions.
 
-| model_id | Architecture | Params (total / active) |
-|---|---|---|
-| deepseek-ai/DeepSeek-V4-Flash | MoE + MQA + DSA + MTP | 291B / 14B |
-| deepseek-ai/DeepSeek-V4-Pro | MoE + MLA + DSA + MTP | 1.6T / 50B |
-| zai-org/GLM-5.2-FP8 | MoE + MLA + DSA + MTP | 753B / 41B |
-| nvidia/GLM-5.2-NVFP4 | MoE + MLA + DSA + MTP | 753B / 41B |
-| Qwen/Qwen3-32B | Dense + GQA | 33B |
+| model_id | Architecture | Params (total / active) | Empirical validation |
+|---|---|---|---|
+| deepseek-ai/DeepSeek-V4-Flash | MoE + MQA + DSA + MTP | 291B / 14B | ✅ 8×B200 (S1, S1R) |
+| deepseek-ai/DeepSeek-V4-Pro | MoE + MLA + DSA + MTP | 1.6T / 50B | — |
+| zai-org/GLM-5.2-FP8 | MoE + MLA + DSA + MTP | 753B / 41B | ✅ 8×B200 (S1, S1R) |
+| nvidia/GLM-5.2-NVFP4 | MoE + MLA + DSA + MTP | 753B / 41B | ✅ 8×B200 (S1) |
+| Qwen/Qwen3-32B | Dense + GQA | 33B | ✅ 8×B200 (S1, S1R) |
+| moonshotai/Kimi-K2.6 | MoE + MLA + VLM | 1.03T / 33B | ✅ 8×B200 (SV, vision tower) |
+| MiniMaxAI/MiniMax-M3 | MoE + GQA + Sparse Attention + MTP + VLM | 427B / 27B | — |
+| Qwen/Qwen3.5-4B | Hybrid (Linear Attention + GQA) + VLM | 5B | ✅ 1×A10G (S0) + 8×B200 (S1R) |
+| google/gemma-3-4b-it | Dense + GQA (sliding window) + VLM | 5B | — |

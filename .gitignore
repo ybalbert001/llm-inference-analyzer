@@ -2,3 +2,4 @@ __pycache__/
 *.pyc
 .DS_Store
 html_output/
+validate_experiments/S1_b200_session/
