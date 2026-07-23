@@ -16,33 +16,48 @@
   * { box-sizing:border-box }
   body { margin:0; background:var(--page); color:var(--ink);
     font:14px/1.55 system-ui,-apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif; }
-  .wrap { max-width:860px; margin:0 auto; padding:40px 24px 64px }
+  .wrap { max-width:980px; margin:0 auto; padding:40px 24px 64px }
   h1 { font-size:24px; font-weight:600; margin:0 }
-  .topbar { display:flex; align-items:center; justify-content:space-between; margin-bottom:6px }
+  .topbar { display:flex; align-items:center; gap:16px; margin-bottom:6px }
+  .topbar h1 { margin-right:auto }
   .subtitle { color:var(--ink2); margin:0 0 24px }
   .userbox { font-size:13px; color:var(--ink2) }
   .userbox a { color:var(--accent); text-decoration:none }
-  .searchrow { display:flex; gap:10px; margin-bottom:20px }
-  input[type=text] { flex:1; font:inherit; padding:10px 14px; border:1px solid var(--grid);
+  .langswitch { display:flex; border:1px solid var(--grid); border-radius:8px; overflow:hidden }
+  .langswitch button { font-size:12.5px; font-weight:600; padding:5px 12px; border:none;
+    background:var(--surface); color:var(--muted); cursor:pointer; border-radius:0 }
+  .langswitch button.cur { background:var(--ink); color:var(--page) }
+  .searchrow { margin-bottom:20px }
+  input[type=text] { width:100%; font:inherit; padding:10px 14px; border:1px solid var(--grid);
     border-radius:10px; background:var(--surface); color:var(--ink); outline:none }
   input[type=text]:focus { border-color:var(--accent) }
-  select { font:inherit; padding:10px; border:1px solid var(--grid); border-radius:10px;
-    background:var(--surface); color:var(--ink) }
   button { font:inherit; font-weight:600; padding:10px 18px; border:none; border-radius:10px;
     background:var(--ink); color:var(--page); cursor:pointer }
   button:disabled { opacity:.5; cursor:default }
+  #list { display:grid; grid-template-columns:repeat(auto-fill,minmax(255px,1fr)); gap:14px }
   .card { background:var(--surface); border:1px solid var(--ring); border-radius:12px;
-    padding:14px 18px; margin-bottom:10px; display:flex; align-items:center; gap:14px }
-  .card a.title { font-weight:600; color:var(--ink); text-decoration:none; font-size:15px }
+    padding:16px 18px; display:flex; flex-direction:column; gap:6px; min-height:118px;
+    transition:border-color .15s }
+  .card:hover { border-color:var(--accent) }
+  .card .org { color:var(--muted); font-size:12px; line-height:1 }
+  .card a.title { font-weight:600; color:var(--ink); text-decoration:none; font-size:16px;
+    word-break:break-all }
   .card a.title:hover { color:var(--accent) }
-  .card .meta { color:var(--muted); font-size:12.5px; margin-left:auto; text-align:right; flex-shrink:0 }
+  .card .tabs { display:flex; gap:12px; font-size:12.5px; margin-top:2px }
+  .card .tabs a { color:var(--muted); text-decoration:none }
+  .card .tabs a:hover { color:var(--accent) }
+  .card .foot { display:flex; align-items:center; justify-content:space-between;
+    margin-top:auto; padding-top:8px }
+  .card .meta { color:var(--muted); font-size:12px }
   .langtag { font-size:11px; font-weight:600; color:var(--ink2); border:1px solid var(--grid);
     border-radius:5px; padding:1px 6px }
-  .tabs { display:flex; gap:12px; margin-left:0; font-size:12.5px }
-  .tabs a { color:var(--muted); text-decoration:none }
-  .tabs a:hover { color:var(--accent) }
+  .pager { display:flex; gap:6px; justify-content:center; margin-top:24px }
+  .pager button { font-size:13px; font-weight:500; padding:6px 12px; border:1px solid var(--grid);
+    border-radius:8px; background:var(--surface); color:var(--ink) }
+  .pager button.cur { background:var(--ink); color:var(--page); border-color:var(--ink) }
+  .pager button:disabled { opacity:.4 }
   #genbox { background:var(--surface); border:1px dashed var(--grid); border-radius:12px;
-    padding:20px; text-align:center; margin-top:8px; display:none }
+    padding:20px; text-align:center; margin-top:16px; display:none }
   #genbox p { margin:0 0 12px; color:var(--ink2) }
   #genstatus { margin-top:12px; font-size:13px }
   #genstatus.err { color:var(--err); white-space:pre-wrap; text-align:left }
@@ -51,104 +66,190 @@
     border-top-color:var(--accent); border-radius:50%; animation:spin .8s linear infinite;
     vertical-align:-2px; margin-right:6px }
   @keyframes spin { to { transform:rotate(360deg) } }
-  .empty { color:var(--muted); text-align:center; padding:32px 0 }
+  .empty { color:var(--muted); text-align:center; padding:32px 0; grid-column:1/-1 }
 </style>
 </head>
 <body>
 <div class="wrap">
   <div class="topbar">
     <h1>LLM Inference Analyzer</h1>
+    <div class="langswitch">
+      <button id="ui-zh" onclick="setLang('zh')">中文</button>
+      <button id="ui-en" onclick="setLang('en')">EN</button>
+    </div>
     <div class="userbox">
       {% if username %}
-        <b>{{ username }}</b>{% if not dev_mode %} · <a href="/logout">退出</a>{% endif %}
+        <b>{{ username }}</b>{% if not dev_mode %} · <a href="/logout" id="t-logout"></a>{% endif %}
       {% else %}
-        <a href="/login">使用 Hugging Face 登录</a>
+        <a href="/login" id="t-login"></a>
       {% endif %}
     </div>
   </div>
-  <p class="subtitle">显存拆解 · 并行切分 · Roofline 性能上界 —— 输入 HuggingFace model ID 检索或生成分析报告</p>
+  <p class="subtitle" id="t-subtitle"></p>
 
   <div class="searchrow">
-    <input type="text" id="q" placeholder="搜索或输入 model ID，如 Qwen/Qwen3-32B" autofocus>
-    <select id="lang"><option value="zh">中文</option><option value="en">EN</option></select>
+    <input type="text" id="q" autofocus>
   </div>
 
   <div id="list"></div>
+  <div class="pager" id="pager"></div>
 
   <div id="genbox">
-    <p>没有找到 <b id="genmodel"></b> 的报告</p>
-    <button id="genbtn">生成分析报告</button>
+    <p><span id="t-nf-pre"></span><b id="genmodel"></b><span id="t-nf-suf"></span></p>
+    <button id="genbtn"></button>
     <div id="genstatus"></div>
   </div>
 </div>
 
 <script>
 const LOGGED_IN = {{ 'true' if username else 'false' }};
+const PAGE_SIZE = 12;
 let reports = [];
+let page = 1;
 
-function fmtSize(b) { return (b/1048576).toFixed(1) + ' MB'; }
+const I18N = {
+  zh: {
+    subtitle: '显存拆解 · 并行切分 · Roofline 性能上界 —— 输入 HuggingFace model ID 检索或生成分析报告',
+    login: '使用 Hugging Face 登录', logout: '退出',
+    placeholder: '搜索或输入 model ID，如 Qwen/Qwen3-32B',
+    empty: '还没有任何报告',
+    nfPre: '没有找到 ', nfSuf: ' 的报告',
+    generate: '生成分析报告',
+    submitting: '提交中…',
+    generating: '生成中（读取 config.json 与 safetensors headers，约需十几秒）…',
+    done: '完成，正在跳转…', failed: '生成失败：\n',
+    tabMem: '显存', tabPar: '并行', tabRoof: 'roofline',
+    prev: '上一页', next: '下一页',
+  },
+  en: {
+    subtitle: 'Memory breakdown · Parallelism sharding · Roofline bounds — search or enter a HuggingFace model ID to view or generate a report',
+    login: 'Sign in with Hugging Face', logout: 'Sign out',
+    placeholder: 'Search or enter a model ID, e.g. Qwen/Qwen3-32B',
+    empty: 'No reports yet',
+    nfPre: 'No report found for ', nfSuf: '',
+    generate: 'Generate report',
+    submitting: 'Submitting…',
+    generating: 'Generating (reads config.json & safetensors headers, ~15s)…',
+    done: 'Done, redirecting…', failed: 'Generation failed:\n',
+    tabMem: 'Memory', tabPar: 'Parallel', tabRoof: 'roofline',
+    prev: 'Prev', next: 'Next',
+  },
+};
+let uiLang = localStorage.getItem('ui_lang') || 'zh';
+
+function t(k) { return I18N[uiLang][k]; }
+
+function setLang(l) {
+  uiLang = l;
+  localStorage.setItem('ui_lang', l);
+  document.documentElement.lang = l;
+  document.getElementById('ui-zh').classList.toggle('cur', l === 'zh');
+  document.getElementById('ui-en').classList.toggle('cur', l === 'en');
+  for (const id of ['subtitle','nf-pre','nf-suf']) {
+    document.getElementById('t-' + id).textContent = t(id.replace(/-(\w)/g, (_, c) => c.toUpperCase()));
+  }
+  const login = document.getElementById('t-login');
+  if (login) login.textContent = t('login');
+  const logout = document.getElementById('t-logout');
+  if (logout) logout.textContent = t('logout');
+  document.getElementById('q').placeholder = t('placeholder');
+  document.getElementById('genbtn').textContent = t('generate');
+  render();
+}
+
+function fmtSize(b) { return (b / 1048576).toFixed(1) + ' MB'; }
+
+function filtered() {
+  const q = document.getElementById('q').value.trim().toLowerCase();
+  return reports.filter(r => !q || r.model_id.toLowerCase().includes(q) || r.slug.includes(q));
+}
+
+function card(r) {
+  const [org, name] = r.model_id.split('/');
+  return `
+    <div class="card">
+      <span class="org">${org}</span>
+      <a class="title" href="/reports/${r.slug}.html">${name}</a>
+      <span class="tabs">
+        <a href="/reports/${r.slug}.html#estimate">${t('tabMem')}</a>
+        <a href="/reports/${r.slug}.html#parallel">${t('tabPar')}</a>
+        <a href="/reports/${r.slug}.html#roofline">${t('tabRoof')}</a>
+      </span>
+      <span class="foot">
+        <span class="langtag">${r.lang}</span>
+        <span class="meta">${r.created_at.slice(0,10)} · ${fmtSize(r.size_bytes)}</span>
+      </span>
+    </div>`;
+}
 
 function render() {
-  const q = document.getElementById('q').value.trim().toLowerCase();
-  const list = document.getElementById('list');
-  const hits = reports.filter(r => !q || r.model_id.toLowerCase().includes(q) || r.slug.includes(q));
-  list.innerHTML = hits.map(r => `
-    <div class="card">
-      <a class="title" href="/reports/${r.slug}.html">${r.model_id}</a>
-      <span class="langtag">${r.lang}</span>
-      <span class="tabs">
-        <a href="/reports/${r.slug}.html#estimate">显存</a>
-        <a href="/reports/${r.slug}.html#parallel">并行</a>
-        <a href="/reports/${r.slug}.html#roofline">roofline</a>
-      </span>
-      <span class="meta">${r.created_at.slice(0,10)} · ${fmtSize(r.size_bytes)}</span>
-    </div>`).join('') || (q ? '' : '<div class="empty">还没有任何报告</div>');
+  const q = document.getElementById('q').value.trim();
+  const hits = filtered();
+  const pages = Math.max(1, Math.ceil(hits.length / PAGE_SIZE));
+  if (page > pages) page = pages;
+  const slice = hits.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE);
+
+  document.getElementById('list').innerHTML =
+    slice.map(card).join('') || (q ? '' : `<div class="empty">${t('empty')}</div>`);
+
+  const pager = document.getElementById('pager');
+  if (pages > 1) {
+    let html = `<button onclick="goPage(${page-1})" ${page===1?'disabled':''}>${t('prev')}</button>`;
+    for (let p = 1; p <= pages; p++) {
+      html += `<button onclick="goPage(${p})" class="${p===page?'cur':''}">${p}</button>`;
+    }
+    html += `<button onclick="goPage(${page+1})" ${page===pages?'disabled':''}>${t('next')}</button>`;
+    pager.innerHTML = html;
+  } else {
+    pager.innerHTML = '';
+  }
 
   const genbox = document.getElementById('genbox');
-  const looksLikeId = /^[\w.-]+\/[\w.-]+$/.test(document.getElementById('q').value.trim());
-  const exact = hits.some(r => r.model_id.toLowerCase() === q);
+  const looksLikeId = /^[\w.-]+\/[\w.-]+$/.test(q);
+  const exact = hits.some(r => r.model_id.toLowerCase() === q.toLowerCase());
   if (q && looksLikeId && !exact) {
-    document.getElementById('genmodel').textContent = document.getElementById('q').value.trim();
+    document.getElementById('genmodel').textContent = q;
     genbox.style.display = 'block';
   } else {
     genbox.style.display = 'none';
   }
 }
 
+function goPage(p) { page = p; render(); }
+
 async function load() {
   reports = await (await fetch('/api/reports')).json();
   render();
 }
 
-document.getElementById('q').addEventListener('input', render);
+document.getElementById('q').addEventListener('input', () => { page = 1; render(); });
 
 document.getElementById('genbtn').addEventListener('click', async () => {
   if (!LOGGED_IN) { location.href = '/login'; return; }
   const modelId = document.getElementById('q').value.trim();
-  const lang = document.getElementById('lang').value;
   const btn = document.getElementById('genbtn');
   const st = document.getElementById('genstatus');
   btn.disabled = true;
-  st.className = ''; st.innerHTML = '<span class="spinner"></span>提交中…';
+  st.className = ''; st.innerHTML = `<span class="spinner"></span>${t('submitting')}`;
   try {
     const resp = await fetch('/api/generate', {
       method: 'POST', headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({model_id: modelId, lang}),
+      body: JSON.stringify({model_id: modelId, lang: uiLang}),
     });
     const data = await resp.json();
     if (!resp.ok) throw new Error(data.detail || resp.statusText);
     if (data.status === 'cached') { location.href = `/reports/${data.slug}.html`; return; }
-    st.innerHTML = '<span class="spinner"></span>生成中（读取 config.json 与 safetensors headers，约需十几秒）…';
+    st.innerHTML = `<span class="spinner"></span>${t('generating')}`;
     const poll = setInterval(async () => {
-      const t = await (await fetch(`/api/tasks/${data.task_id}`)).json();
-      if (t.status === 'done') {
+      const tk = await (await fetch(`/api/tasks/${data.task_id}`)).json();
+      if (tk.status === 'done') {
         clearInterval(poll);
-        st.className = 'ok'; st.textContent = '完成，正在跳转…';
-        location.href = `/reports/${t.slug}.html`;
-      } else if (t.status === 'failed') {
+        st.className = 'ok'; st.textContent = t('done');
+        location.href = `/reports/${tk.slug}.html`;
+      } else if (tk.status === 'failed') {
         clearInterval(poll);
         btn.disabled = false;
-        st.className = 'err'; st.textContent = '生成失败：\n' + t.error;
+        st.className = 'err'; st.textContent = t('failed') + tk.error;
       }
     }, 2000);
   } catch (e) {
@@ -157,6 +258,7 @@ document.getElementById('genbtn').addEventListener('click', async () => {
   }
 });
 
+setLang(uiLang);
 load();
 </script>
 </body>

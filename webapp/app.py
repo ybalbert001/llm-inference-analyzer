@@ -289,6 +289,24 @@ async def api_task(task_id: str):
         return dict(t)
 
 
+LOGIN_GATE_HTML = """<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>Login required</title>
+<style>
+  body{margin:0;background:#f9f9f7;color:#0b0b0b;font:14px/1.6 system-ui,-apple-system,"PingFang SC",sans-serif;
+    display:flex;align-items:center;justify-content:center;min-height:100vh}
+  @media (prefers-color-scheme:dark){body{background:#0d0d0d;color:#fff}}
+  .box{text-align:center;padding:32px}
+  a.btn{display:inline-block;margin-top:16px;padding:10px 22px;border-radius:10px;
+    background:#0b0b0b;color:#f9f9f7;text-decoration:none;font-weight:600}
+  @media (prefers-color-scheme:dark){a.btn{background:#fff;color:#0d0d0d}}
+  p{color:#898781;margin:6px 0 0}
+</style></head><body><div class="box">
+  <div style="font-size:18px;font-weight:600">需要登录 / Login required</div>
+  <p>查看报告需要 Hugging Face 登录 · Viewing reports requires signing in with Hugging Face</p>
+  <a class="btn" href="/login?next={next}">使用 Hugging Face 登录 · Sign in</a>
+</div></body></html>"""
+
+
 # ---------- pages & report data ----------
 
 @app.get("/api/reports")
@@ -307,9 +325,10 @@ async def serve_report(request: Request, slug: str):
         raise HTTPException(400, "bad slug")
     username = current_user(request)
     if not username:
-        # browser navigation: bounce through OAuth and come back here
-        # (the #tab hash never reaches the server and may be dropped en route)
-        return RedirectResponse(f"/login?next=/reports/{slug}.html")
+        # interstitial instead of auto-redirect: HF silently re-authorizes
+        # already-approved apps, so an automatic bounce would undo /logout
+        return HTMLResponse(LOGIN_GATE_HTML.replace("{next}", f"/reports/{slug}.html"),
+                            status_code=401)
     path = REPORTS_DIR / f"{slug}.html"
     if not path.exists():
         raise HTTPException(404, "no such report")

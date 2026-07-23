@@ -32,7 +32,7 @@ DEV_MODE=1 .venv/bin/python app.py      # http://localhost:8000，免登录（�
 # 否则每次重启所有用户都要重新登录）
 export HF_OAUTH_CLIENT_ID="<OAuth App 的 client id>"
 export HF_OAUTH_CLIENT_SECRET="<OAuth App 的 client secret>"
-export BASE_URL="http://<公网IP>:8000"        # 必须与 HF OAuth App 的 redirect URL 前缀一致；有域名后换 https://<域名>
+export BASE_URL="https://<域名>"              # 必须与 HF OAuth App 的 redirect URL 前缀一致
 export SESSION_SECRET="$(openssl rand -hex 32)"  # 生成一次，之后固定复用
 
 docker build -f webapp/Dockerfile -t llm-inference-analyzer-web .   # 在仓库根目录执行
@@ -43,6 +43,8 @@ docker run -d -p 8000:8000 -v analyzer-data:/app/webapp/data \
 ```
 
 `-e VAR`（不带 `=值`）表示把当前 shell 里同名环境变量原样传入容器，所以上面 export 之后无需再改 docker 命令。HF OAuth App 的 redirect URL 需登记为 `${BASE_URL}/auth/callback`（HF 支持登记多条，切域名时追加即可）。
+
+当前生产环境的实例信息、SSM 登录方式、重新部署与运维手册见 `webapp/deploy.md`（含敏感信息，不入 git）。
 
 ## 设计要点
 
