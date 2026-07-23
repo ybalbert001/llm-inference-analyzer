@@ -313,7 +313,9 @@ LOGIN_GATE_HTML = """<!doctype html><html><head><meta charset="utf-8">
 async def api_reports():
     with db() as conn:
         rows = conn.execute(
-            "SELECT slug, model_id, lang, created_at, created_by, size_bytes"
+            "SELECT slug, model_id, lang, created_at, created_by, size_bytes,"
+            " (SELECT COUNT(*) FROM access_log a"
+            "   WHERE a.action='view' AND a.model_id = reports.model_id) AS views"
             " FROM reports ORDER BY created_at DESC"
         ).fetchall()
     return [dict(r) for r in rows]

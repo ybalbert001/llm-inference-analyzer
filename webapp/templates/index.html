@@ -48,7 +48,8 @@
   .card .tabs a:hover { color:var(--accent) }
   .card .foot { display:flex; align-items:center; justify-content:space-between;
     margin-top:auto; padding-top:8px }
-  .card .meta { color:var(--muted); font-size:12px }
+  .card .meta { color:var(--muted); font-size:12px; display:flex; align-items:center; gap:4px }
+  .card .meta svg { flex-shrink:0 }
   .langtag { font-size:11px; font-weight:600; color:var(--ink2); border:1px solid var(--grid);
     border-radius:5px; padding:1px 6px }
   .pager { display:flex; gap:6px; justify-content:center; margin-top:24px }
@@ -177,7 +178,11 @@ function card(r) {
       </span>
       <span class="foot">
         <span class="langtag">${r.lang}</span>
-        <span class="meta">${r.created_at.slice(0,10)} · ${fmtSize(r.size_bytes)}</span>
+        <span class="meta">
+          <svg viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.5">
+            <path d="M1.5 8s2.5-4.5 6.5-4.5S14.5 8 14.5 8 12 12.5 8 12.5 1.5 8 1.5 8Z"/>
+            <circle cx="8" cy="8" r="2"/>
+          </svg>${r.views || 0} · ${r.created_at.slice(0,10)} · ${fmtSize(r.size_bytes)}</span>
       </span>
     </div>`;
 }
