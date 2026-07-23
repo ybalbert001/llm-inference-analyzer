@@ -316,7 +316,7 @@ async def api_reports():
             "SELECT slug, model_id, lang, created_at, created_by, size_bytes,"
             " (SELECT COUNT(*) FROM access_log a"
             "   WHERE a.action='view' AND a.model_id = reports.model_id) AS views"
-            " FROM reports ORDER BY created_at DESC"
+            " FROM reports ORDER BY views DESC, created_at DESC"
         ).fetchall()
     return [dict(r) for r in rows]
 
