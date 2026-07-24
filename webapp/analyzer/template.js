@@ -1,5 +1,11 @@
 var GIB = 1073741824;
 
+// NOTE: this file contains NO modeling math. Every number is computed by the
+// server (analyzer/engine.py — the single implementation) and fetched from
+// /api/v1/whatif on each control change; the page ships with the initial
+// combination baked in as D.whatif0. W is the current payload being rendered.
+var W = D.whatif0;
+
 function gib(b) {
   var v = b / GIB;
   return v >= 0.95
@@ -8,23 +14,9 @@ function gib(b) {
 }
 function el(id) { return document.getElementById(id); }
 function setText(id, txt) { var e = el(id); if (e) e.textContent = txt; }
-// fp4 = mxfp4: 0.5 B data + 1 uint8 scale per 16 elements
+// display-only element size for the weight-dtype what-if footnote
+// (fp4 = mxfp4: 0.5 B data + 1 uint8 scale per 16 elements)
 function kvBytesPer(dtype) { return dtype === 'fp8' ? 1 : dtype === 'fp4' ? 0.5625 : 2; }
-// KV cell: bytes per token per KV-bearing layer. DSA models add a fixed
-// fp8 index-key + scale (kvIndexerBytes) that does NOT follow the KV dtype.
-function kvCellBytes(dtype) { return D.kvElemsPerLayer * kvBytesPer(dtype) + (D.kvIndexerBytes || 0); }
-// stored KV token-positions summed over layers, honoring sliding-window caps.
-// kvGroups: [[layerCount, window], ...]; window=0 = full context. Falls back to
-// nKvLayers×ctx (or L×ctx) when no group model is present.
-function kvLayerTokens(ctx) {
-  var g = D.kvGroups;
-  if (g && g.length) {
-    var s = 0;
-    for (var i = 0; i < g.length; i++) s += g[i][0] * (g[i][1] ? Math.min(ctx, g[i][1]) : ctx);
-    return s;
-  }
-  return (D.nKvLayers || D.L) * ctx;
-}
 function ctxLabel(v) { return v % 1048576 === 0 ? (v / 1048576) + 'M' : (v / 1024) + 'K'; }
 // human token count: 1.94M / 317K / 512
 function tokLabel(v) {
@@ -32,18 +24,6 @@ function tokLabel(v) {
   if (v >= 1024) return Math.round(v / 1024) + 'K';
   return String(Math.round(v));
 }
-function kvDtypeNow() {
-  var sel = el('f-kv').value;
-  return sel === 'auto' ? D.kvAuto : sel;
-}
-// roofline what-if controls: weight dtype and prefill chunk size.
-// The dropdown defaults to the checkpoint's own dtype, which keeps the exact
-// safetensors bytes; selecting a different dtype rescales every weight kernel
-// to ideal params × bytes/param (real quant configs keep some layers bf16,
-// so that conversion is idealized).
-function weightDtypeNow() { return el('f-wdtype').value; }
-function weightDtypeIsOverride() { return el('f-wdtype').value !== D.weightDtype; }
-function chunkTokensNow() { return +el('f-chunk').value || D.batchTokens; }
 
 /* ============================ i18n ============================ */
 // All user-facing strings assembled at runtime (not baked in by Python) live
@@ -183,7 +163,7 @@ var I18N = {
     replNote: function (mult) {
       return '；每卡整份复制不切分 → HBM 字节 ×' + mult + '（时间 ÷TP 后即每卡读整份）';
     },
-    linStateLabel: function () { return 'Linear/SSM state'; },
+    linStateKernelLabel: function () { return 'Linear/SSM state'; },
     linStateDecodeNote: function (nLin) {
       return nLin + ' 个 linear 层定长 state 每步读+写各一遍，随并发不随 context 增长';
     },
@@ -249,6 +229,9 @@ var I18N = {
     pointTooltip: function (phaseLabel, intensityStr, bound, attainStr, pctStr) {
       return '<b>' + phaseLabel + '</b> · 强度 ≈ ' + intensityStr + ' FLOPs/B → ' + bound +
         '<br>可达 ≈ ' + attainStr + ' TFLOPs/s（峰值的 ' + pctStr + '%）';
+    },
+    fetchError: function () {
+      return 'what-if 服务不可达——图中数字仍是上一次成功的参数组合，非当前选择';
     },
   },
   en: {
@@ -385,7 +368,7 @@ var I18N = {
     replNote: function (mult) {
       return '; replicated per rank, not sharded → HBM bytes ×' + mult + ' (after ÷TP each rank reads one full copy)';
     },
-    linStateLabel: function () { return 'Linear/SSM state'; },
+    linStateKernelLabel: function () { return 'Linear/SSM state'; },
     linStateDecodeNote: function (nLin) {
       return 'fixed state of ' + nLin + ' linear layers read+written once per step; grows with concurrency, not context';
     },
@@ -452,9 +435,22 @@ var I18N = {
       return '<b>' + phaseLabel + '</b> · intensity ≈ ' + intensityStr + ' FLOPs/B → ' + bound +
         '<br>attainable ≈ ' + attainStr + ' TFLOPs/s (' + pctStr + '% of peak)';
     },
+    fetchError: function () {
+      return 'what-if service unreachable — numbers shown are the last successful combination, not the current selection';
+    },
   }
 };
 function Tr(key) { return (I18N[D.lang] || I18N.zh)[key]; }
+
+// server-provided noteRefs → localized string: [["gemmDecodeNote", 16],
+// ["_raw", " + "], ...]. Unknown keys degrade to their raw parts.
+function noteText(refs) {
+  return (refs || []).map(function (r) {
+    if (r[0] === '_raw') return r[1];
+    var f = Tr(r[0]);
+    return f ? f.apply(null, r.slice(1)) : r.join(' ');
+  }).join('');
+}
 
 /* ============================ tab switching ============================ */
 function setTab(name) {
@@ -479,6 +475,68 @@ if (typeof location !== 'undefined') {
   if (location.hash === '#roofline') setTab('roofline');
 }
 
+/* ====================== what-if fetch orchestration ====================== */
+// Controls → query string → /api/v1/whatif → W → renderAll(). The initial
+// combination is baked in (D.whatif0), so first paint needs no network.
+var _fetchCtl = null, _fetchTimer = null;
+
+function paramsNow() {
+  var q = {
+    model: D.model,
+    context: el('f-ctx').value,
+    requests: el('f-req').value,
+    kv_dtype: el('f-kv').value,
+    tp: el('f-tp').value,
+    pp: el('f-pp').value,
+    dp_attention: el('f-dp').checked,
+    mem_fraction_static: el('f-frac').value,
+    fixed_overhead_gib: D.fixedGib,
+    batch_tokens: D.batchTokens,
+    chunk_tokens: el('f-chunk').value || D.batchTokens,
+    weight_dtype: el('f-wdtype').value
+  };
+  var ep = el('f-ep').value;
+  if (ep) q.ep = ep;
+  var inst = el('f-inst').value;
+  if (inst === 'custom') {
+    q.gpu_mem_gib = +el('f-cmem').value || 1;
+    q.gpus_per_node = +el('f-cgpn').value || 1;
+  } else {
+    q.instance = inst;
+  }
+  return q;
+}
+
+function showFetchError(on) {
+  var e = el('warnmsg');
+  if (on) { e.textContent = Tr('fetchError')(); e.style.display = ''; }
+  else if (e.textContent === Tr('fetchError')()) { e.style.display = 'none'; e.textContent = ''; }
+}
+
+function refresh() {
+  clearTimeout(_fetchTimer);
+  _fetchTimer = setTimeout(function () {
+    if (_fetchCtl) _fetchCtl.abort();
+    _fetchCtl = (typeof AbortController !== 'undefined') ? new AbortController() : null;
+    var qs = new URLSearchParams(paramsNow()).toString();
+    fetch('/api/v1/whatif?' + qs, _fetchCtl ? { signal: _fetchCtl.signal } : {})
+      .then(function (r) { if (!r.ok) throw new Error(r.status); return r.json(); })
+      .then(function (payload) { W = payload; showFetchError(false); renderAll(); })
+      .catch(function (err) { if (err.name !== 'AbortError') showFetchError(true); });
+  }, 200);
+}
+
+function rebuildEpOptions(tp){
+  if (!D.nMoe){ el('ep-box').style.display='none'; return; }
+  var sel = el('f-ep'), prev = +sel.value || EP_INIT;
+  var divisors = [];
+  for (var d=1; d<=tp; d++) if (tp%d===0) divisors.push(d);
+  var pick = divisors.indexOf(prev)>=0 ? prev : tp;
+  sel.innerHTML = divisors.map(function(d){
+    return "<option value='"+d+"'"+(d===pick?' selected':'')+">"+d+"</option>";
+  }).join('');
+}
+
 /* ====================== TAB 1: estimate (design_1) ====================== */
 function barHtml(segs, total) {
   var h = '';
@@ -501,54 +559,45 @@ function legendHtml(segs) {
   }).join('');
 }
 
-function updateEstimate() {
-  var ctx = +el('f-ctx').value;
-  var req = +el('f-req').value;
-  var kvSel = el('f-kv').value;
-  var kvDtype = kvDtypeNow();
-  var kvPerTok = kvCellBytes(kvDtype) * (D.nKvLayers || D.L);
-  var kvPerReq = kvCellBytes(kvDtype) * kvLayerTokens(ctx);
-  var kvTotal = kvPerReq * req;
-  var linTotal = (D.linStateBytes || 0) * req;
-  var runtime = kvTotal + linTotal + D.actBytes + (D.visionActBytes || 0);
-  var total = D.weightsBytes + runtime;
-  var grand = total * (1 + D.overhead);
+function renderEstimate() {
+  var E = W.estimate, ctx = W.echo.ctx, req = W.echo.req;
+  var kvSel = el('f-kv').value, kvDtype = W.echo.kvDtype;
   var ctxStr = ctx.toLocaleString('en-US');
 
-  setText('d-runtime', gib(runtime));
+  setText('d-runtime', gib(E.runtime));
   setText('d-ctx', ctxStr);
   setText('d-req', req);
-  setText('d-kv-total', gib(kvTotal));
+  setText('d-kv-total', gib(E.kvTotal));
   setText('d-ctx2', ctxStr);
-  setText('d-kv-per-req', gib(kvPerReq));
+  setText('d-kv-per-req', gib(E.kvPerReq));
   setText('d-req2', req);
-  setText('d-kv-total2', gib(kvTotal));
+  setText('d-kv-total2', gib(E.kvTotal));
   setText('d-kv-dtype', kvDtype + (kvSel === 'auto' ? Tr('kvAutoSuffix')() : ''));
-  setText('d-kv-per-tok', (kvPerTok / 1024).toLocaleString('en-US',
+  setText('d-kv-per-tok', (E.kvPerTok / 1024).toLocaleString('en-US',
     {minimumFractionDigits: 1, maximumFractionDigits: 1}));
-  if (D.mhaRatio) setText('d-mha', gib(kvTotal * D.mhaRatio));
+  if (E.mhaTotal) setText('d-mha', gib(E.mhaTotal));
 
   var segs = [
     {label: Tr('weightsStaticLabel')(), bytes: D.weightsBytes, slot: D.weightsSlot},
-    {label: 'KV Cache', bytes: kvTotal, slot: 5}
+    {label: 'KV Cache', bytes: E.kvTotal, slot: 5}
   ];
-  if (linTotal > 0) segs.push({label: 'linear/SSM state', bytes: linTotal, slot: 7});
+  if (E.linTotal > 0) segs.push({label: 'linear/SSM state', bytes: E.linTotal, slot: 7});
   segs.push({label: 'Activation', bytes: D.actBytes, slot: 6});
   if (D.visionActBytes > 0) segs.push({label: 'Vision encoder', bytes: D.visionActBytes, slot: 8});
-  setText('d-tot-head', Tr('totalHead')(gib(total), ctxStr, req));
-  el('d-tot-bar').innerHTML = barHtml(segs, total);
+  setText('d-tot-head', Tr('totalHead')(gib(E.total), ctxStr, req));
+  el('d-tot-bar').innerHTML = barHtml(segs, E.total);
   el('d-tot-legend').innerHTML = legendHtml(segs);
   el('d-total-line').innerHTML = Tr('totalLine')(
-    gib(D.weightsBytes), gib(kvTotal), gib(D.actBytes),
-    Math.round(D.overhead * 100), gib(grand), gib(kvPerReq),
-    linTotal > 0 ? gib(linTotal) : null);
-  setText('d-lin-total', gib(linTotal));
-  setText('d-tbl-lin-val', gib(linTotal));
+    gib(D.weightsBytes), gib(E.kvTotal), gib(D.actBytes),
+    Math.round(D.overhead * 100), gib(E.grand), gib(E.kvPerReq),
+    E.linTotal > 0 ? gib(E.linTotal) : null);
+  setText('d-lin-total', gib(E.linTotal));
+  setText('d-tbl-lin-val', gib(E.linTotal));
   setText('d-lin-req', req);
 
   setText('d-tbl-kv-label', Tr('tblKvLabel')(ctxStr, req));
   setText('d-tbl-kv-dtype', kvDtype);
-  setText('d-tbl-kv-val', gib(kvTotal));
+  setText('d-tbl-kv-val', gib(E.kvTotal));
 }
 
 /* ====================== TAB 2: parallel (design_2) ====================== */
@@ -570,152 +619,19 @@ var COMPS = [
   {k:'others',    label:'norms/router', color:C.others}
 ];
 
-function readParams(){
-  var inst = el('f-inst').value, memGib, gpn, instLabel;
-  if (inst === 'custom'){
-    memGib = +el('f-cmem').value || 1; gpn = +el('f-cgpn').value || 1;
-    instLabel = Tr('customInstLabel')(gpn, memGib);
+// deployment shape being rendered: server echo + display label for the node
+function shapeNow() {
+  var e = W.echo;
+  var inst = el('f-inst').value, instLabel;
+  if (inst === 'custom' || !D.instances[inst]) {
+    instLabel = Tr('customInstLabel')(e.gpn, e.memGib);
   } else {
     var s = D.instances[inst];
-    memGib = s.memGib; gpn = s.count;
     instLabel = Tr('instLabel')(inst, s.count, s.gpu, s.memGib);
   }
-  var tp = +el('f-tp').value;
-  return {
-    tp:tp, pp:+el('f-pp').value, ep:+(el('f-ep').value||1),
-    dpAttn: el('f-dp').checked && dpAvailable(tp),
-    memGib:memGib, gpn:gpn, instLabel:instLabel,
-    ctx:+el('f-ctx').value, req:+el('f-req').value,
-    kvDtype: kvDtypeNow(), frac:+el('f-frac').value
-  };
-}
-
-// DP attention only changes the picture when KV would otherwise be
-// replicated across TP ranks: MLA (latent has no head dim, replicated at
-// any TP) or GQA/MQA once TP exceeds the kv-head count.
-function dpAvailable(tp){
-  return D.kvIsMla || tp > (D.kvNKvHeads || tp);
-}
-
-function rebuildEpOptions(tp){
-  if (!D.nMoe){ el('ep-box').style.display='none'; return; }
-  var sel = el('f-ep'), prev = +sel.value || EP_INIT;
-  var divisors = [];
-  for (var d=1; d<=tp; d++) if (tp%d===0) divisors.push(d);
-  var pick = divisors.indexOf(prev)>=0 ? prev : tp;
-  sel.innerHTML = divisors.map(function(d){
-    return "<option value='"+d+"'"+(d===pick?' selected':'')+">"+d+"</option>";
-  }).join('');
-}
-
-function stageRange(s, pp){                       // layers [lo, hi); later stages get +1
-  var base = Math.floor(D.L/pp), rem = D.L%pp;
-  var lo = 0;
-  for (var i=0;i<s;i++) lo += base + (i >= pp-rem ? 1 : 0);
-  return [lo, lo + base + (s >= pp-rem ? 1 : 0)];
-}
-
-// bytes on one GPU of pipeline stage s (all tp ranks of a stage are identical)
-function gpuMemory(s, P){
-  var r = stageRange(s, P.pp), lo=r[0], hi=r[1], n=hi-lo;
-  var nd = Math.max(0, Math.min(hi, D.nDense) - Math.min(lo, D.nDense));
-  var nm = n - nd;
-  var L = D.layer, w = {};
-  // attn-TP sharding divisor: dp-attention sets the attention TP group to
-  // tp/dp = 1, so everything in that group (attention projections, embed,
-  // MLA w_kc/w_vc, draft embed) becomes one full copy per rank. lm_head is
-  // NOT in the group (enable_dp_lm_head defaults off) — it stays /tp.
-  var attnTpDiv = P.dpAttn ? 1 : P.tp;
-  w.embed  = (s===0) ? D.embed/attnTpDiv : 0;
-  // vision tower (VLMs) sits on the embedding stage. Only VisionAttention's
-  // qkv/o shard by attn-TP (visionAttnFrac); the ViT MLP (plain nn.Linear)
-  // and the projector are replicated on every rank.
-  w.vision = 0;
-  if (s===0 && D.visionBytes) {
-    var vAttn = D.visionAttnFrac || 0;
-    w.vision = D.visionBytes * (vAttn/attnTpDiv + (1-vAttn));
-  }
-  w.lmHead = 0;
-  if (s===P.pp-1) w.lmHead = D.tied ? (P.pp>1 ? D.embed/P.tp : 0) : D.lmHead/P.tp;
-  w.attention = n * (P.dpAttn
-    ? L.attnQo + L.attnKvProj + L.attnRepl
-    : L.attnQo/P.tp + L.attnKvProj/Math.min(P.tp, D.kvNKvHeads||P.tp) + L.attnRepl);
-  // MLA absorption: SGLang materializes bf16 w_kc/w_vc from kv_b_proj at load
-  // (original kept for the MHA prefill path) — extra bytes beyond safetensors,
-  // sharded by attn-TP. Verified S1 E4: GLM-5.2 +0.27 GiB @TP8, +2.13 @dpAttn.
-  w.attention += n * (D.absorbPerLayer||0) / attnTpDiv;
-  w.denseFfn  = nd * L.denseFfn/P.tp;
-  w.moeRouted = nm * L.moeRouted/P.tp;
-  w.moeShared = nm * L.moeShared/P.tp;
-  // MTP draft: expert FFN always /tp; attention flips to replicated under
-  // dp-attention (mtpAttnFrac); plus the draft's own bf16 embed + w_kc/w_vc,
-  // allocated at load (aliased to target later, but pool sizing sees them).
-  w.mtp = 0;
-  if (s===P.pp-1 && L.mtpTotal) {
-    var mtpFfnFrac = L.mtpSlicedFrac - (L.mtpAttnFrac||0);
-    w.mtp = P.dpAttn
-      ? L.mtpTotal*(mtpFfnFrac/P.tp + (1-mtpFfnFrac))
-      : L.mtpTotal*(L.mtpSlicedFrac/P.tp + (1-L.mtpSlicedFrac));
-    w.mtp += ((D.draftEmbedBytes||0) + (D.absorbPerLayer||0)) / attnTpDiv;
-  }
-  w.others = n*(L.norms + L.indexer) + nm*L.moeGate;
-
-  var weights = 0; for (var k in w) weights += w[k];
-  // KV demand: bytes this GPU must hold to serve ctx × req at the chosen sharding.
-  // Stored token-positions honor sliding-window caps (kvLayerTokens); scale to
-  // this pipeline stage's share of layers (exact when pp=1: n===L).
-  var kvShard = P.dpAttn  ? 1/P.tp
-              : D.kvIsMla ? 1
-                          : 1/Math.min(P.tp, D.kvNKvHeads);
-  // per storage group (full-context vs sliding-capped), for the split fill in
-  // kvUtilBar; kv is their sum, identical to the old aggregate formula.
-  var kvParts = (D.kvGroups && D.kvGroups.length ? D.kvGroups : [[D.nKvLayers||D.L, 0]])
-    .map(function(g0){
-      var tokens = g0[1] ? Math.min(P.ctx, g0[1]) : P.ctx;
-      return { layers:g0[0], window:g0[1],
-               b: kvCellBytes(P.kvDtype) * g0[0] * tokens
-                  * (n/D.L) * P.req * kvShard };
-    });
-  var kv = 0; kvParts.forEach(function(g0){ kv += g0.b; });
-  // vision encoder activation: the ViT MLP is replicated (only its attention
-  // shards by TP), so each rank needs close to the full workspace while
-  // encoding — added unsharded, conservative.
-  var act = D.actBytes/P.tp + (D.visionActBytes||0);
-  // linear/SSM fixed state (hybrid models): per-request, grows with concurrency
-  // not context. SGLang allocates it as a separate mamba pool inside the static
-  // region, so it competes with the paged-KV pool for the same budget. Assumes
-  // linear layers spread evenly across pp stages; heads shard by tp.
-  var linState = (D.linStateBytes||0) * P.req * n / D.L / P.tp;
-  var cap = P.memGib*GIB, fixed = D.fixedGib*GIB;
-  // SGLang-style allocation: the static region (frac × cap) is pre-allocated at
-  // startup as weights + KV pool; whatever the weights don't take becomes KV
-  // capacity. Activation / CUDA graph live in the (1-frac) non-static region.
-  var staticBudget = P.frac*cap;
-  var kvCap = staticBudget - fixed - weights - linState;
-  var canStart = kvCap > 0;
-  var used = canStart ? staticBudget + act : weights + fixed + linState + act;
-  // pool capacity: demand kv covers ctx*req tokens, so tokens/byte = ctx*req/kv.
-  // Under dp-attention each rank runs its own pool at the FULL cell (it stores
-  // only its own requests' KV): both numbers become per-rank — this matches
-  // SGLang's logged max_total_num_tokens; cluster capacity = dp × per-rank
-  // (the display appends the ×dp cluster equivalent so it can be compared
-  // against the requests filter).
-  var capShard = P.dpAttn ? P.tp : 1;
-  var maxReq = (canStart && kv > 0) ? Math.floor(kvCap*P.req/kv/capShard) : 0;
-  var maxTokens = (canStart && kv > 0) ? kvCap*P.ctx*P.req/kv/capShard : 0;
-  return { w:w, weights:weights, kv:kv, kvParts:kvParts, kvCap:Math.max(kvCap,0),
-           kvCapRaw:kvCap, canStart:canStart, act:act, used:used, maxReq:maxReq,
-           maxTokens:maxTokens, linState:linState, layers:[lo,hi], nDense:nd, nMoe:nm };
-}
-
-// experts held by tp rank t (EP grouping)
-function expertInfo(t, P){
-  if (!D.nMoe || !D.nExperts) return null;
-  var grp = P.tp/P.ep, epRank = Math.floor(t/grp);
-  var base = Math.floor(D.nExperts/P.ep), rem = D.nExperts%P.ep;
-  var cnt = base + (epRank < rem ? 1 : 0);
-  var lo = epRank*base + Math.min(epRank, rem);
-  return { cnt:cnt, lo:lo, hi:lo+cnt-1, sliceDenom:grp };
+  return { tp: e.tp, pp: e.pp, ep: e.ep, dpAttn: e.dpAttn, memGib: e.memGib,
+           gpn: e.gpn, instLabel: instLabel, ctx: e.ctx, req: e.req,
+           kvDtype: e.kvDtype, frac: e.frac, fixedGib: e.fixedGib };
 }
 
 function memBar(m, P){
@@ -725,7 +641,7 @@ function memBar(m, P){
   // frac boundary line.
   var parts = [];
   COMPS.forEach(function(c){ if (m.w[c.k] > 0) parts.push({label:c.label, b:m.w[c.k], color:c.color}); });
-  parts.push({label:Tr('fixedOverhead')(), b:D.fixedGib*GIB, color:'var(--fixed)'});
+  parts.push({label:Tr('fixedOverhead')(), b:P.fixedGib*GIB, color:'var(--fixed)'});
   if (m.linState > 0) parts.push({label:Tr('linStateLabel')(P.req), b:m.linState,
                                   color:C.linState, note:Tr('linStateTipNote')()});
   if (m.canStart) parts.push({label:Tr('kvCapLabel')(), b:m.kvCap, color:C.kv});
@@ -758,8 +674,8 @@ function memBar(m, P){
 // demand is the dark fill. Overflow past the tick turns red, so 216% and 500%
 // look different (the tick sits at a different position).
 // Hybrid-attention models get one fill segment per storage group (full-context
-// vs sliding-capped) so the two growth regimes are visually distinct: the full
-// segment scales with context, the sliding one saturates at its window.
+// vs sliding-capped, from the server's kvParts) so the two growth regimes are
+// visually distinct.
 function kvUtilBar(m, P){
   if (!m.canStart || m.kvCap <= 0) return '';
   var ratio = m.kv/m.kvCap, pct = (ratio*100).toFixed(0), over = ratio > 1;
@@ -789,7 +705,7 @@ function kvUtilBar(m, P){
   return h;
 }
 
-function chips(m, s, t, P){
+function chips(m, ei, P){
   var h = '';
   // embed follows the attn-TP group: sliced 1/tp in pure TP, one full copy
   // per rank under dp-attention (lm_head stays /tp either way).
@@ -800,7 +716,6 @@ function chips(m, s, t, P){
   if (m.w.mtp>0) h += "<span class='chip-io' style='background:"+C.mtp+"'>MTP"+(P.dpAttn?'':" ⁄"+P.tp)+"</span>";
   if (m.w.lmHead>0) h += "<span class='chip-io' style='background:"+C.lmHead+"'>lm_head ⁄"+P.tp+"</span>";
   var eh = '';
-  var ei = expertInfo(t, P);
   if (ei && m.nMoe>0){
     var nsq = Math.min(ei.cnt, 12), sq='';
     for (var i=0;i<nsq;i++) sq += "<span class='eg"+(ei.sliceDenom>1?' cut':'')+"'></span>";
@@ -811,36 +726,34 @@ function chips(m, s, t, P){
   return "<div class='chips'>"+h+"</div>"+eh;
 }
 
-function updateParallel(){
-  var P = readParams();
-  rebuildEpOptions(P.tp); P.ep = +el('f-ep').value || 1;
-  el('dp-box').style.display = dpAvailable(P.tp) ? '' : 'none';
+function renderParallel(){
+  var P = shapeNow();
+  el('dp-box').style.display = W.echo.dpAvailable ? '' : 'none';
   el('custom-box').style.display = el('f-inst').value==='custom' ? 'inline-flex' : 'none';
 
-  var warn = [];
-  if (P.pp > D.L) { warn.push(Tr('warnPpExceeds')(P.pp, D.L)); }
-  el('warnmsg').style.display = warn.length ? '' : 'none';
-  el('warnmsg').textContent = warn.join(D.lang === 'en' ? '; ' : '；');
-  if (warn.length) { el('cluster').innerHTML=''; return; }
+  if (W.parallel.error === 'ppExceeds') {
+    el('warnmsg').style.display = '';
+    el('warnmsg').textContent = Tr('warnPpExceeds')(W.parallel.pp, W.parallel.L);
+    el('cluster').innerHTML='';
+    return;
+  }
+  if (el('warnmsg').textContent && el('warnmsg').textContent !== Tr('fetchError')()) {
+    el('warnmsg').style.display = 'none'; el('warnmsg').textContent = '';
+  }
 
-  // per-stage memory (identical across tp ranks)
-  var stages = [];
-  for (var s=0;s<P.pp;s++) stages.push(gpuMemory(s, P));
-
-  var world = P.tp*P.pp, nNodes = Math.ceil(world/P.gpn);
+  var PA = W.parallel;
+  var stages = PA.stages;
+  var world = PA.world, nNodes = Math.ceil(world/P.gpn);
   var cap = P.memGib*GIB;
-  var html = '', oomTotal = 0, maxUsed = 0;
-  var clusterWeights = 0, clusterKv = 0;
+  var html = '', oomTotal = 0;
 
   for (var nd=0; nd<nNodes; nd++){
     var cards = '', nodeOom = 0;
     for (var g=nd*P.gpn; g<Math.min((nd+1)*P.gpn, world); g++){
       var s0 = Math.floor(g/P.tp), t = g%P.tp;
       var m = stages[s0];
-      clusterWeights += m.weights; clusterKv += m.kv;
       var free = cap - m.used, oom = !m.canStart || free < 0;
       if (oom){ nodeOom++; oomTotal++; }
-      maxUsed = Math.max(maxUsed, m.used);
       var memTxt = !m.canStart
         ? "<span class='oombadge'>"+Tr('cannotStart')(gib(-m.kvCapRaw))+"</span>"
         : oom
@@ -849,10 +762,9 @@ function updateParallel(){
       // KV arithmetic, spelled out line by line so every number on the card
       // can be reproduced by hand. Demand scope by mode: dp-attention → this
       // rank serves req/dp requests (each rank owns its pool); pure TP → the
-      // demand covers ALL requests' tokens (MLA: full cell replicated, no
-      // head dim to shard; GQA: per-token bytes sharded by kv heads). The
-      // effective per-token KiB is derived from m.kv so the printed formula
-      // is exact for every geometry, pp stage, and kv dtype.
+      // demand covers ALL requests' tokens. The effective per-token KiB is
+      // derived from m.kv so the printed formula is exact for every geometry,
+      // pp stage, and kv dtype.
       var demandTokens = P.ctx * P.req / (P.dpAttn ? P.tp : 1);
       var perTokKiB = (m.kv / demandTokens / 1024)
         .toLocaleString('en-US', {minimumFractionDigits:1, maximumFractionDigits:1});
@@ -872,7 +784,7 @@ function updateParallel(){
         "<div class='gpu-line'>"+Tr('gpuLine')(gib(m.weights), gib(m.canStart?m.kvCap:0), gib(m.act), oom?'':Tr('freeTail')(gib(free)))+"</div>"+
         kvUtilBar(m, P)+
         utilLine+
-        chips(m, s0, t, P)+"</div>";
+        chips(m, PA.experts[t], P)+"</div>";
     }
     html += "<div class='node'><div class='node-head'>"+
       "<span class='node-title'>Node-"+(nd+1)+"</span>"+
@@ -883,9 +795,8 @@ function updateParallel(){
   el('cluster').innerHTML = html;
 
   // summary + legend
-  var repl = clusterWeights - D.weightsBytes;
-  var kvSingle = kvCellBytes(P.kvDtype)*kvLayerTokens(P.ctx)*P.req;
-  var kvRepl = clusterKv/kvSingle;
+  var repl = PA.clusterWeights - D.weightsBytes;
+  var kvRepl = PA.clusterKv/PA.kvSingle;
   el('sum-head').textContent = 'TP'+P.tp+' × PP'+P.pp+(D.nMoe?' × EP'+P.ep:'')+
     Tr('sumHeadTail')(world, nNodes, P.instLabel,
       oomTotal ? Tr('oomPartOom')(oomTotal) : Tr('oomPartOk')());
@@ -912,20 +823,15 @@ function updateParallel(){
   var kvNote = P.dpAttn
     ? Tr('kvNoteDpOn')()
     : D.kvIsMla
-      ? Tr('kvNoteMlaRepl')(kvRepl.toFixed(1), gib(clusterKv))
+      ? Tr('kvNoteMlaRepl')(kvRepl.toFixed(1), gib(PA.clusterKv))
       : (P.tp > D.kvNKvHeads
           ? Tr('kvNoteTpExceeds')(P.tp, D.kvNKvHeads, (P.tp/Math.min(P.tp,D.kvNKvHeads)).toFixed(1))
           : Tr('kvNoteSliced')(P.tp));
-  var minMaxReq = Infinity, minMaxTok = Infinity, allStart = true;
-  stages.forEach(function(m){
-    if (!m.canStart) allStart = false;
-    else { minMaxReq = Math.min(minMaxReq, m.maxReq); minMaxTok = Math.min(minMaxTok, m.maxTokens); }
-  });
-  var capLine = allStart && isFinite(minMaxTok)
-    ? '<br>'+Tr('sumCapLine')(tokLabel(minMaxTok), ctxLabel(P.ctx), minMaxReq, P.frac.toFixed(2))
-      + (P.dpAttn ? Tr('sumCapDpSuffix')(P.tp, tokLabel(minMaxTok*P.tp), minMaxReq*P.tp) : '') : '';
+  var capLine = PA.allStart && PA.minMaxTok > 0
+    ? '<br>'+Tr('sumCapLine')(tokLabel(PA.minMaxTok), ctxLabel(P.ctx), PA.minMaxReq, P.frac.toFixed(2))
+      + (P.dpAttn ? Tr('sumCapDpSuffix')(P.tp, tokLabel(PA.minMaxTok*P.tp), PA.minMaxReq*P.tp) : '') : '';
   el('sum-line').innerHTML =
-    Tr('sumLine')(gib(maxUsed), P.memGib, gib(clusterWeights), gib(D.weightsBytes), gib(Math.max(repl,0)))+
+    Tr('sumLine')(gib(PA.maxUsed), P.memGib, gib(PA.clusterWeights), gib(D.weightsBytes), gib(Math.max(repl,0)))+
     '<br>'+kvNote+capLine;
 
   // table view
@@ -953,567 +859,24 @@ function fmtNum(x) {
   return x.toFixed(2);
 }
 
-/**
- * Snapshot the user-controlled inputs needed by every roofline calculator.
- *
- * Output fields:
- *   decodeTokens   - B, one generated token per active request in a decode step
- *   prefillTokens  - T, tokens processed by one prefill chunk
- *   contextTokens  - S, cached tokens read by each decode request
- *   kvBytes        - storage bytes per KV element at the selected precision
- *   kvLayers       - layers that hold paged KV; hybrid models' linear/SSM
- *                    layers keep a fixed state instead and must not be charged
- *                    per-context attention reads/pairs
- *   linLayers/linStateBytes - linear/SSM layer count and their fixed per-request
- *                    state bytes (read+written every step, O(1) in context)
- *   tp/dpAttn      - sharding mode. All quantities here are GLOBAL (whole
- *                    model × all requests) and the verdict cards divide time
- *                    by tp assuming even sharding; components that are
- *                    replicated per rank instead must scale their HBM bytes
- *                    ×tp so the ÷tp comes out to one full copy per rank
- *   kvIsMla/kvHeads - KV shardability: MLA latent KV has no head dim (every
- *                    rank reads the whole cache under pure TP); GQA shards
- *                    KV by min(tp, kvHeads)
- *   attentionGeometry/pattern - model structure serialized by Python
- *   topk/nExperts  - routed experts selected per token / total routed experts
- */
-function currentRooflineWorkload() {
-  var tp = +el('f-tp').value || 1;
-  return {
-    decodeTokens: +el('f-req').value,
-    prefillTokens: chunkTokensNow(),
-    contextTokens: +el('f-ctx').value,
-    kvBytes: kvBytesPer(kvDtypeNow()),
-    kvLayers: D.nKvLayers || D.L,
-    linLayers: D.linLayers || 0,
-    linStateBytes: D.linStateBytes || 0,
-    tp: tp,
-    dpAttn: el('f-dp').checked && dpAvailable(tp),
-    kvIsMla: !!D.kvIsMla,
-    kvHeads: D.kvNKvHeads || 0,
-    attentionGeometry: D.attentionCore.geometry,
-    attentionPattern: D.attentionCore.pattern,
-    topk: D.topk,
-    nExperts: D.nExperts
-  };
+// display label for a kernel row: attn_core / linear_state are localized,
+// weight-GEMM labels come language-neutral from the server
+function rowLabel(r) {
+  if (r.key === 'attn_core') return Tr('attnCoreLabel')();
+  if (r.key === 'linear_state') return Tr('linStateKernelLabel')();
+  return r.label;
 }
 
-/**
- * Build the common output of a single phase calculation.
- *
- * Inputs are total FLOPs and HBM bytes for the phase. Output is always
- * {flops, bytes, intensity, note}, where intensity = FLOPs / HBM bytes.
- */
-function phaseWork(flops, bytes, note) {
-  return { flops: flops, bytes: bytes, intensity: flops / bytes, note: note };
-}
-
-/**
- * Shared arithmetic for a weight-bearing GEMM.
- *
- * Input kernel: {params, bytes}; input workload: decode/prefill token counts.
- * Formula per phase:
- *   FLOPs = 2 * logical weight parameters * tokens
- *   HBM bytes = stored weight bytes, streamed once and shared by all tokens
- * Output: {dec: phaseWork, pre: phaseWork}.
- */
-function calculateWeightGemmWork(kernel, workload) {
-  var B = workload.decodeTokens;
-  var T = workload.prefillTokens;
-  return {
-    dec: phaseWork(
-      2 * kernel.params * B,
-      kernel.bytes,
-      Tr('gemmDecodeNote')(B)
-    ),
-    pre: phaseWork(
-      2 * kernel.params * T,
-      kernel.bytes,
-      Tr('gemmPrefillNote')(T.toLocaleString('en-US'))
-    )
-  };
-}
-
-/**
- * Attention Q/K/V/O projection kernel.
- *
- * Inputs: aggregate projection {params, bytes} and current workload.
- * Formula: FLOPs = 2 * params * tokens; HBM = projection weight bytes.
- * Output: decode and prefill phase work from calculateWeightGemmWork().
- */
-function calculateAttentionProjectionWork(kernel, workload) {
-  return calculateWeightGemmWork(kernel, workload);
-}
-
-/**
- * DSA indexer projection kernel.
- *
- * Inputs: aggregate indexer {params, bytes} and current workload.
- * Formula: FLOPs = 2 * params * tokens; HBM = indexer weight bytes.
- * This covers projection GEMMs only; full-context scoring/top-k is not modeled.
- * Output: decode and prefill phase work from calculateWeightGemmWork().
- */
-function calculateDsaIndexerWork(kernel, workload) {
-  return calculateWeightGemmWork(kernel, workload);
-}
-
-/**
- * Dense FFN kernel.
- *
- * Inputs: aggregate FFN {params, bytes} and current workload.
- * Formula: FLOPs = 2 * params * tokens; HBM = FFN weight bytes.
- * Output: decode and prefill phase work from calculateWeightGemmWork().
- */
-function calculateDenseFfnWork(kernel, workload) {
-  return calculateWeightGemmWork(kernel, workload);
-}
-
-/**
- * MoE router kernel.
- *
- * Inputs: aggregate router {params, bytes} and current workload.
- * Formula: FLOPs = 2 * params * tokens; HBM = router weight bytes.
- * Output: decode and prefill phase work from calculateWeightGemmWork().
- */
-function calculateMoeRouterWork(kernel, workload) {
-  return calculateWeightGemmWork(kernel, workload);
-}
-
-/**
- * Routed MoE expert kernels.
- *
- * Inputs: routed-expert {params, bytes}; workload supplies B, T, topk, nExperts.
- * Decode formulas:
- *   active parameter ratio = topk / nExperts
- *   touched expert ratio = min(1, B * topk / nExperts)
- *   FLOPs = 2 * params * active ratio * B
- *   HBM bytes = stored expert bytes * touched expert ratio
- * Prefill assumes a large chunk touches all experts:
- *   FLOPs = 2 * params * active ratio * T; HBM bytes = all expert bytes
- * Output: {dec: phaseWork, pre: phaseWork}.
- */
-function calculateMoeExpertsWork(kernel, workload) {
-  var B = workload.decodeTokens;
-  var T = workload.prefillTokens;
-  var activeRatio = workload.topk / workload.nExperts;
-  var touchedRatio = Math.min(1, B * activeRatio);
-  return {
-    dec: phaseWork(
-      2 * kernel.params * activeRatio * B,
-      kernel.bytes * touchedRatio,
-      Tr('moeDecodeNote')(B, Math.round(touchedRatio * 100))
-    ),
-    pre: phaseWork(
-      2 * kernel.params * activeRatio * T,
-      kernel.bytes,
-      Tr('moePrefillNote')(T.toLocaleString('en-US'))
-    )
-  };
-}
-
-/**
- * Shared MoE expert kernel.
- *
- * Inputs: aggregate shared-expert {params, bytes} and current workload.
- * Formula: FLOPs = 2 * params * tokens; HBM = shared-expert weight bytes.
- * Output: decode and prefill phase work from calculateWeightGemmWork().
- */
-function calculateMoeSharedExpertsWork(kernel, workload) {
-  return calculateWeightGemmWork(kernel, workload);
-}
-
-/**
- * LM-head projection kernel.
- *
- * Inputs: lm_head {params, bytes} and current workload.
- * Formula: FLOPs = 2 * params * tokens; HBM = lm_head weight bytes.
- * Output: decode and prefill phase work from calculateWeightGemmWork().
- */
-function calculateLmHeadWork(kernel, workload) {
-  return calculateWeightGemmWork(kernel, workload);
-}
-
-/**
- * Standard multi-head attention geometry.
- *
- * Input spec: {qHeads, kvHeads, qkHeadDim, valueHeadDim}.
- * Per attended query/key pair:
- *   QK FLOPs = 2 * qHeads * qkHeadDim
- *   AV FLOPs = 2 * qHeads * valueHeadDim
- * KV elements per key = kvHeads * (qkHeadDim + valueHeadDim)
- * For MHA qHeads == kvHeads.
- */
-function calculateMhaAttentionGeometry(spec) {
-  return {
-    label: Tr('mhaLabel')(spec.qHeads),
-    flopsPerPair: 2 * spec.qHeads * (spec.qkHeadDim + spec.valueHeadDim),
-    kvElementsPerKey: spec.kvHeads * (spec.qkHeadDim + spec.valueHeadDim)
-  };
-}
-
-/**
- * Grouped-query (including multi-query) attention geometry.
- *
- * Input spec: {qHeads, kvHeads, qkHeadDim, valueHeadDim}.
- * FLOPs still scale with qHeads because every query head computes QK and AV.
- * KV storage scales with kvHeads because each KV head is shared by a group:
- *   FLOPs/pair = 2 * qHeads * (qkHeadDim + valueHeadDim)
- *   KV elements/key = kvHeads * (qkHeadDim + valueHeadDim)
- */
-function calculateGqaAttentionGeometry(spec) {
-  return {
-    label: Tr('gqaLabel')(spec.qHeads, spec.kvHeads),
-    flopsPerPair: 2 * spec.qHeads * (spec.qkHeadDim + spec.valueHeadDim),
-    kvElementsPerKey: spec.kvHeads * (spec.qkHeadDim + spec.valueHeadDim)
-  };
-}
-
-/**
- * Absorbed MLA attention geometry used with a compressed latent KV cache.
- *
- * Input spec: {qHeads, kvLoraRank, ropeHeadDim}.
- * Let Dc = kvLoraRank and Dr = ropeHeadDim. For each query/key pair:
- *   latent QK = 2 * qHeads * Dc
- *   RoPE QK   = 2 * qHeads * Dr
- *   latent AV = 2 * qHeads * Dc
- * Therefore FLOPs/pair = 2 * qHeads * (2*Dc + Dr), while the shared cache
- * stores only Dc + Dr elements per key position.
- */
-function calculateMlaAttentionGeometry(spec) {
-  return {
-    label: Tr('mlaLabel')(spec.kvLoraRank, spec.ropeHeadDim),
-    flopsPerPair: 2 * spec.qHeads * (2 * spec.kvLoraRank + spec.ropeHeadDim),
-    kvElementsPerKey: spec.kvLoraRank + spec.ropeHeadDim
-  };
-}
-
-/**
- * Select the geometry calculator declared by the model config.
- *
- * Input: the serialized attention geometry. Output:
- * {label, flopsPerPair, kvElementsPerKey}.
- */
-function calculateAttentionGeometry(spec) {
-  if (spec.kind === 'mha') return calculateMhaAttentionGeometry(spec);
-  if (spec.kind === 'gqa') return calculateGqaAttentionGeometry(spec);
-  if (spec.kind === 'mla') return calculateMlaAttentionGeometry(spec);
-  throw new Error('Unsupported attention geometry: ' + spec.kind);
-}
-
-/**
- * Number of causal query/key pairs in a dense T-token chunk.
- *
- * Query i attends i+1 keys, so pairs = 1 + ... + T = T*(T+1)/2.
- */
-function denseCausalPairs(tokens) {
-  return tokens * (tokens + 1) / 2;
-}
-
-/**
- * Number of causal pairs when every query attends at most `limit` keys.
- *
- * The first min(T, limit) queries form a dense causal triangle. Every later
- * query contributes exactly `limit` selected keys.
- */
-function cappedCausalPairs(tokens, limit) {
-  var denseTokens = Math.min(tokens, limit);
-  return denseCausalPairs(denseTokens) + Math.max(0, tokens - limit) * limit;
-}
-
-/**
- * Dense attention access pattern across the KV-bearing layers.
- *
- * Inputs: B decode queries, context S, prefill chunk T, and KV layer count Lkv
- * (= all layers for pure transformers; hybrid models' linear/SSM layers are
- * excluded — their O(1) state traffic is the separate linear_state kernel).
- * Decode pairs and KV reads = B*S*Lkv.
- * Prefill pairs = T*(T+1)/2*Lkv. Prefill KV reads = T*Lkv, the ideal one-pass
- * HBM lower bound; FlashAttention tiling/reloads are intentionally excluded.
- */
-function calculateDenseAttentionPattern(workload) {
-  var decodePairs = workload.decodeTokens * workload.contextTokens * workload.kvLayers;
-  return {
-    label: 'dense',
-    decodePairs: decodePairs,
-    prefillPairs: denseCausalPairs(workload.prefillTokens) * workload.kvLayers,
-    decodeKvReads: decodePairs,
-    prefillKvReads: workload.prefillTokens * workload.kvLayers,
-    decodeNote: Tr('denseDecodeNote')(ctxLabel(workload.contextTokens)),
-    prefillNote: Tr('densePrefillNote')()
-  };
-}
-
-/**
- * DSA sparse attention access pattern across all transformer layers.
- *
- * Input pattern: {kind:'dsa', topk}. DSA is composed with MHA/GQA/MLA; it is
- * not a KV geometry. Each decode query attends min(S, topk) selected keys.
- * Prefill uses the exact top-k-capped causal pair count. KV HBM for prefill
- * remains the ideal one-pass lower bound and excludes irregular gather reloads.
- * Full-context index scoring/top-k is not modeled; the DSA indexer row currently
- * covers its projection GEMMs only.
- */
-function calculateDsaAttentionPattern(workload, pattern) {
-  var attended = Math.min(workload.contextTokens, pattern.topk);
-  return {
-    label: Tr('dsaLabel')(pattern.topk),
-    decodePairs: workload.decodeTokens * attended * workload.kvLayers,
-    prefillPairs: cappedCausalPairs(workload.prefillTokens, pattern.topk) * workload.kvLayers,
-    decodeKvReads: workload.decodeTokens * attended * workload.kvLayers,
-    prefillKvReads: workload.prefillTokens * workload.kvLayers,
-    decodeNote: Tr('dsaDecodeNote')(ctxLabel(workload.contextTokens), attended),
-    prefillNote: Tr('dsaPrefillNote')(pattern.topk)
-  };
-}
-
-/**
- * Capped attention (sliding window or block-sparse) across a subset of layers.
- *
- * `capLayers` of the total layers cap each query at min(context, cap) keys; the
- * remaining layers are dense (full context). This splits the per-layer read
- * accordingly, so MiniMax-style 57/60-sparse or Gemma-style 5:1-sliding models
- * are not treated as fully dense.
- */
-function calculateCappedAttentionPattern(workload, pattern) {
-  var S = workload.contextTokens, B = workload.decodeTokens, T = workload.prefillTokens;
-  var capL = Math.min(pattern.capLayers, workload.kvLayers);
-  var denseL = workload.kvLayers - capL;
-  var attended = Math.min(S, pattern.cap);
-  var decodeKvReads = B * (attended * capL + S * denseL);
-  var prefillPairsCapped = cappedCausalPairs(T, pattern.cap) * capL
-                         + denseCausalPairs(T) * denseL;
-  return {
-    label: Tr('dsaLabel') ? Tr('dsaLabel')(pattern.cap) : 'capped',
-    decodePairs: decodeKvReads,
-    prefillPairs: prefillPairsCapped,
-    decodeKvReads: decodeKvReads,
-    prefillKvReads: T * workload.kvLayers,
-    decodeNote: Tr('dsaDecodeNote')(ctxLabel(S), attended) + ' × ' + capL + 'L',
-    prefillNote: Tr('dsaPrefillNote')(pattern.cap)
-  };
-}
-
-/**
- * Select the dense / DSA / capped access-pattern calculator.
- *
- * Output: pair counts for FLOPs and KV-key read counts for ideal HBM traffic.
- */
-function calculateAttentionPattern(workload) {
-  var pattern = workload.attentionPattern;
-  if (pattern.kind === 'dense') return calculateDenseAttentionPattern(workload);
-  if (pattern.kind === 'dsa') return calculateDsaAttentionPattern(workload, pattern);
-  if (pattern.kind === 'capped') return calculateCappedAttentionPattern(workload, pattern);
-  throw new Error('Unsupported attention pattern: ' + pattern.kind);
-}
-
-/**
- * Weight-free attention core: QK score plus score-weighted value aggregation.
- *
- * Geometry determines FLOPs per attended pair and KV elements per key.
- * Pattern determines how many pairs are computed and how many KV keys reach
- * HBM. Output is the common {dec, pre} phase work consumed by the roofline.
- *
- * Formulas per phase:
- *   FLOPs = geometry.flopsPerPair * pattern.queryKeyPairs
- *   HBM bytes = geometry.kvElementsPerKey * pattern.kvKeyReads * kvBytes
- */
-function calculateAttentionCoreWork(workload) {
-  var geometry = calculateAttentionGeometry(workload.attentionGeometry);
-  var pattern = calculateAttentionPattern(workload);
-  var prefix = geometry.label + ' + ' + pattern.label + ': ';
-  return {
-    dec: phaseWork(
-      geometry.flopsPerPair * pattern.decodePairs,
-      geometry.kvElementsPerKey * pattern.decodeKvReads * workload.kvBytes,
-      prefix + pattern.decodeNote
-    ),
-    pre: phaseWork(
-      geometry.flopsPerPair * pattern.prefillPairs,
-      geometry.kvElementsPerKey * pattern.prefillKvReads * workload.kvBytes,
-      prefix + pattern.prefillNote
-    )
-  };
-}
-
-/**
- * Weight-free linear/SSM recurrent-state kernel for hybrid models.
- *
- * The linear layers keep a fixed per-request state (conv + ssm, linStateBytes
- * total across all linear layers) instead of paged KV. Every decode step each
- * active request reads and writes that state once — O(1) in context, O(B) in
- * concurrency. Chunked prefill reads+writes the one request's state once per
- * chunk. FLOPs are an order-of-magnitude delta-rule estimate (~2 FLOPs per
- * state element per token, state elements ≈ bytes/2); the term is bandwidth-
- * dominated so the bytes side carries the roofline placement.
- */
-function calculateLinearStateWork(workload) {
-  var B = workload.decodeTokens;
-  var T = workload.prefillTokens;
-  var stateElems = workload.linStateBytes / 2;
-  return {
-    dec: phaseWork(
-      2 * stateElems * B,
-      2 * workload.linStateBytes * B,
-      Tr('linStateDecodeNote')(workload.linLayers)
-    ),
-    pre: phaseWork(
-      2 * stateElems * T,
-      2 * workload.linStateBytes,
-      Tr('linStatePrefillNote')(workload.linLayers)
-    )
-  };
-}
-
-/**
- * Per-rank replication multiplier for a kernel's HBM weight bytes.
- *
- * All roofline quantities are global and the verdict cards divide time by tp,
- * which assumes every kernel's bytes shard evenly across ranks. Components the
- * memory model replicates instead read one FULL copy on EVERY rank, so their
- * cluster-wide traffic is ×factor; scaling the global bytes keeps the shared
- * ÷tp honest. Mirrors gpuMemory()'s sharding:
- *   attention - full copy per rank under dp-attention (attn-TP group = 1)
- *   indexer / moe_gate - replicated per rank even in pure TP (w.others has
- *               no /tp); small, but kept consistent with the memory model
- * FLOPs never scale: each rank computes only its own token/head share.
- */
-function kernelBytesReplication(key, workload) {
-  if (key === 'indexer' || key === 'moe_gate') return workload.tp;
-  if (key === 'attention') return workload.dpAttn ? workload.tp : 1;
-  return 1;
-}
-
-/**
- * KV-read replication for the attention core — the OPPOSITE polarity of the
- * weights term. Under pure TP, MLA's latent KV has no head dimension, so every
- * rank streams the full B×S cache each step (the reason dp-attention exists);
- * GQA shards KV reads only by min(tp, kvHeads). Under dp-attention each rank
- * reads just its own B/tp requests' KV, so the even-shard ÷tp is exact.
- */
-function attnCoreKvReplication(workload) {
-  if (workload.dpAttn || workload.tp <= 1) return 1;
-  if (workload.kvIsMla) return workload.tp;
-  return workload.tp / Math.min(workload.tp, workload.kvHeads || workload.tp);
-}
-
-// Scale a {dec, pre} work pair's HBM bytes by a replication factor, keeping
-// FLOPs, rebuilding intensity, and annotating the note so the detail table
-// shows why this kernel's traffic does not shard.
-function scaleWorkBytes(work, mult) {
-  if (mult === 1) return work;
-  return {
-    dec: phaseWork(work.dec.flops, work.dec.bytes * mult,
-                   work.dec.note + Tr('replNote')(fmtNum(mult))),
-    pre: phaseWork(work.pre.flops, work.pre.bytes * mult,
-                   work.pre.note + Tr('replNote')(fmtNum(mult)))
-  };
-}
-
-// Every emitted weight kernel must opt into one explicit calculator. Adding a
-// Python-side kernel without updating this table fails visibly instead of
-// silently applying an unrelated formula.
-var ROOFLINE_KERNEL_CALCULATORS = {
-  attention: calculateAttentionProjectionWork,
-  indexer: calculateDsaIndexerWork,
-  dense_ffn: calculateDenseFfnWork,
-  moe_gate: calculateMoeRouterWork,
-  moe_routed: calculateMoeExpertsWork,
-  moe_shared: calculateMoeSharedExpertsWork,
-  lm_head: calculateLmHeadWork
-};
-
-/**
- * Orchestrate all per-kernel calculators without owning any kernel formula.
- *
- * Output: {rows, B, T}. Each row keeps display metadata and the common
- * {dec, pre} phase results consumed by the chart, table, and verdict cards.
- */
-function rooflineKernels() {
-  var workload = currentRooflineWorkload();
-  // weight-dtype what-if: an explicit selection replaces each kernel's exact
-  // stored bytes with ideal params × bytes/param at the chosen precision
-  // (same per-element sizes as KV: bf16 2, fp8 1, mxfp4 0.5625 incl. scales).
-  // FLOPs are unchanged; the peak line switches via currentGpuPerf().
-  var wOverride = weightDtypeIsOverride() ? kvBytesPer(weightDtypeNow()) : 0;
-  var rows = (D.kernels || []).map(function (kernel) {
-    var calculate = ROOFLINE_KERNEL_CALCULATORS[kernel.key];
-    if (!calculate) throw new Error('No roofline calculator for kernel: ' + kernel.key);
-    if (wOverride) {
-      kernel = { key: kernel.key, label: kernel.label, color: kernel.color,
-                 kind: kernel.kind, params: kernel.params,
-                 bytes: kernel.params * wOverride };
-    }
-    var work = scaleWorkBytes(calculate(kernel, workload),
-                              kernelBytesReplication(kernel.key, workload));
-    return {
-      key: kernel.key,
-      label: kernel.label,
-      color: kernel.color,
-      kind: kernel.kind,
-      dec: work.dec,
-      pre: work.pre
-    };
-  });
-
-  var attentionCore = scaleWorkBytes(calculateAttentionCoreWork(workload),
-                                     attnCoreKvReplication(workload));
-  rows.push({
-    key: 'attn_core',
-    label: Tr('attnCoreLabel')(),
-    color: C.kv,
-    kind: 'attn',
-    dec: attentionCore.dec,
-    pre: attentionCore.pre
-  });
-
-  if (workload.linStateBytes > 0) {
-    var linearState = calculateLinearStateWork(workload);
-    rows.push({
-      key: 'linear_state',
-      label: Tr('linStateLabel')(),
-      color: C.linState,
-      kind: 'attn',
-      dec: linearState.dec,
-      pre: linearState.pre
-    });
-  }
-
-  return { rows: rows, B: workload.decodeTokens, T: workload.prefillTokens };
-}
-
-// phases we render; PH[i].pick(row) returns that phase's {flops,bytes,intensity,note}
+// phases we render; PH[i].pick(row) returns that phase's server-computed
+// {flops, bytes, intensity, timeMs, noteRefs}
 var PH = [
   { key: 'dec', label: 'Decode', pick: function (r) { return r.dec; } },
   { key: 'pre', label: 'Prefill', pick: function (r) { return r.pre; } }
 ];
 
-function aggregate(rows, phase, label, color) {
-  var f = 0, b = 0;
-  rows.forEach(function (r) { var c = phase.pick(r); f += c.flops; b += c.bytes; });
-  return { label: label, color: color, flops: f, bytes: b, intensity: f / b };
-}
-
-// roofline execution model: kernel time = max(bytes/BW, FLOPs/peak)
-function compTime(c, perf) {
-  return Math.max(c.bytes / (perf.bw * 1e12), c.flops / (perf.peak * 1e12));
-}
-
-function currentGpuPerf() {
-  var inst = el('f-inst').value;
-  if (inst === 'custom' || !D.instances[inst]) return null;
-  var gpu = D.instances[inst].gpu;
-  var perf = D.gpuPerf[gpu];
-  if (!perf) return null;
-  var dt = weightDtypeNow();
-  var peak = perf[dt], usedDt = dt;
-  if (!peak) { peak = perf.bf16; usedDt = 'bf16'; }
-  return { gpu: gpu, peak: peak, bw: perf.bw, dtype: usedDt,
-           fallback: usedDt !== dt ? dt : null };
-}
-
 function drawRoofline(perf, pts) {
-  var W = 860, H = 420, ml = 64, mr = 24, mt = 16, mb = 46;
-  var pw = W - ml - mr, ph = H - mt - mb;
+  var W_ = 860, H = 420, ml = 64, mr = 24, mt = 16, mb = 46;
+  var pw = W_ - ml - mr, ph = H - mt - mb;
   var knee = perf.peak / perf.bw;  // TFLOPs / (TB/s) = FLOPs/byte
   // log-log: x 0.1..10^4 FLOPs/B, y from ~peak/2e4 up to peak*2
   var x0 = Math.log10(0.1), x1 = Math.log10(10000);
@@ -1522,7 +885,7 @@ function drawRoofline(perf, pts) {
   function Y(v) { return mt + (y1 - Math.log10(v)) / (y1 - y0) * ph; }
   function perfAt(i) { return Math.min(i * perf.bw, perf.peak); }
 
-  var s = "<svg viewBox='0 0 " + W + " " + H + "' xmlns='http://www.w3.org/2000/svg'>";
+  var s = "<svg viewBox='0 0 " + W_ + " " + H + "' xmlns='http://www.w3.org/2000/svg'>";
 
   // shaded regions under the roof: memory-bound (left of knee) / compute-bound
   var kx = X(knee), py = Y(perf.peak), by = mt + ph;
@@ -1741,10 +1104,10 @@ function drawRoofline(perf, pts) {
   s += "<g transform='translate(" + (ml + 10) + "," + (mt + 12) + ")'>";
   s += "<circle cx='6' cy='0' r='6' fill='var(--ink2)'/>";
   s += "<text x='18' y='4' fill='var(--ink2)' font-size='11.5'>" +
-       Tr('legendDecode')(+el('f-req').value) + "</text>";
+       Tr('legendDecode')(W.roofline.B) + "</text>";
   s += "<path d='M6,20 L12.5,32 L-0.5,32 Z' fill='var(--ink2)'/>";
   s += "<text x='18' y='31' fill='var(--ink2)' font-size='11.5'>" +
-       Tr('legendPrefill')(fmtNum(chunkTokensNow())) + "</text>";
+       Tr('legendPrefill')(fmtNum(W.roofline.T)) + "</text>";
   s += "</g>";
 
   s += "</svg>";
@@ -1757,13 +1120,12 @@ function drawRoofline(perf, pts) {
 function kernelBars(rows, phase) {
   var items = rows.map(function (r) {
     var c = phase.pick(r);
-    return { label: r.label, color: r.color, flops: c.flops, bytes: c.bytes,
+    return { label: rowLabel(r), color: r.color, flops: c.flops, bytes: c.bytes,
              intensity: c.intensity };
   }).filter(function (it) { return it.flops > 0 || it.bytes > 0; })
     .sort(function (a, b) { return b.flops - a.flops; });
   var maxF = Math.max.apply(null, items.map(function (i) { return i.flops; }).concat([1]));
   var maxB = Math.max.apply(null, items.map(function (i) { return i.bytes; }).concat([1]));
-  var knee = null;
   var rowsHtml = items.map(function (it) {
     var fW = Math.max(1.5, it.flops / maxF * 100);
     var bW = Math.max(1.5, it.bytes / maxB * 100);
@@ -1783,27 +1145,25 @@ function kernelBars(rows, phase) {
 
 // showMs: prefill shows each kernel's roofline time in ms (single GPU, before
 // ÷TP) so the chunk-time formula below the table reads as ∑ rows ÷ TP;
-// decode keeps the relative time-share column.
-function compTableHtml(comps, perf, total, showMs) {
+// decode keeps the relative time-share column. Times come from the server.
+function compTableHtml(comps, phaseAgg, knee, showMs) {
   var totalTime = 0;
-  comps.forEach(function (c) { totalTime += compTime(c, perf); });
+  comps.forEach(function (c) { totalTime += c.timeMs; });
   var rows = comps.map(function (c) {
-    var t = compTime(c, perf);
-    var iv = c.flops / c.bytes;
-    var isMem = iv < perf.peak / perf.bw;
+    var isMem = c.intensity < knee;
     return "<tr><td><i class='dot' style='background:" + c.color + "'></i>" + c.label + "</td>" +
       "<td class='num'>" + (c.flops / 1e12).toFixed(2) + "</td>" +
       "<td class='num'>" + gib(c.bytes) + "</td>" +
-      "<td class='num'>" + fmtNum(iv) + "</td>" +
+      "<td class='num'>" + fmtNum(c.intensity) + "</td>" +
       "<td class='num'>" + (isMem ? Tr('boundByMem')() : Tr('boundByCompute')()) + "</td>" +
-      "<td class='num'><b>" + (showMs ? (t * 1000).toFixed(1) : Math.round(t / totalTime * 100) + "%") + "</b></td>" +
+      "<td class='num'><b>" + (showMs ? c.timeMs.toFixed(1) : Math.round(c.timeMs / totalTime * 100) + "%") + "</b></td>" +
       "<td>" + c.note + "</td></tr>";
   }).join('');
   rows += "<tr class='sep'><td><b>" + Tr('compTblTotal')() + "</b></td>" +
-    "<td class='num'><b>" + (total.flops / 1e12).toFixed(2) + "</b></td>" +
-    "<td class='num'><b>" + gib(total.bytes) + "</b></td>" +
-    "<td class='num'><b>" + fmtNum(total.intensity) + "</b></td><td></td>" +
-    "<td class='num'><b>" + (showMs ? (totalTime * 1000).toFixed(1) : "100%") + "</b></td><td></td></tr>";
+    "<td class='num'><b>" + (phaseAgg.aggFlops / 1e12).toFixed(2) + "</b></td>" +
+    "<td class='num'><b>" + gib(phaseAgg.aggBytes) + "</b></td>" +
+    "<td class='num'><b>" + fmtNum(phaseAgg.aggIntensity) + "</b></td><td></td>" +
+    "<td class='num'><b>" + (showMs ? phaseAgg.sumMs.toFixed(1) : "100%") + "</b></td><td></td></tr>";
   return "<div style='overflow-x:auto'><table style='width:100%'>" +
     "<thead><tr><th>" + Tr('compTblComponent')() + "</th><th class='num'>TFLOPs</th><th class='num'>" + Tr('compTblHbm')() + "</th>" +
     "<th class='num'>" + Tr('compTblIntensity')() + "</th><th class='num'>" + Tr('compTblBoundBy')() +
@@ -1812,34 +1172,34 @@ function compTableHtml(comps, perf, total, showMs) {
     "<tbody>" + rows + "</tbody></table></div>";
 }
 
-// map a phase's kernel rows into the {label,color,flops,bytes,note} shape the
-// table + roofline points want, dropping zero-work kernels
+// map a phase's kernel rows into the shape the table + roofline points want,
+// dropping zero-work kernels; notes are localized from server noteRefs
 function phaseComps(rows, phase) {
   return rows.map(function (r) {
     var c = phase.pick(r);
-    return { label: r.label, color: r.color, flops: c.flops, bytes: c.bytes, note: c.note };
+    return { label: rowLabel(r), color: r.color, flops: c.flops, bytes: c.bytes,
+             intensity: c.intensity, timeMs: c.timeMs, note: noteText(c.noteRefs) };
   }).filter(function (c) { return c.flops > 0 || c.bytes > 0; });
 }
 
-function updateRoofline() {
-  var perf = currentGpuPerf();
-  if (!perf) {
+function renderRoofline() {
+  var R = W.roofline;
+  if (!R) {
     el('roof-title').textContent = Tr('customInstNoSpec')();
     el('roof-svg').innerHTML = '';
     el('roof-note').textContent = Tr('customInstNoSpecNote')();
     el('roof-verdicts').innerHTML = '';
     return;
   }
-  var w = rooflineKernels();
-  var knee = perf.peak / perf.bw;
+  var perf = R.perf, knee = R.knee;
 
   // one roofline point per kernel × phase (decode ●, prefill ▲)
   var pts = [];
-  w.rows.forEach(function (r) {
+  R.rows.forEach(function (r) {
     PH.forEach(function (ph) {
       var c = ph.pick(r);
       if (c.flops <= 0 && c.bytes <= 0) return;
-      pts.push({ label: r.label, color: r.color, phase: ph.key,
+      pts.push({ label: rowLabel(r), color: r.color, phase: ph.key,
                  flops: c.flops, bytes: c.bytes, intensity: c.intensity });
     });
   });
@@ -1848,55 +1208,50 @@ function updateRoofline() {
     perf.peak.toLocaleString('en-US'), perf.bw, perf.fallback ? Tr('roofFallback')(perf.fallback) : '');
   el('roof-svg').innerHTML = drawRoofline(perf, pts);
   el('roof-note').innerHTML = Tr('roofNote')(fmtNum(knee)) +
-    (weightDtypeIsOverride()
-      ? Tr('wdtypeIdealNote')(weightDtypeNow(), kvBytesPer(weightDtypeNow()))
+    (R.wdtypeOverride
+      ? Tr('wdtypeIdealNote')(R.wdtypeOverride, kvBytesPer(R.wdtypeOverride))
       : '');
 
-  var tpNow = +el('f-tp').value || 1;
+  var tpNow = W.echo.tp;
   var vh = "";
 
   // ---- per-phase cards: kernel bar chart (FLOPs & HBM) + table + prescription
   PH.forEach(function (ph) {
-    var comps = phaseComps(w.rows, ph);
-    var agg = aggregate(w.rows, ph, ph.label, ph.key === 'dec' ? C.kv : C.others);
-    var isMem = agg.intensity < knee;
-    var phTime = 0;
-    comps.forEach(function (c) { phTime += compTime(c, perf); });
-    phTime /= tpNow;
+    var comps = phaseComps(R.rows, ph);
+    var pa = R.phases[ph.key];
+    var isMem = pa.isMem;
+    var aggColor = ph.key === 'dec' ? C.kv : C.others;
 
     var badge = "<span class='vbadge' style='background:" +
       (isMem ? 'var(--s6)' : 'var(--s2)') + "'>" +
       (isMem ? 'memory-bound' : 'compute-bound') + " · " +
-      (isMem ? knee / agg.intensity : agg.intensity / knee).toFixed(1) + "×</span>";
+      pa.kneeRatio.toFixed(1) + "×</span>";
 
     var head, foot;
     if (ph.key === 'dec') {
-      var stepMs = phTime * 1000;
-      var tpsPerReq = 1000 / stepMs;
-      head = ph.label + Tr('decodeHeadSuffix')(w.B);
-      foot = Tr('decodeFormula')(gib(agg.bytes), perf.bw, tpNow, stepMs.toFixed(1),
-        fmtNum(tpsPerReq), fmtNum(tpsPerReq * w.B), w.B) +
+      head = ph.label + Tr('decodeHeadSuffix')(R.B);
+      foot = Tr('decodeFormula')(gib(pa.aggBytes), perf.bw, tpNow, pa.phaseMs.toFixed(1),
+        fmtNum(pa.tpsPerReq), fmtNum(pa.tpsGroup), R.B) +
         "<div class='cl'>" + Tr('decodeFootPrefix')() +
         (isMem
-          ? Tr('decodeFootMem')((knee / agg.intensity).toFixed(1))
+          ? Tr('decodeFootMem')(pa.kneeRatio.toFixed(1))
           : Tr('decodeFootCompute')()) +
         "</div>";
     } else {
-      head = ph.label + Tr('prefillHeadSuffix')(fmtNum(w.T));
-      foot = Tr('prefillFormula')((phTime * tpNow * 1000).toFixed(0), (phTime * 1000).toFixed(0),
-        tpNow, ctxLabel(+el('f-ctx').value),
-        (phTime * (+el('f-ctx').value) / w.T).toFixed(1)) +
+      head = ph.label + Tr('prefillHeadSuffix')(fmtNum(R.T));
+      foot = Tr('prefillFormula')(pa.sumMs.toFixed(0), pa.phaseMs.toFixed(0),
+        tpNow, ctxLabel(W.echo.ctx), pa.ttftS.toFixed(1)) +
         "<div class='cl'>" +
         (isMem ? Tr('prefillFootMem')() : Tr('prefillFootCompute')()) +
         Tr('prefillFootTail')() + "</div>";
     }
 
-    vh += "<div class='card' style='border-left-color:" + agg.color + "'>" +
-      "<div class='ch'><i class='dot' style='background:" + agg.color + "'></i>" +
+    vh += "<div class='card' style='border-left-color:" + aggColor + "'>" +
+      "<div class='ch'><i class='dot' style='background:" + aggColor + "'></i>" +
       "<span class='ct'>" + head + "</span>" + badge + "</div>" +
-      "<div class='kbchart'>" + kernelBars(w.rows, ph) + "</div>" +
+      "<div class='kbchart'>" + kernelBars(R.rows, ph) + "</div>" +
       "<details class='ktbl'><summary>" + Tr('kernelDetailsSummary')() + "</summary>" +
-      compTableHtml(comps, perf, agg, ph.key === 'pre') + "</details>" + foot + "</div>";
+      compTableHtml(comps, pa, knee, ph.key === 'pre') + "</details>" + foot + "</div>";
   });
 
   el('roof-verdicts').innerHTML = vh;
@@ -1919,7 +1274,7 @@ function updateRoofline() {
   });
 })();
 
-function updateAll(){ updateEstimate(); updateParallel(); updateRoofline(); }
+function renderAll(){ renderEstimate(); renderParallel(); renderRoofline(); }
 
 function renderKvWarnings(){
   var box = el('kv-warnings');
@@ -1928,21 +1283,21 @@ function renderKvWarnings(){
   box.innerHTML = ws.map(function(w){ return "<div class='kvw'>⚠ "+w+"</div>"; }).join('');
 }
 renderKvWarnings();
-// shared filters drive all tabs; parallel/instance filters drive their tabs
-['f-ctx','f-req','f-kv'].forEach(function(id){
-  el(id).addEventListener('change', updateAll);
+// every control change → one debounced server round-trip → full re-render
+['f-ctx','f-req','f-kv','f-pp','f-ep','f-dp','f-wdtype','f-chunk'].forEach(function(id){
+  el(id).addEventListener('change', refresh);
 });
-['f-pp','f-ep'].forEach(function(id){
-  el(id).addEventListener('change', updateParallel);
+el('f-tp').addEventListener('change', function(){
+  rebuildEpOptions(+el('f-tp').value);   // ep divisors depend on tp
+  refresh();
 });
-el('f-tp').addEventListener('change', function(){ updateParallel(); updateRoofline(); });
-el('f-inst').addEventListener('change', function(){ updateParallel(); updateRoofline(); });
-el('f-dp').addEventListener('change', function(){ updateParallel(); updateRoofline(); });
-el('f-wdtype').addEventListener('change', updateRoofline);
-el('f-chunk').addEventListener('change', updateRoofline);
-el('f-cmem').addEventListener('input', updateParallel);
-el('f-cgpn').addEventListener('input', updateParallel);
-el('f-frac').addEventListener('input', function(){ syncFracLabel(); updateParallel(); });
+el('f-inst').addEventListener('change', function(){
+  el('custom-box').style.display = el('f-inst').value==='custom' ? 'inline-flex' : 'none';
+  refresh();
+});
+el('f-cmem').addEventListener('input', refresh);
+el('f-cgpn').addEventListener('input', refresh);
+el('f-frac').addEventListener('input', function(){ syncFracLabel(); refresh(); });
 function syncFracLabel(){ setText('f-frac-val', (+el('f-frac').value).toFixed(2)); }
 syncFracLabel();
 rebuildEpOptions(+el('f-tp').value);
@@ -1951,8 +1306,8 @@ if (D.nMoe){ el('f-ep').value = String(EP_INIT); }
 /* ========================= language switcher ========================= */
 // Static, Python-rendered fragments (cards, structure diagrams, table rows,
 // bar labels, chrome text) are swapped wholesale from D.frags[lang]; dynamic
-// numbers (KV/parallel/roofline) are re-derived by updateAll() below, which
-// already reads every string through Tr() and so picks up D.lang for free.
+// numbers (KV/parallel/roofline) are re-rendered from the current payload W by
+// renderAll() below — no refetch needed, every string goes through Tr().
 var FRAG_IDS = {
   'tab-evidence': 'evidence',
   'h-title': 'title', 'h-subtitle': 'subtitle', 'h-meta': 'meta',
@@ -2008,7 +1363,7 @@ function setLang(lang){
   applyLangFragments(lang);
   syncLangButtons(lang);
   try { localStorage.setItem('vram-estimate-lang', lang); } catch (e) {}
-  updateAll();
+  renderAll();
 }
 function syncLangButtons(lang){
   ['zh','en'].forEach(function(l){
@@ -2032,4 +1387,4 @@ if (typeof location !== 'undefined') {
   syncLangButtons(D.lang);
 }
 
-updateAll();
+renderAll();

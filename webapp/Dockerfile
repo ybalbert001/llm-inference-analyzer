@@ -4,8 +4,6 @@ WORKDIR /app
 COPY webapp/requirements.txt webapp/requirements.txt
 RUN pip install --no-cache-dir -r webapp/requirements.txt
 
-# read-only dependency: the skill's scripts
-COPY skills/llm-inference-analyzer skills/llm-inference-analyzer
 COPY webapp webapp
 
 ENV PORT=8000

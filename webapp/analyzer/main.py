@@ -1880,63 +1880,44 @@ def render_html(a: dict, out_path: str, ctx_options: list, req_options: list,
         fr["instance_options"] += f"<option value='custom'>{t('html.instance_custom')}</option>"
     set_lang(display_lang)
 
+    # ---- initial what-if payload: the page's first paint renders this baked
+    # combination; every control change afterwards refetches /api/v1/whatif.
+    # Lazy import: engine imports this module back at module load.
+    import engine
+    D0 = engine.deploy_data(a, cfg)
+    fixed_gib = pargs.fixed_overhead_gib if pargs else 1.0
+    D0["fixedGib"] = fixed_gib
+    inst_spec = (instances or {}).get(inst_init) or {"gpu": None, "count": 8, "memGib": 80}
+    P0 = {"tp": tp_init, "pp": pp_init, "ep": ep_init, "dpAttn": False,
+          "memGib": inst_spec["memGib"], "gpn": inst_spec["count"],
+          "ctx": a["ctx"], "req": a["requests"], "kvDtype": a["kv_dtype"],
+          "frac": pargs.mem_fraction_static if pargs else 0.9,
+          "fixedGib": fixed_gib}
+    whatif0 = engine.whatif_payload(a, cfg, D0, P0, inst_spec["gpu"],
+                                    a["batch_tokens"])
+
     viz = {
-        # shared
+        # shared chrome / static-fragment state
         "lang": display_lang,
         "frags": frags,
-        "L": L,
-        "nKvLayers": a["kv_struct"]["n_kv_layers"],   # full-attn layers that hold paged KV
-        "kvGroups": a["kv_struct"]["kv_groups"],       # [[count, window], ...] storage groups
-        "linLayers": a["kv_struct"]["linear_layers"],
-        "linStateBytes": a["kv_struct"]["lin_state_per_req"],  # fixed state per request, all linear layers
-        "readCap": a["kv_struct"]["read_cap"],         # decode per-layer read cap (0=full ctx)
-        "readCapLayers": a["kv_struct"]["read_cap_layers"],
+        "model": a["model_id"],
+        "whatif0": whatif0,
         "kvWarnings": a.get("weight_warnings", []) + a["kv_struct"]["warnings"],
-        "kvElemsPerLayer": elems_per_layer,
-        "kvIndexerBytes": a.get("kv_indexer_bytes", 0),  # DSA index cache, bytes/token/layer, kv-dtype-independent
-        "kvAuto": kv_auto,                # what "auto" resolves to for this model
-        "kvChoice": kv_choice,
-        "actBytes": a["act_total"],
-        "overhead": a["overhead"],
+        # model constants the renderer needs between payloads (labels, legend
+        # visibility, and the static segments of the estimate bar)
         "weightsBytes": a["total_bytes"],
-        # estimate tab
+        "actBytes": a["act_total"],
+        "visionActBytes": a.get("vision_act", 0),
+        "overhead": a["overhead"],
         "weightsSlot": 3 if is_moe else 2,
-        "mhaRatio": a["mha_ratio"],
-        # parallel tab
-        "nDense": p["dense_layers"], "nMoe": p["moe_layers"],
-        "nExperts": n_routed or 0,
-        "topk": cfg.get("num_experts_per_tok", 0),
-        "layer": layer,
-        "embed": next((c["bytes"] for c in a["comps"] if c["key"] == "embed"), 0),
-        "lmHead": next((c["bytes"] for c in a["comps"] if c["key"] == "lm_head"), 0),
-        "tied": bool(cfg.get("tie_word_embeddings")),
+        "nMoe": p["moe_layers"],
+        "kvGroups": a["kv_struct"]["kv_groups"],   # sliding-legend visibility
+        "linStateBytes": a["kv_struct"]["lin_state_per_req"],
         "kvIsMla": bool(p["is_mla"]),
         "kvNKvHeads": cfg.get("num_key_value_heads", cfg["num_attention_heads"]),
-        "fixedGib": pargs.fixed_overhead_gib if pargs else 1.0,
-        # SGLang load-time weight materializations (bytes, full/unsharded):
-        # MLA w_kc/w_vc bf16 per layer; NextN draft's own bf16 embed. Both
-        # shard by attn-TP: /tp in pure TP, full copy under dp-attention.
-        "absorbPerLayer": a.get("absorb_per_layer", 0),
-        "draftEmbedBytes": a.get("draft_embed_bytes", 0),
-        # vision tower + projector (VLMs): SGLang shards only VisionAttention's
-        # qkv/o by attn-TP; the ViT MLP (plain nn.Linear) and the projector
-        # (ReplicatedLinear) are one full copy per rank.
-        "visionBytes": next((c["bytes"] for c in a["comps"] if c["key"] == "vision"), 0),
-        "visionAttnFrac": (round(a["vision"]["attn_params"] / a["vision"]["params"], 4)
-                           if a.get("vision") else 0),
-        "visionActBytes": a.get("vision_act", 0),
-        "instances": instances or {},
-        # roofline tab
-        "activeParams": a["active"] or a["total_params"],
-        "totalParams": a["total_params"],
+        "fixedGib": fixed_gib,
         "batchTokens": a["batch_tokens"],
-        "moeRoutedBytes": next((c["bytes"] for c in a["comps"] if c["key"] == "moe_routed"), 0),
-        "moeRoutedParams": next((c["params"] for c in a["comps"] if c["key"] == "moe_routed"), 0),
-        "weightDtype": ("fp4" if "fp4" in a["wname"] else
-                        "fp8" if "fp8" in a["wname"] else "bf16"),
-        "gpuPerf": GPU_PERF,
-        "kernels": roofline_kernels(a, cfg),
-        "attentionCore": attention_core_spec(cfg),
+        "instances": instances or {},
     }
     viz_json = json.dumps(viz)
 

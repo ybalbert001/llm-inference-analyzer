@@ -31,13 +31,13 @@
 
 ```bash
 # 终端报告,默认 128K context × 16 并发
-python3 scripts/main.py zai-org/GLM-5.2-FP8
+python3 webapp/analyzer/main.py zai-org/GLM-5.2-FP8
 
 # 完整三 TAB HTML 报告
-python3 scripts/main.py deepseek-ai/DeepSeek-V4-Flash --html dsv4.html
+python3 webapp/analyzer/main.py deepseek-ai/DeepSeek-V4-Flash --html dsv4.html
 
 # 自定义部署形态
-python3 scripts/main.py Qwen/Qwen3-32B --context 32768 --requests 64 \
+python3 webapp/analyzer/main.py Qwen/Qwen3-32B --context 32768 --requests 64 \
     --tp 4 --instance p5.48xlarge --kv-dtype fp8 --html qwen.html
 ```
 

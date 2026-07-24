@@ -31,13 +31,13 @@ Why this works: the first two sources are independent and can be **reconciled** 
 
 ```bash
 # Terminal report, defaults: 128K context × 16 concurrent requests
-python3 scripts/main.py zai-org/GLM-5.2-FP8
+python3 webapp/analyzer/main.py zai-org/GLM-5.2-FP8
 
 # Full interactive 3-tab HTML report
-python3 scripts/main.py deepseek-ai/DeepSeek-V4-Flash --html dsv4.html
+python3 webapp/analyzer/main.py deepseek-ai/DeepSeek-V4-Flash --html dsv4.html
 
 # Custom deployment shape
-python3 scripts/main.py Qwen/Qwen3-32B --context 32768 --requests 64 \
+python3 webapp/analyzer/main.py Qwen/Qwen3-32B --context 32768 --requests 64 \
     --tp 4 --instance p5.48xlarge --kv-dtype fp8 --html qwen.html
 ```
 
