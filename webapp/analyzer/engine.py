@@ -240,27 +240,41 @@ def _gib(b: float) -> float:
     return round(b / GIB, 2)
 
 
+def _parallel_compute(D: dict, P: dict) -> dict | None:
+    """Per-stage memory + cluster aggregates for one deployment shape — the
+    single computation behind parallel_verdict() (prose) and whatif_payload()
+    (renderer shape). Returns None when pp exceeds the layer count."""
+    if P["pp"] > D["L"]:
+        return None
+    stages = [gpu_memory(D, P, s) for s in range(P["pp"])]
+    return {
+        "stages": stages,
+        "world": P["tp"] * P["pp"],
+        "oom": sum(1 for m in stages for _ in range(P["tp"])
+                   if not m["canStart"] or m["free"] < 0),
+        "all_start": all(m["canStart"] for m in stages),
+        "kv_fits": all(m["canStart"] and m["kv"] <= m["kvCap"] for m in stages),
+        "max_used": max(m["used"] for m in stages),
+        "cluster_weights": sum(m["weights"] for m in stages) * P["tp"],
+        "cluster_kv": sum(m["kv"] for m in stages) * P["tp"],
+        "kv_single": kv_cell_bytes(D, P["kvDtype"])
+                     * kv_layer_tokens(D, P["ctx"]) * P["req"],
+        "min_max_req": min((m["maxReq"] for m in stages if m["canStart"]), default=0),
+        "min_max_tok": min((m["maxTokens"] for m in stages if m["canStart"]), default=0),
+    }
+
+
 def parallel_verdict(D: dict, P: dict) -> dict:
     """Full fit verdict for one deployment shape — the parallel tab's summary
     numbers as structured data."""
-    if P["pp"] > D["L"]:
+    pc = _parallel_compute(D, P)
+    if pc is None:
         return {"error": f"pp({P['pp']}) exceeds layer count {D['L']}"}
-
-    stages = [gpu_memory(D, P, s) for s in range(P["pp"])]
-    world = P["tp"] * P["pp"]
-    cap = P["memGib"] * GIB
-
-    oom = sum(1 for m in stages for _ in range(P["tp"])
-              if not m["canStart"] or m["free"] < 0)
-    all_start = all(m["canStart"] for m in stages)
-    kv_fits = all_start and all(m["kv"] <= m["kvCap"] for m in stages)
-    max_used = max(m["used"] for m in stages)
-    cluster_weights = sum(m["weights"] for m in stages) * P["tp"]
-    cluster_kv = sum(m["kv"] for m in stages) * P["tp"]
-    kv_single = kv_cell_bytes(D, P["kvDtype"]) * kv_layer_tokens(D, P["ctx"]) * P["req"]
-
-    min_max_req = min((m["maxReq"] for m in stages if m["canStart"]), default=0)
-    min_max_tok = min((m["maxTokens"] for m in stages if m["canStart"]), default=0)
+    stages = pc["stages"]
+    world, oom, all_start, kv_fits = pc["world"], pc["oom"], pc["all_start"], pc["kv_fits"]
+    max_used, cluster_weights, cluster_kv = pc["max_used"], pc["cluster_weights"], pc["cluster_kv"]
+    kv_single = pc["kv_single"]
+    min_max_req, min_max_tok = pc["min_max_req"], pc["min_max_tok"]
     dp_mult = P["tp"] if P["dpAttn"] else 1
 
     if P["dpAttn"]:
@@ -552,6 +566,30 @@ def _resolve_perf(gpu_name: str | None, D: dict,
             "dtype": used_dt, "fallback": dt if used_dt != dt else None}
 
 
+def _comp_time_s(c: dict, perf: dict) -> float:
+    """Roofline execution model: kernel time = max(bytes/BW, FLOPs/peak).
+    THE single definition — every consumer times kernels through this."""
+    return max(c["bytes"] / (perf["bw"] * 1e12), c["flops"] / (perf["peak"] * 1e12))
+
+
+def _phase_aggregate(comps: list, perf: dict, tp: int) -> dict:
+    """Aggregate one phase's kernels: totals, bound verdict, and the ÷TP phase
+    time. Shared by roofline_verdict() and whatif_payload() so the execution
+    model cannot drift between the JSON API and the report page."""
+    knee = perf["peak"] / perf["bw"]
+    agg_f = sum(c["flops"] for c in comps)
+    agg_b = sum(c["bytes"] for c in comps)
+    intensity = agg_f / agg_b if agg_b else 0
+    sum_s = sum(_comp_time_s(c, perf) for c in comps)
+    return {
+        "agg_flops": agg_f, "agg_bytes": agg_b, "intensity": intensity,
+        "is_mem": intensity < knee,
+        "knee_ratio": (knee / intensity if intensity < knee
+                       else intensity / knee) if intensity else 0,
+        "sum_s": sum_s, "phase_s": sum_s / tp,
+    }
+
+
 def roofline_verdict(a: dict, cfg: dict, D: dict, P: dict,
                      gpu_name: str, chunk_tokens: int,
                      weight_dtype: str | None = None) -> dict | None:
@@ -567,9 +605,6 @@ def roofline_verdict(a: dict, cfg: dict, D: dict, P: dict,
 
     rows, wl, w_override = _build_roofline_rows(a, cfg, D, P, chunk_tokens, weight_dtype)
 
-    def comp_time(c):  # roofline execution model
-        return max(c["bytes"] / (bw * 1e12), c["flops"] / (peak * 1e12))
-
     out = {"gpu": gpu_name, "peak_tflops": peak, "peak_dtype": used_dt,
            "hbm_tbs": bw, "knee_flops_per_byte": round(knee, 1),
            "tp": P["tp"], "dp_attention": P["dpAttn"],
@@ -580,25 +615,21 @@ def roofline_verdict(a: dict, cfg: dict, D: dict, P: dict,
     for ph, label in (("dec", "decode"), ("pre", "prefill")):
         comps = [{"label": r["label"], "key": r["key"], **r[ph]} for r in rows
                  if r[ph]["flops"] > 0 or r[ph]["bytes"] > 0]
-        agg_f = sum(c["flops"] for c in comps)
-        agg_b = sum(c["bytes"] for c in comps)
-        intensity = agg_f / agg_b if agg_b else 0
-        is_mem = intensity < knee
-        ph_time = sum(comp_time(c) for c in comps) / P["tp"]
-        total_t = sum(comp_time(c) for c in comps)
+        agg = _phase_aggregate(comps, perf, P["tp"])
+        is_mem, ph_time, total_t = agg["is_mem"], agg["phase_s"], agg["sum_s"]
         kernels = [{
             "kernel": c["label"], "tflops": round(c["flops"] / 1e12, 3),
             "hbm_gib": _gib(c["bytes"]),
             "intensity": round(c["intensity"], 1),
             "bound": "memory" if c["intensity"] < knee else "compute",
-            "time_share_pct": round(comp_time(c) / total_t * 100, 1) if total_t else 0,
+            "time_share_pct": round(_comp_time_s(c, perf) / total_t * 100, 1) if total_t else 0,
             "note": c["note"],
         } for c in comps]
 
         entry = {
             "bound": "memory" if is_mem else "compute",
-            "aggregate_intensity": round(intensity, 1),
-            "knee_ratio": round(knee / intensity if is_mem else intensity / knee, 2),
+            "aggregate_intensity": round(agg["intensity"], 1),
+            "knee_ratio": round(agg["knee_ratio"], 2),
             "kernels": kernels,
         }
         if ph == "dec":
@@ -704,39 +735,28 @@ def whatif_payload(a: dict, cfg: dict, D: dict, P: dict,
         "mhaTotal": kv_total * a["mha_ratio"] if a.get("mha_ratio") else None,
     }
 
-    # ---- parallel tab
-    if P["pp"] > D["L"]:
+    # ---- parallel tab (same _parallel_compute core as parallel_verdict)
+    pc = _parallel_compute(D, P)
+    if pc is None:
         parallel = {"error": "ppExceeds", "pp": P["pp"], "L": D["L"]}
     else:
-        stages = [gpu_memory(D, P, s) for s in range(P["pp"])]
-        world = P["tp"] * P["pp"]
-        experts = [_expert_info(D, P, t) for t in range(P["tp"])]
-        cluster_weights = sum(m["weights"] for m in stages) * P["tp"]
-        cluster_kv = sum(m["kv"] for m in stages) * P["tp"]
-        kv_single = cell * kv_layer_tokens(D, P["ctx"]) * P["req"]
-        oom = sum(1 for m in stages for _ in range(P["tp"])
-                  if not m["canStart"] or m["free"] < 0)
-        all_start = all(m["canStart"] for m in stages)
         parallel = {
-            "stages": stages, "experts": experts, "world": world,
-            "clusterWeights": cluster_weights, "clusterKv": cluster_kv,
-            "kvSingle": kv_single, "oomTotal": oom, "allStart": all_start,
-            "maxUsed": max(m["used"] for m in stages),
-            "minMaxReq": min((m["maxReq"] for m in stages if m["canStart"]), default=0),
-            "minMaxTok": min((m["maxTokens"] for m in stages if m["canStart"]), default=0),
+            "stages": pc["stages"],
+            "experts": [_expert_info(D, P, t) for t in range(P["tp"])],
+            "world": pc["world"],
+            "clusterWeights": pc["cluster_weights"], "clusterKv": pc["cluster_kv"],
+            "kvSingle": pc["kv_single"], "oomTotal": pc["oom"],
+            "allStart": pc["all_start"], "maxUsed": pc["max_used"],
+            "minMaxReq": pc["min_max_req"], "minMaxTok": pc["min_max_tok"],
         }
 
-    # ---- roofline tab
+    # ---- roofline tab (same _comp_time_s/_phase_aggregate core as roofline_verdict)
     perf = _resolve_perf(gpu_name, D, weight_dtype)
     roofline = None
     if perf:
-        peak, bw = perf["peak"], perf["bw"]
-        knee = peak / bw
+        knee = perf["peak"] / perf["bw"]
         rows, wl, w_override = _build_roofline_rows(a, cfg, D, P, chunk_tokens,
                                                     weight_dtype)
-
-        def comp_time(c):
-            return max(c["bytes"] / (bw * 1e12), c["flops"] / (peak * 1e12))
 
         out_rows, phases = [], {}
         for r in rows:
@@ -745,21 +765,18 @@ def whatif_payload(a: dict, cfg: dict, D: dict, P: dict,
                 c = r[ph]
                 entry[ph] = {"flops": c["flops"], "bytes": c["bytes"],
                              "intensity": c["intensity"],
-                             "timeMs": comp_time(c) * 1000,
+                             "timeMs": _comp_time_s(c, perf) * 1000,
                              "noteRefs": _note_refs(r, ph, wl)}
             out_rows.append(entry)
         for ph in ("dec", "pre"):
             comps = [r[ph] for r in out_rows
                      if r[ph]["flops"] > 0 or r[ph]["bytes"] > 0]
-            agg_f = sum(c["flops"] for c in comps)
-            agg_b = sum(c["bytes"] for c in comps)
-            intensity = agg_f / agg_b if agg_b else 0
-            sum_ms = sum(c["timeMs"] for c in comps)
-            ph_ms = sum_ms / P["tp"]
-            e = {"aggFlops": agg_f, "aggBytes": agg_b, "aggIntensity": intensity,
-                 "isMem": intensity < knee, "sumMs": sum_ms, "phaseMs": ph_ms,
-                 "kneeRatio": (knee / intensity if intensity < knee
-                               else intensity / knee) if intensity else 0}
+            agg = _phase_aggregate(comps, perf, P["tp"])
+            ph_ms = agg["phase_s"] * 1000
+            e = {"aggFlops": agg["agg_flops"], "aggBytes": agg["agg_bytes"],
+                 "aggIntensity": agg["intensity"], "isMem": agg["is_mem"],
+                 "sumMs": agg["sum_s"] * 1000, "phaseMs": ph_ms,
+                 "kneeRatio": agg["knee_ratio"]}
             if ph == "dec":
                 e["tpsPerReq"] = 1000 / ph_ms if ph_ms else 0
                 e["tpsGroup"] = (1000 / ph_ms) * wl["B"] if ph_ms else 0

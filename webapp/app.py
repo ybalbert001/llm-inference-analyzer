@@ -203,15 +203,22 @@ executor = ThreadPoolExecutor(max_workers=2)
 tasks: dict[str, dict] = {}  # task_id -> {status, slug, error, model_id, lang}
 tasks_lock = threading.Lock()
 rate: dict[str, list[float]] = {}
+rate_lock = threading.Lock()  # mutated from the event loop AND sync worker threads
 
 
-def check_rate(username: str) -> None:
+def check_rate(key: str, per_hour: int = GENERATES_PER_HOUR,
+               what: str = "generates") -> None:
+    """Sliding-window rate limit shared by all endpoints (key = user or ip)."""
     cutoff = time.time() - 3600
-    stamps = [t for t in rate.get(username, []) if t > cutoff]
-    if len(stamps) >= GENERATES_PER_HOUR:
-        raise HTTPException(429, f"rate limit: {GENERATES_PER_HOUR} generates/hour")
-    stamps.append(time.time())
-    rate[username] = stamps
+    with rate_lock:
+        stamps = [t for t in rate.get(key, []) if t > cutoff]
+        if len(stamps) >= per_hour:
+            raise HTTPException(429, f"rate limit: {per_hour} {what}/hour")
+        stamps.append(time.time())
+        rate[key] = stamps
+        if len(rate) > 10_000:  # prune long-dead keys (one-off IPs)
+            for k in [k for k, v in rate.items() if not v or v[-1] < cutoff]:
+                del rate[k]
 
 
 def run_generation(task_id: str, model_id: str, lang: str, username: str) -> None:
@@ -278,16 +285,7 @@ async def api_generate(request: Request):
 
     check_rate(username)
     log_access(username, "generate", model_id)
-
-    with tasks_lock:
-        for tid, t in tasks.items():
-            if t["model_id"] == model_id and t["lang"] == lang and t["status"] in ("pending", "running"):
-                return {"status": "queued", "task_id": tid}
-        task_id = secrets.token_urlsafe(8)
-        tasks[task_id] = {"status": "pending", "model_id": model_id, "lang": lang,
-                          "slug": None, "error": None}
-    executor.submit(run_generation, task_id, model_id, lang, username)
-    return {"status": "queued", "task_id": task_id}
+    return _queue_report(model_id, lang, username, force=force)
 
 
 @app.get("/api/tasks/{task_id}")
@@ -439,21 +437,66 @@ def _resolve_hardware(instance: str | None, gpu: str | None,
 
 
 def _queue_report(model_id: str, lang: str, username: str,
-                  force: bool = False) -> None:
-    """Fire-and-forget default-report generation so report_url resolves.
-    force=True regenerates even when a (stale) report exists."""
+                  force: bool = False) -> dict:
+    """Queue default-report generation (dedups against in-flight tasks).
+    force=True regenerates even when a (stale) report exists. Returns the
+    same {status, ...} shape /api/generate responds with."""
     slug = slug_for(model_id, lang)
     if not force and (REPORTS_DIR / f"{slug}.html").exists():
-        return
+        return {"status": "cached", "slug": slug}
     with tasks_lock:
-        for t in tasks.values():
+        for tid, t in tasks.items():
             if t["model_id"] == model_id and t["lang"] == lang \
                     and t["status"] in ("pending", "running"):
-                return
+                return {"status": "queued", "task_id": tid}
         task_id = secrets.token_urlsafe(8)
         tasks[task_id] = {"status": "pending", "model_id": model_id, "lang": lang,
                           "slug": None, "error": None}
     executor.submit(run_generation, task_id, model_id, lang, username)
+    return {"status": "queued", "task_id": task_id}
+
+
+def _prepare_analysis(request: Request, *, model: str, context: int, requests: int,
+                      kv_dtype: str, tp: int, pp: int, ep: int | None,
+                      dp_attention: bool, instance: str | None, gpu: str | None,
+                      gpu_mem_gib: float | None, gpus_per_node: int,
+                      mem_fraction_static: float, fixed_overhead_gib: float,
+                      batch_tokens: int, weight_dtype: str | None,
+                      rate_prefix: str, rate_limit: int,
+                      rate_what: str) -> tuple:
+    """Validate + rate-limit + load + analyze — the shared front half of
+    /api/v1/analyze and /api/v1/whatif. Returns (a, cfg, D, P, hw,
+    weight_warnings). Any rule about resolving parameters into the engine's
+    D/P contract lives HERE, once."""
+    if not MODEL_ID_RE.match(model):
+        raise HTTPException(400, "invalid model id (expected org/name)")
+    if kv_dtype not in KV_DTYPES:
+        raise HTTPException(400, f"kv_dtype must be one of {KV_DTYPES}")
+    if weight_dtype and weight_dtype not in WEIGHT_DTYPES:
+        raise HTTPException(400, f"weight_dtype must be one of {WEIGHT_DTYPES}")
+    hw = _resolve_hardware(instance, gpu, gpu_mem_gib, gpus_per_node)
+
+    ip = request.client.host if request.client else "unknown"
+    check_rate(f"{rate_prefix}:{ip}", rate_limit, rate_what)
+
+    try:
+        cfg, catalog, weight_warnings = _load_model(model)
+    except Exception as exc:  # noqa: BLE001 — nonexistent/gated/network
+        raise HTTPException(
+            404, f"cannot fetch {model} from huggingface.co ({exc}); nonexistent or "
+                 f"gated models are not supported") from exc
+
+    kv_effective = engine.resolve_kv_auto(cfg) if kv_dtype == "auto" else kv_dtype
+    a = core.analyze(model, cfg, context, requests, kv_effective,
+                     batch_tokens, 0.05, catalog=catalog)
+    D = engine.deploy_data(a, cfg)
+    D["fixedGib"] = fixed_overhead_gib
+    P = {"tp": tp, "pp": pp, "ep": ep or tp,
+         "dpAttn": dp_attention and engine.dp_available(D, tp),
+         "memGib": hw["memGib"], "gpn": hw["gpn"], "ctx": context, "req": requests,
+         "kvDtype": kv_effective, "frac": mem_fraction_static,
+         "fixedGib": fixed_overhead_gib}
+    return a, cfg, D, P, hw, weight_warnings
 
 
 @app.get("/api/v1/analyze")
@@ -478,46 +521,19 @@ def api_v1_analyze(  # sync def: FastAPI runs it in a worker thread (blocking HF
     weight_dtype: str | None = Query(None, description="roofline what-if override"),
     lang: str = Query("zh", description="language of the linked HTML report"),
 ):
-    if not MODEL_ID_RE.match(model):
-        raise HTTPException(400, "invalid model id (expected org/name)")
-    if kv_dtype not in KV_DTYPES:
-        raise HTTPException(400, f"kv_dtype must be one of {KV_DTYPES}")
-    if weight_dtype and weight_dtype not in WEIGHT_DTYPES:
-        raise HTTPException(400, f"weight_dtype must be one of {WEIGHT_DTYPES}")
     if lang not in LANGS:
         raise HTTPException(400, "lang must be zh or en")
-    hw = _resolve_hardware(instance, gpu, gpu_mem_gib, gpus_per_node)
-
+    a, cfg, D, P, hw, weight_warnings = _prepare_analysis(
+        request, model=model, context=context, requests=requests,
+        kv_dtype=kv_dtype, tp=tp, pp=pp, ep=ep, dp_attention=dp_attention,
+        instance=instance, gpu=gpu, gpu_mem_gib=gpu_mem_gib,
+        gpus_per_node=gpus_per_node, mem_fraction_static=mem_fraction_static,
+        fixed_overhead_gib=fixed_overhead_gib, batch_tokens=batch_tokens,
+        weight_dtype=weight_dtype,
+        rate_prefix="api", rate_limit=API_PER_HOUR, rate_what="analyses per IP")
     ip = request.client.host if request.client else "unknown"
-    cutoff = time.time() - 3600
-    key = f"api:{ip}"
-    stamps = [t for t in rate.get(key, []) if t > cutoff]
-    if len(stamps) >= API_PER_HOUR:
-        raise HTTPException(429, f"rate limit: {API_PER_HOUR} analyses/hour per IP")
-    stamps.append(time.time())
-    rate[key] = stamps
-
-    try:
-        cfg, catalog, weight_warnings = _load_model(model)
-    except Exception as exc:  # noqa: BLE001 — nonexistent/gated/network
-        raise HTTPException(
-            404, f"cannot fetch {model} from huggingface.co ({exc}); nonexistent or "
-                 f"gated models are not supported") from exc
     log_access(f"api:{ip}", "analyze", model)
-
-    kv_auto = engine.resolve_kv_auto(cfg)
-    kv_effective = kv_auto if kv_dtype == "auto" else kv_dtype
-    ep_effective = ep or tp
-
-    a = core.analyze(model, cfg, context, requests, kv_effective,
-                     batch_tokens, 0.05, catalog=catalog)
-    D = engine.deploy_data(a, cfg)
-    D["fixedGib"] = fixed_overhead_gib
-    dp_effective = dp_attention and engine.dp_available(D, tp)
-    P = {"tp": tp, "pp": pp, "ep": ep_effective, "dpAttn": dp_effective,
-         "memGib": hw["memGib"], "gpn": hw["gpn"], "ctx": context, "req": requests,
-         "kvDtype": kv_effective, "frac": mem_fraction_static,
-         "fixedGib": fixed_overhead_gib}
+    kv_effective, ep_effective, dp_effective = P["kvDtype"], P["ep"], P["dpAttn"]
 
     parallel = engine.parallel_verdict(D, P)
     sweep = engine.tp_sweep(D, P, hw["gpn"])
@@ -626,40 +642,15 @@ def api_v1_whatif(  # sync def: worker thread (config fetch may block on first h
     numbers all three dynamic tabs need. Same knobs as /api/v1/analyze but
     the response is renderer-shaped (template.js field names) and skips the
     prose/sweep sections. Anonymous; report pages call it same-origin on
-    every dropdown change."""
-    if not MODEL_ID_RE.match(model):
-        raise HTTPException(400, "invalid model id")
-    if kv_dtype not in KV_DTYPES:
-        raise HTTPException(400, f"kv_dtype must be one of {KV_DTYPES}")
-    if weight_dtype and weight_dtype not in WEIGHT_DTYPES:
-        raise HTTPException(400, f"weight_dtype must be one of {WEIGHT_DTYPES}")
-    hw = _resolve_hardware(instance, gpu, gpu_mem_gib, gpus_per_node)
-
-    # dropdown exploration fires many small calls — generous separate bucket
-    ip = request.client.host if request.client else "unknown"
-    key = f"whatif:{ip}"
-    cutoff = time.time() - 3600
-    stamps = [t for t in rate.get(key, []) if t > cutoff]
-    if len(stamps) >= API_PER_HOUR * 10:
-        raise HTTPException(429, "rate limit")
-    stamps.append(time.time())
-    rate[key] = stamps
-
-    try:
-        cfg, catalog, _ = _load_model(model)
-    except Exception as exc:  # noqa: BLE001
-        raise HTTPException(404, f"cannot fetch {model} ({exc})") from exc
-
-    kv_effective = engine.resolve_kv_auto(cfg) if kv_dtype == "auto" else kv_dtype
-    a = core.analyze(model, cfg, context, requests, kv_effective,
-                     batch_tokens, 0.05, catalog=catalog)
-    D = engine.deploy_data(a, cfg)
-    D["fixedGib"] = fixed_overhead_gib
-    P = {"tp": tp, "pp": pp, "ep": ep or tp,
-         "dpAttn": dp_attention and engine.dp_available(D, tp),
-         "memGib": hw["memGib"], "gpn": hw["gpn"], "ctx": context,
-         "req": requests, "kvDtype": kv_effective,
-         "frac": mem_fraction_static, "fixedGib": fixed_overhead_gib}
+    every dropdown change — hence the generous separate rate bucket."""
+    a, cfg, D, P, hw, _ = _prepare_analysis(
+        request, model=model, context=context, requests=requests,
+        kv_dtype=kv_dtype, tp=tp, pp=pp, ep=ep, dp_attention=dp_attention,
+        instance=instance, gpu=gpu, gpu_mem_gib=gpu_mem_gib,
+        gpus_per_node=gpus_per_node, mem_fraction_static=mem_fraction_static,
+        fixed_overhead_gib=fixed_overhead_gib, batch_tokens=batch_tokens,
+        weight_dtype=weight_dtype,
+        rate_prefix="whatif", rate_limit=API_PER_HOUR * 10, rate_what="what-ifs per IP")
     return JSONResponse(engine.whatif_payload(
         a, cfg, D, P, hw["gpu"], chunk_tokens or batch_tokens, weight_dtype))
 

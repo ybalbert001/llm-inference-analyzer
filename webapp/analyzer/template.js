@@ -69,10 +69,6 @@ var I18N = {
         '（建议部署时显式设 --max-mamba-cache-size）';
     },
     kvSlidingLegend: function () { return 'KV 需求：滑窗层（bullet 条浅色段）'; },
-    kvUtilLine: function (d, c, pct, maxTok, ctxLbl, maxReq) {
-      return 'KV 需求 <b>' + d + '</b> / 容量 <b>' + c + '</b> GiB（<b>' + pct + '%</b>）· 池容量 ≈ <b>' +
-        maxTok + '</b> tokens（≈ ' + maxReq + ' 个 ' + ctxLbl + ' 满 context 请求）';
-    },
     kvReqExprDp: function (req, dp) { return req + ' 并发 ÷ DP' + dp; },
     kvReqExprAll: function (req) { return req + ' 并发'; },
     kvUtilNoteDp: function (dp, clusterReq) {
@@ -115,7 +111,6 @@ var I18N = {
     },
     oomPartOom: function (count) { return '　·　⚠ ' + count + ' 卡不足'; },
     oomPartOk: function () { return '　·　全部放得下'; },
-    kvCacheLegendLabel: function (kvDtype) { return 'KV cache（' + kvDtype + '）'; },
     kvNoteDpOn: function () { return 'DP attention 开启：KV 按 TP 切，无复制'; },
     kvNoteMlaRepl: function (kvRepl, clusterKvGib) {
       return '<b>MLA latent 无 head 维：KV 每卡全量复制，集群共 ' + kvRepl + '× 单份 KV（' + clusterKvGib +
@@ -146,7 +141,6 @@ var I18N = {
     },
     denseDecodeNote: function (ctxLbl) { return '每请求读取完整 ' + ctxLbl + ' context'; },
     densePrefillNote: function () { return 'chunk 内 dense causal attention；HBM 按 KV 一次读取/写入的理想下界'; },
-    dsaLabel: function (topk) { return 'DSA top-' + topk; },
     dsaDecodeNote: function (ctxLbl, attended) {
       return '每请求从 ' + ctxLbl + ' context 读取 top-' + attended + ' selected KV；indexer full-context 检索当前未建模';
     },
@@ -273,10 +267,6 @@ var I18N = {
         '(set --max-mamba-cache-size explicitly when deploying)';
     },
     kvSlidingLegend: function () { return 'KV demand: sliding layers (light segment on bullet)'; },
-    kvUtilLine: function (d, c, pct, maxTok, ctxLbl, maxReq) {
-      return 'KV demand <b>' + d + '</b> / capacity <b>' + c + '</b> GiB (<b>' + pct + '%</b>) · pool ≈ <b>' +
-        maxTok + '</b> tokens (≈ ' + maxReq + ' full-' + ctxLbl + '-context requests)';
-    },
     kvReqExprDp: function (req, dp) { return req + ' requests ÷ DP' + dp; },
     kvReqExprAll: function (req) { return req + ' requests'; },
     kvUtilNoteDp: function (dp, clusterReq) {
@@ -320,7 +310,6 @@ var I18N = {
     },
     oomPartOom: function (count) { return ' · ⚠ ' + count + ' GPU(s) short'; },
     oomPartOk: function () { return ' · all fits'; },
-    kvCacheLegendLabel: function (kvDtype) { return 'KV cache (' + kvDtype + ')'; },
     kvNoteDpOn: function () { return 'DP attention on: KV split by TP, no replication'; },
     kvNoteMlaRepl: function (kvRepl, clusterKvGib) {
       return '<b>MLA latent has no head dim: KV is fully replicated per GPU, cluster holds ' + kvRepl +
@@ -351,7 +340,6 @@ var I18N = {
     },
     denseDecodeNote: function (ctxLbl) { return 'each request reads the full ' + ctxLbl + ' context'; },
     densePrefillNote: function () { return 'dense causal attention within the chunk; HBM is the ideal one-pass KV read/write lower bound'; },
-    dsaLabel: function (topk) { return 'DSA top-' + topk; },
     dsaDecodeNote: function (ctxLbl, attended) {
       return 'each request reads top-' + attended + ' selected KV from ' + ctxLbl + ' context; indexer full-context retrieval is not modeled';
     },
@@ -507,10 +495,19 @@ function paramsNow() {
   return q;
 }
 
-function showFetchError(on) {
+// warnmsg state: boolean flags, never read back from the DOM (DOM text is
+// language-dependent and breaks on switch). renderWarnmsg() owns the element;
+// fetch error outranks the pp warning.
+var _fetchFailed = false;
+
+function renderWarnmsg() {
   var e = el('warnmsg');
-  if (on) { e.textContent = Tr('fetchError')(); e.style.display = ''; }
-  else if (e.textContent === Tr('fetchError')()) { e.style.display = 'none'; e.textContent = ''; }
+  var msg = _fetchFailed ? Tr('fetchError')()
+          : (W.parallel && W.parallel.error === 'ppExceeds')
+            ? Tr('warnPpExceeds')(W.parallel.pp, W.parallel.L)
+            : '';
+  e.textContent = msg;
+  e.style.display = msg ? '' : 'none';
 }
 
 function refresh() {
@@ -521,8 +518,10 @@ function refresh() {
     var qs = new URLSearchParams(paramsNow()).toString();
     fetch('/api/v1/whatif?' + qs, _fetchCtl ? { signal: _fetchCtl.signal } : {})
       .then(function (r) { if (!r.ok) throw new Error(r.status); return r.json(); })
-      .then(function (payload) { W = payload; showFetchError(false); renderAll(); })
-      .catch(function (err) { if (err.name !== 'AbortError') showFetchError(true); });
+      .then(function (payload) { W = payload; _fetchFailed = false; renderAll(); })
+      .catch(function (err) {
+        if (err.name !== 'AbortError') { _fetchFailed = true; renderWarnmsg(); }
+      });
   }, 200);
 }
 
@@ -731,14 +730,10 @@ function renderParallel(){
   el('dp-box').style.display = W.echo.dpAvailable ? '' : 'none';
   el('custom-box').style.display = el('f-inst').value==='custom' ? 'inline-flex' : 'none';
 
+  renderWarnmsg();
   if (W.parallel.error === 'ppExceeds') {
-    el('warnmsg').style.display = '';
-    el('warnmsg').textContent = Tr('warnPpExceeds')(W.parallel.pp, W.parallel.L);
     el('cluster').innerHTML='';
     return;
-  }
-  if (el('warnmsg').textContent && el('warnmsg').textContent !== Tr('fetchError')()) {
-    el('warnmsg').style.display = 'none'; el('warnmsg').textContent = '';
   }
 
   var PA = W.parallel;

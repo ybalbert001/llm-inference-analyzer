@@ -1804,7 +1804,7 @@ def _build_lang_fragments(a: dict, cfg: dict, p: dict, is_moe: bool, short: str,
 
 
 def render_html(a: dict, out_path: str, ctx_options: list, req_options: list,
-                layer: dict = None, instances: dict = None, pargs=None):
+                instances: dict = None, pargs=None):
     cfg, p = a["cfg"], a["p"]
     L = cfg["num_hidden_layers"]
     is_moe = bool(p["moe_layers"])
@@ -1830,9 +1830,6 @@ def render_html(a: dict, out_path: str, ctx_options: list, req_options: list,
         for v in req_opts)
     kv_auto = a.get("kv_auto", a["kv_dtype"])
     kv_choice = a.get("kv_choice", a["kv_dtype"])
-
-    # data the in-page JS needs to recompute the runtime side (both tabs)
-    elems_per_layer, _ = kv_per_token_elems(cfg)
 
     # ---- parallel-tab option lists (language-independent)
     def _popts(values, selected, labeler=str):
@@ -1992,32 +1989,17 @@ def main():
     except Exception as e:
         sys.exit(f"failed to fetch config for {args.model_id}: {e}")
 
-    # multimodal configs nest the LLM under text_config; keep quantization and
-    # the vision tower config (vision weights/activation are modeled too)
-    if "num_hidden_layers" not in cfg and "text_config" in cfg:
-        qc = cfg.get("quantization_config")
-        vc = cfg.get("vision_config")
-        mm_tok = cfg.get("mm_tokens_per_image")
-        cfg = cfg["text_config"]
-        if qc and "quantization_config" not in cfg:
-            cfg["quantization_config"] = qc
-        if vc and "vision_config" not in cfg:
-            cfg["vision_config"] = vc
-        if mm_tok and "mm_tokens_per_image" not in cfg:
-            cfg["mm_tokens_per_image"] = mm_tok
-
-    # resolve kv-dtype "auto" the way SGLang does (server_args + deepseek_v4_hook):
-    # DSA/V4 sparse-attention models default to fp8_e4m3 KV, everything else
-    # keeps KV in the activation dtype (bf16)
-    arch = (cfg.get("architectures") or [""])[0]
-    is_dsa = cfg.get("index_topk") is not None or arch in (
-        "DeepseekV4ForCausalLM", "DeepseekV32ForCausalLM")
-    kv_auto = "fp8" if is_dsa else "bf16"
+    # config normalization + kv-dtype auto rule live in engine (single
+    # implementation shared with the web API); lazy import — engine imports
+    # this module back at load
+    import engine
+    cfg = engine.normalize_config(cfg)
+    kv_auto = engine.resolve_kv_auto(cfg)
     kv_choice = args.kv_dtype                    # what the user picked (may be "auto")
     if args.kv_dtype == "auto":
         args.kv_dtype = kv_auto
         print(f"kv-dtype auto -> {args.kv_dtype}"
-              f"{t('cli.kv_dsa_note') if is_dsa else ''}",
+              f"{t('cli.kv_dsa_note') if kv_auto == 'fp8' else ''}",
               file=sys.stderr)
 
     catalog = None
@@ -2055,13 +2037,12 @@ def main():
     if args.html:
         ctx_options = [int(v) for v in args.ctx_options.split(",")]
         req_options = [int(v) for v in args.req_options.split(",")]
-        layer = per_layer_breakdown(a, cfg)
-        parallel_self_check(a, layer, cfg)
+        parallel_self_check(a, per_layer_breakdown(a, cfg), cfg)
         instances = fetch_instance_specs(INSTANCE_TYPES)
         if args.instance not in instances:
             sys.exit(f"unknown instance {args.instance}; known: {', '.join(instances)}")
         render_html(a, args.html, ctx_options, req_options,
-                    layer=layer, instances=instances, pargs=args)
+                    instances=instances, pargs=args)
         print(f"diagram written to {args.html}")
 
 
