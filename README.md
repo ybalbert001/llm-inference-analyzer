@@ -31,7 +31,7 @@ Why this works: the first two sources are independent and can be **reconciled** 
 
 **1. Use the deployed webapp** — live at <https://llm-inference-analyzer.ybalbert.people.aws.dev>
 
-**2. Install as an Agent Skill**, then just ask in natural language.
+**2. Install as an Agent Skill**(./llm-inference-analyzer.zip), then just ask in natural language.
 
 ## Validated models
 

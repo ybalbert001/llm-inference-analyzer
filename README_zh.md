@@ -32,7 +32,7 @@
 
 **1. 访问部署的 webapp**， 线上地址：<https://llm-inference-analyzer.ybalbert.people.aws.dev>
 
-**2. 安装成 Agent Skill**, 通过自然语言提问。
+**2. 安装成 Agent Skill**(./llm-inference-analyzer.zip), 通过自然语言提问。
 
 
 ## 已验证的模型
