@@ -2,16 +2,20 @@
 
 English | [中文](README_zh.md)
 
-A Claude Code Skill: given nothing but a HuggingFace model ID, it produces a complete inference-deployment analysis — VRAM breakdown, parallelism partitioning, performance upper bounds — plus an interactive single-file HTML report.
+Given nothing but a HuggingFace model ID, it produces a complete inference-deployment analysis — VRAM breakdown, parallelism partitioning, performance upper bounds — plus an interactive single-file HTML report.
 
 ## What problem does it solve
 
-Before deploying a large model, engineers always face the same set of questions:
+Before deploying a large model, engineers always want to figure out questions like these:
 
-- **"How much GPU memory does this model need? Can it run on 8×H100?"**
-- **"How should I shard it with TP/PP/EP? How much does each GPU hold, and how much is left?"**
-- **"With 128K context × 64 concurrent requests, how big does the KV cache grow?"**
-- **"Is decode memory-bound or compute-bound? What's the theoretical tokens/s?"**
+- **"How much GPU memory does DeepSeek-V4-Flash need? Can it run on 8×H100?"**
+- **"How many H100 GPUs does Qwen3.5-27B need? How much does each GPU hold, and how much is left?"**
+- **"Can DeepSeek-V4-Pro on a single H200 node support 128K context × 64 concurrent requests?"**
+- **"What are the optimal deployment parameters for GLM-5.2-FP8 on B300?"**
+- **"Which instance type is the best choice for GLM-5.2-FP8?"**
+- **"What's the theoretical max throughput (tokens/s) of GLM-5.2-FP8 on B300?"**
+- **"What's the theoretical best TTFT of Kimi-2.6 on B300?"**
+- **"How can I reduce the GPU memory footprint of Qwen3-32B on L40S?"**
 
 ## Core idea
 
@@ -25,21 +29,9 @@ Why this works: the first two sources are independent and can be **reconciled** 
 
 ## How to use
 
-**1. As a Claude Code Skill** — install `llm-inference-analyzer.skill` (or drop `skills/llm-inference-analyzer/` into your skills directory), then just ask in natural language.
+**1. Use the deployed webapp** — live at <https://llm-inference-analyzer.ybalbert.people.aws.dev>
 
-**2. Run the script directly** (Python standard library only):
-
-```bash
-# Terminal report, defaults: 128K context × 16 concurrent requests
-python3 webapp/analyzer/main.py zai-org/GLM-5.2-FP8
-
-# Full interactive 3-tab HTML report
-python3 webapp/analyzer/main.py deepseek-ai/DeepSeek-V4-Flash --html dsv4.html
-
-# Custom deployment shape
-python3 webapp/analyzer/main.py Qwen/Qwen3-32B --context 32768 --requests 64 \
-    --tp 4 --instance p5.48xlarge --kv-dtype fp8 --html qwen.html
-```
+**2. Install as an Agent Skill**, then just ask in natural language.
 
 ## Validated models
 

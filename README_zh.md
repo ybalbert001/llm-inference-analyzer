@@ -2,16 +2,21 @@
 
 [English](README.md) | 中文
 
-一个 Claude Code Skill:只给一个 HuggingFace 模型 ID,就能得到完整的推理部署分析——显存拆解、并行切分、性能上界,外加一份可交互的单文件 HTML 报告。
+只给一个 HuggingFace 模型 ID,就能得到完整的推理部署分析——显存拆解、并行切分、性能上界,外加一份可交互的单文件 HTML 报告。
 
 ## 想解决什么问题
 
-部署一个大模型之前,工程师总要回答同一组问题:
+部署一个大模型之前,工程师总会想要搞清楚如下类似问题:
 
-- **"这个模型需要多少显存?能跑在 8×H100 上吗?"**
-- **"TP/PP/EP 该怎么切?每张卡占多少、剩多少?"**
-- **"128K context × 64 并发,KV cache 会涨到多大?"**
-- **"decode 是 memory-bound 还是 compute-bound?理论上能跑多少 tokens/s?"**
+- **"DeepSeek-V4-Flash模型需要多少显存?能跑在 8×H100 上吗?"**
+- **"Qwen3.5-27B模型用H100 部署，需要多少张卡？每张卡占多少、剩多少?"**
+- **"DeepSeek-V4-Pro模型用H200 单机部署，能支持128K context × 64 并发吗?"**
+- **"GLM-5.2-FP8模型在 B300 上的最优化参数是多少？"**
+- **"GLM-5.2-FP8模型选择什么机型是最佳？"**
+- **"GLM-5.2-FP8模型在B300 上理论上最大吞吐(token/s)是多少？"**
+- **"Kimi-2.6模型在 B300 上理论上最快TTFT是多少？"**
+- **"Qwen3-32B模型在 L40S 上有什么办法能降低显存占用"**
+
 
 ## 核心想法
 
@@ -25,21 +30,10 @@
 
 ## 使用方式
 
-**1. 作为 Claude Code Skill** — 安装 `llm-inference-analyzer.skill`(或把 `skills/llm-inference-analyzer/` 放入 skills 目录),自然语言提问。
+**1. 访问部署的 webapp**， 线上地址：<https://llm-inference-analyzer.ybalbert.people.aws.dev>
 
-**2. 直接运行脚本**(仅依赖 Python 标准库):
+**2. 安装成 Agent Skill**, 通过自然语言提问。
 
-```bash
-# 终端报告,默认 128K context × 16 并发
-python3 webapp/analyzer/main.py zai-org/GLM-5.2-FP8
-
-# 完整三 TAB HTML 报告
-python3 webapp/analyzer/main.py deepseek-ai/DeepSeek-V4-Flash --html dsv4.html
-
-# 自定义部署形态
-python3 webapp/analyzer/main.py Qwen/Qwen3-32B --context 32768 --requests 64 \
-    --tp 4 --instance p5.48xlarge --kv-dtype fp8 --html qwen.html
-```
 
 ## 已验证的模型
 
