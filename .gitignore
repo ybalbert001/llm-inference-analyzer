@@ -3,3 +3,7 @@ __pycache__/
 .DS_Store
 html_output/
 validate_experiments/S1_b200_session/
+design_draft/
+model_configs/
+validate_experiments/
+Issues.md
