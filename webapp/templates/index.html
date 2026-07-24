@@ -66,6 +66,10 @@
     vertical-align:-2px; margin-right:6px }
   @keyframes spin { to { transform:rotate(360deg) } }
   .empty { color:var(--muted); text-align:center; padding:32px 0; grid-column:1/-1 }
+  .sitefoot { margin-top:48px; padding-top:16px; border-top:1px solid var(--grid);
+    color:var(--muted); font-size:12.5px; text-align:center }
+  .sitefoot a { color:var(--muted); text-decoration:none }
+  .sitefoot a:hover { color:var(--accent) }
 </style>
 </head>
 <body>
@@ -97,6 +101,12 @@
     <p><span id="t-nf-pre"></span><b id="genmodel"></b><span id="t-nf-suf"></span></p>
     <button id="genbtn"></button>
     <div id="genstatus"></div>
+  </div>
+
+  <div class="sitefoot">
+    Powered by AWS GCR GenAI Specialist · Contacts:
+    <a href="mailto:ybalbert@amazon.com">ybalbert@amazon.com</a>,
+    <a href="mailto:huiqingn@amazon.com">huiqingn@amazon.com</a>
   </div>
 </div>
 
