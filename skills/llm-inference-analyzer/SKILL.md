@@ -30,8 +30,9 @@ in the server catalog — query `/api/v1/catalog` rather than recalling them.
    defaults (`assumptions.defaults_used`). Don't dump raw JSON.
 2. **Hand over `report_url` for the fine-grained interactive analysis.** The
    HTML report has dropdowns for context/concurrency/KV dtype/TP/instance
-   what-ifs and four deep-linkable tabs (`#evidence` `#estimate` `#parallel`
-   `#roofline`). Point the user at the tab that matches their question. It
+   what-ifs, four deep-linkable tabs (`#evidence` `#estimate` `#parallel`
+   `#roofline`), and an in-page zh/en switcher. Point the user at the tab that
+   matches their question. It
    **requires a HuggingFace login in the browser** — the login is the user's
    own action; no token ever passes through this skill. First-ever request for
    a model generates the report in the background (~1 min); the API answer

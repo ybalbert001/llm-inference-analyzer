@@ -40,7 +40,6 @@ effective value and lists which came from defaults (`defaults_used`).
 | `batch_tokens` | int 128 – 131072 | 8192 | decode-step batch context for roofline |
 | `chunk_tokens` | int 128 – 131072 | =batch_tokens | chunked-prefill size for the prefill roofline verdict |
 | `weight_dtype` | `bf16` `fp8` `fp4` | checkpoint's | roofline what-if: idealized dtype conversion (weights section still reports the real checkpoint) |
-| `lang` | `zh` `en` | zh | language of the linked HTML report |
 
 ### Response schema
 
@@ -165,7 +164,7 @@ effective value and lists which came from defaults (`defaults_used`).
     }
   },
 
-  "report_url": "https://…/reports/org--name.zh.html",
+  "report_url": "https://…/reports/org--name.html",   // report has an in-page zh/en switcher
   "report_note": "interactive 4-tab report (deep links: #evidence #estimate #parallel #roofline); requires HuggingFace login in a browser; generating in background if absent — may take ~1 min on first request"
 }
 ```
@@ -202,7 +201,7 @@ No parameters. The hardware vocabulary — **query this instead of recalling GPU
 
 ## GET /api/v1/whatif
 
-Same request parameters as `/analyze` **minus `lang`**. The response is **renderer-shaped**: it feeds the HTML report page's dynamic tabs on every dropdown change. Differences from `/analyze`: all sizes are raw **bytes** (un-rounded floats, not GiB), times are **ms**, field names are camelCase matching template.js, and kernel notes are i18n key references (`noteRefs`) instead of prose. Prefer `/analyze` for answering users; `/whatif` is useful when you need un-rounded numbers, per-component weight bytes per GPU, or per-kernel times — or to cross-check the report page's rendering.
+Same request parameters as `/analyze`. The response is **renderer-shaped**: it feeds the HTML report page's dynamic tabs on every dropdown change. Differences from `/analyze`: all sizes are raw **bytes** (un-rounded floats, not GiB), times are **ms**, field names are camelCase matching template.js, and kernel notes are i18n key references (`noteRefs`) instead of prose. Prefer `/analyze` for answering users; `/whatif` is useful when you need un-rounded numbers, per-component weight bytes per GPU, or per-kernel times — or to cross-check the report page's rendering.
 
 Schema below verified against the live service (dense GQA, MLA+DSA+MoE with dp-attention, hybrid SSM, `weight_dtype` override, `pp>layers`, uncataloged hardware).
 

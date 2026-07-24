@@ -29,16 +29,15 @@ def main() -> None:
             skipped.append((f.name, "no model id found"))
             continue
         model_id = m.group(1)
-        lang = "zh" if '<html lang="zh"' in head[:200] else "en"
-        slug = slug_for(model_id, lang)
+        slug = slug_for(model_id)
         dest = REPORTS_DIR / f"{slug}.html"
         shutil.copyfile(f, dest)
         with db() as conn:
             conn.execute(
                 "INSERT OR REPLACE INTO reports"
-                "(slug, model_id, lang, created_at, created_by, size_bytes, last_access)"
-                " VALUES(?,?,?,?,?,?,?)",
-                (slug, model_id, lang, now(), "import", dest.stat().st_size, now()),
+                "(slug, model_id, created_at, created_by, size_bytes, last_access)"
+                " VALUES(?,?,?,?,?,?)",
+                (slug, model_id, now(), "import", dest.stat().st_size, now()),
             )
         imported.append((f.name, slug))
     for name, slug in imported:

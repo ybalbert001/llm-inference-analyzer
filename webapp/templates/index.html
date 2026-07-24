@@ -234,7 +234,7 @@ document.getElementById('genbtn').addEventListener('click', async () => {
   try {
     const resp = await fetch('/api/generate', {
       method: 'POST', headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({model_id: modelId, lang: uiLang}),
+      body: JSON.stringify({model_id: modelId}),
     });
     const data = await resp.json();
     if (!resp.ok) throw new Error(data.detail || resp.statusText);

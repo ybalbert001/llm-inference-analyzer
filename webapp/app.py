@@ -53,7 +53,6 @@ GENERATES_PER_HOUR = int(os.environ.get("GENERATES_PER_HOUR", "20"))
 GENERATE_TIMEOUT_S = 300
 
 MODEL_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,95}/[A-Za-z0-9][A-Za-z0-9_.-]{0,95}$")
-LANGS = ("zh", "en")
 
 app = FastAPI(title="LLM Inference Analyzer")
 app.add_middleware(
@@ -81,7 +80,6 @@ def init_db() -> None:
             CREATE TABLE IF NOT EXISTS reports(
               slug TEXT PRIMARY KEY,
               model_id TEXT NOT NULL,
-              lang TEXT NOT NULL,
               created_at TEXT NOT NULL,
               created_by TEXT NOT NULL,
               size_bytes INTEGER NOT NULL,
@@ -99,6 +97,44 @@ def init_db() -> None:
         cols = [r["name"] for r in conn.execute("PRAGMA table_info(reports)")]
         if "report_version" not in cols:
             conn.execute("ALTER TABLE reports ADD COLUMN report_version TEXT")
+        if "lang" in cols:
+            _migrate_langless(conn)
+
+
+def _migrate_langless(conn: sqlite3.Connection) -> None:
+    """One-time: reports were cached per (model, lang); the page has a built-in
+    language switcher, so the lang axis is gone. Keep one report per model
+    (zh preferred — it's just the first-paint language), rename `<slug>.zh`
+    files to `<slug>`, drop the rest."""
+    rows = conn.execute("SELECT slug, model_id, lang FROM reports").fetchall()
+    keep: dict[str, sqlite3.Row] = {}
+    for r in rows:
+        cur = keep.get(r["model_id"])
+        if cur is None or (r["lang"] == "zh" and cur["lang"] != "zh"):
+            keep[r["model_id"]] = r
+    for r in rows:
+        old = REPORTS_DIR / f"{r['slug']}.html"
+        if keep.get(r["model_id"]) is r:
+            new = REPORTS_DIR / f"{slug_for(r['model_id'])}.html"
+            if old.exists():
+                old.replace(new)
+        else:
+            old.unlink(missing_ok=True)
+    conn.execute("ALTER TABLE reports RENAME TO reports_old")
+    conn.execute(
+        """CREATE TABLE reports(
+             slug TEXT PRIMARY KEY, model_id TEXT NOT NULL,
+             created_at TEXT NOT NULL, created_by TEXT NOT NULL,
+             size_bytes INTEGER NOT NULL, last_access TEXT NOT NULL,
+             report_version TEXT)"""
+    )
+    for r in keep.values():
+        conn.execute(
+            "INSERT INTO reports SELECT ?, model_id, created_at, created_by,"
+            " size_bytes, last_access, report_version FROM reports_old WHERE slug=?",
+            (slug_for(r["model_id"]), r["slug"]),
+        )
+    conn.execute("DROP TABLE reports_old")
 
 
 def now() -> str:
@@ -113,8 +149,8 @@ def log_access(username: str, action: str, model_id: str | None = None) -> None:
         )
 
 
-def slug_for(model_id: str, lang: str) -> str:
-    return model_id.lower().replace("/", "--") + f".{lang}"
+def slug_for(model_id: str) -> str:
+    return model_id.lower().replace("/", "--")
 
 
 def evict_lru() -> None:
@@ -200,7 +236,7 @@ async def logout(request: Request):
 # ---------- generation tasks ----------
 
 executor = ThreadPoolExecutor(max_workers=2)
-tasks: dict[str, dict] = {}  # task_id -> {status, slug, error, model_id, lang}
+tasks: dict[str, dict] = {}  # task_id -> {status, slug, error, model_id}
 tasks_lock = threading.Lock()
 rate: dict[str, list[float]] = {}
 rate_lock = threading.Lock()  # mutated from the event loop AND sync worker threads
@@ -221,16 +257,18 @@ def check_rate(key: str, per_hour: int = GENERATES_PER_HOUR,
                 del rate[k]
 
 
-def run_generation(task_id: str, model_id: str, lang: str, username: str) -> None:
-    slug = slug_for(model_id, lang)
+def run_generation(task_id: str, model_id: str, username: str) -> None:
+    slug = slug_for(model_id)
     out_path = REPORTS_DIR / f"{slug}.html"
     tmp_path = REPORTS_DIR / f".{slug}.tmp.html"
     with tasks_lock:
         tasks[task_id]["status"] = "running"
     try:
+        # --lang only sets the first-paint language; the page has a built-in
+        # zh/en switcher (choice persisted in localStorage)
         proc = subprocess.run(
             [sys.executable, str(ANALYZER_SCRIPT), model_id,
-             "--html", str(tmp_path), "--lang", lang],
+             "--html", str(tmp_path), "--lang", "zh"],
             capture_output=True, text=True, timeout=GENERATE_TIMEOUT_S,
             cwd=str(ANALYZER_SCRIPT.parent),
         )
@@ -241,10 +279,10 @@ def run_generation(task_id: str, model_id: str, lang: str, username: str) -> Non
         with db() as conn:
             conn.execute(
                 "INSERT OR REPLACE INTO reports"
-                "(slug, model_id, lang, created_at, created_by, size_bytes,"
+                "(slug, model_id, created_at, created_by, size_bytes,"
                 " last_access, report_version)"
-                " VALUES(?,?,?,?,?,?,?,?)",
-                (slug, model_id, lang, now(), username, out_path.stat().st_size,
+                " VALUES(?,?,?,?,?,?,?)",
+                (slug, model_id, now(), username, out_path.stat().st_size,
                  now(), engine.report_version()),
             )
         evict_lru()
@@ -261,14 +299,11 @@ async def api_generate(request: Request):
     username = require_user(request)
     body = await request.json()
     model_id = (body.get("model_id") or "").strip()
-    lang = body.get("lang", "zh")
     force = bool(body.get("force"))
     if not MODEL_ID_RE.match(model_id):
         raise HTTPException(400, "invalid model id (expected org/name)")
-    if lang not in LANGS:
-        raise HTTPException(400, "lang must be zh or en")
 
-    slug = slug_for(model_id, lang)
+    slug = slug_for(model_id)
     if not force and (REPORTS_DIR / f"{slug}.html").exists():
         return {"status": "cached", "slug": slug}
 
@@ -285,7 +320,7 @@ async def api_generate(request: Request):
 
     check_rate(username)
     log_access(username, "generate", model_id)
-    return _queue_report(model_id, lang, username, force=force)
+    return _queue_report(model_id, username, force=force)
 
 
 @app.get("/api/tasks/{task_id}")
@@ -321,7 +356,7 @@ LOGIN_GATE_HTML = """<!doctype html><html><head><meta charset="utf-8">
 async def api_reports():
     with db() as conn:
         rows = conn.execute(
-            "SELECT slug, model_id, lang, created_at, created_by, size_bytes,"
+            "SELECT slug, model_id, created_at, created_by, size_bytes,"
             " (SELECT COUNT(*) FROM access_log a"
             "   WHERE a.action='view' AND a.model_id = reports.model_id) AS views"
             " FROM reports ORDER BY views DESC, created_at DESC"
@@ -344,7 +379,7 @@ async def serve_report(request: Request, slug: str):
         raise HTTPException(404, "no such report")
     with db() as conn:
         row = conn.execute(
-            "SELECT model_id, lang, report_version FROM reports WHERE slug=?",
+            "SELECT model_id, report_version FROM reports WHERE slug=?",
             (slug,)).fetchone()
         conn.execute("UPDATE reports SET last_access=? WHERE slug=?", (now(), slug))
     log_access(username, "view", row["model_id"] if row else slug)
@@ -353,7 +388,7 @@ async def serve_report(request: Request, slug: str):
     # The page's dynamic numbers come from /api/v1/whatif and are always
     # current regardless; this refreshes the baked static parts.
     if row and row["report_version"] != engine.report_version():
-        _queue_report(row["model_id"], row["lang"], "stale-regen", force=True)
+        _queue_report(row["model_id"], "stale-regen", force=True)
     return FileResponse(path, media_type="text/html")
 
 
@@ -436,23 +471,21 @@ def _resolve_hardware(instance: str | None, gpu: str | None,
             "label": f"p5en.48xlarge ({cnt}x{g} {mib / 1024:.0f} GiB) [default]"}
 
 
-def _queue_report(model_id: str, lang: str, username: str,
-                  force: bool = False) -> dict:
+def _queue_report(model_id: str, username: str, force: bool = False) -> dict:
     """Queue default-report generation (dedups against in-flight tasks).
     force=True regenerates even when a (stale) report exists. Returns the
     same {status, ...} shape /api/generate responds with."""
-    slug = slug_for(model_id, lang)
+    slug = slug_for(model_id)
     if not force and (REPORTS_DIR / f"{slug}.html").exists():
         return {"status": "cached", "slug": slug}
     with tasks_lock:
         for tid, t in tasks.items():
-            if t["model_id"] == model_id and t["lang"] == lang \
-                    and t["status"] in ("pending", "running"):
+            if t["model_id"] == model_id and t["status"] in ("pending", "running"):
                 return {"status": "queued", "task_id": tid}
         task_id = secrets.token_urlsafe(8)
-        tasks[task_id] = {"status": "pending", "model_id": model_id, "lang": lang,
+        tasks[task_id] = {"status": "pending", "model_id": model_id,
                           "slug": None, "error": None}
-    executor.submit(run_generation, task_id, model_id, lang, username)
+    executor.submit(run_generation, task_id, model_id, username)
     return {"status": "queued", "task_id": task_id}
 
 
@@ -519,10 +552,7 @@ def api_v1_analyze(  # sync def: FastAPI runs it in a worker thread (blocking HF
     batch_tokens: int = Query(8192, ge=128, le=131_072),
     chunk_tokens: int | None = Query(None, ge=128, le=131_072),
     weight_dtype: str | None = Query(None, description="roofline what-if override"),
-    lang: str = Query("zh", description="language of the linked HTML report"),
 ):
-    if lang not in LANGS:
-        raise HTTPException(400, "lang must be zh or en")
     a, cfg, D, P, hw, weight_warnings = _prepare_analysis(
         request, model=model, context=context, requests=requests,
         kv_dtype=kv_dtype, tp=tp, pp=pp, ep=ep, dp_attention=dp_attention,
@@ -541,8 +571,8 @@ def api_v1_analyze(  # sync def: FastAPI runs it in a worker thread (blocking HF
                                         chunk_tokens or batch_tokens, weight_dtype)
                 if hw["gpu"] else None)
 
-    slug = slug_for(model, lang)
-    _queue_report(model, lang, f"api:{ip}")
+    slug = slug_for(model)
+    _queue_report(model, f"api:{ip}")
     gib = 1024 ** 3
 
     defaults_used = [name for name, given in (
@@ -612,8 +642,9 @@ def api_v1_analyze(  # sync def: FastAPI runs it in a worker thread (blocking HF
                     f"gpu ({', '.join(sorted(core.GPU_PERF))}) for roofline bounds"},
         "report_url": f"{BASE_URL}/reports/{slug}.html",
         "report_note": "interactive 4-tab report (deep links: #evidence #estimate "
-                       "#parallel #roofline); requires HuggingFace login in a browser; "
-                       "generating in background if absent — may take ~1 min on first request",
+                       "#parallel #roofline; in-page zh/en switcher); requires "
+                       "HuggingFace login in a browser; generating in background "
+                       "if absent — may take ~1 min on first request",
     })
 
 
