@@ -429,7 +429,7 @@ def _load_model(model_id: str) -> tuple[dict, dict | None, list[str], tuple | No
     cfg = engine.normalize_config(core.fetch_config(model_id))
     catalog, warnings = None, []
     try:
-        catalog, declared = core.fetch_safetensors_catalog(model_id)
+        catalog, declared, _n_shards, _index_info = core.fetch_safetensors_catalog(model_id)
         got = sum(t["bytes"] for t in catalog.values())
         if declared and abs(got - declared) / declared > 0.01:
             warnings.append(

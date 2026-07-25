@@ -113,6 +113,64 @@
   .ev-caption { color:var(--muted); font-size:12px; margin:8px 0 0; text-align:center }
   .ev-sigma { margin:14px 0 0; padding:12px 14px; border-radius:8px; font-size:13px;
     background:var(--page); border:1px solid var(--grid); font-variant-numeric:tabular-nums }
+  /* 0 · raw evidence: draggable two-pane (raw files | parsed facts) */
+  .ev-split { display:flex; align-items:stretch; gap:0; margin:4px 0 0 }
+  .ev-pane { min-width:120px; overflow:hidden }
+  .ev-pane-left { flex:1 1 56% }
+  .ev-pane-right { flex:1 1 44% }
+  .ev-gutter { flex:0 0 11px; margin:0 3px; cursor:col-resize; border-radius:5px;
+    background:var(--grid); position:relative }
+  .ev-gutter:hover, .ev-gutter.drag { background:var(--muted) }
+  .ev-gutter::after { content:""; position:absolute; left:4px; top:50%; width:3px; height:30px;
+    transform:translateY(-50%); border-left:1px solid var(--surface); border-right:1px solid var(--surface) }
+  .ev-panetitle { font-size:12px; font-weight:600; color:var(--muted);
+    text-transform:uppercase; letter-spacing:.03em; margin:0 0 10px }
+  .ev-det { margin:0 0 12px }
+  .ev-det > summary { cursor:pointer; font-size:13px; font-weight:600; color:var(--ink2);
+    padding:7px 10px; background:var(--page); border:1px solid var(--grid); border-radius:8px;
+    list-style:revert }
+  .ev-det[open] > summary { margin:0 0 8px }
+  .ev-det.ev-sub { margin:8px 0 0 }
+  .ev-det.ev-sub > summary { font-size:12px; font-weight:500; color:var(--muted) }
+  .ev-kvlist { display:flex; flex-direction:column; gap:2px }
+  .ev-kv { display:flex; gap:10px; font-size:12px; padding:3px 8px; align-items:baseline;
+    border-bottom:1px solid var(--grid) }
+  .ev-kv:last-child { border-bottom:none }
+  .ev-k { flex:0 0 auto; min-width:150px; color:var(--muted);
+    font-family:ui-monospace,"SF Mono",Menlo,Consolas,monospace }
+  .ev-v { color:var(--ink); font-family:ui-monospace,"SF Mono",Menlo,Consolas,monospace;
+    word-break:break-all }
+  .ev-raw { margin:0; padding:10px 12px; background:var(--page); border:1px solid var(--grid);
+    border-radius:8px; font-size:11px; line-height:1.45; color:var(--ink2); max-height:340px;
+    overflow:auto; white-space:pre; font-family:ui-monospace,"SF Mono",Menlo,Consolas,monospace }
+  .ev-idxmeta { font-size:12px; color:var(--ink); background:var(--page);
+    border:1px solid var(--grid); border-left:3px solid var(--s2); border-radius:6px;
+    padding:6px 10px; margin:0 0 10px; font-variant-numeric:tabular-nums;
+    font-family:ui-monospace,"SF Mono",Menlo,Consolas,monospace }
+  .ev-stgrp { margin:0 0 10px }
+  .ev-stlab { display:block; font-size:12px; font-weight:600; color:var(--ink2); margin:6px 0 3px }
+  .ev-stdim { color:var(--muted); font-weight:400; font-size:11.5px }
+  .ev-sttrunc { margin:6px 0 0 }
+  .ev-sttab { width:100%; border-collapse:collapse; font-size:11px;
+    font-family:ui-monospace,"SF Mono",Menlo,Consolas,monospace }
+  .ev-sttab th { text-align:left; font-size:10px; font-weight:600; color:var(--muted);
+    text-transform:uppercase; padding:0 8px 3px 0; border-bottom:1px solid var(--grid) }
+  .ev-sttab td { padding:2px 8px 2px 0; border-bottom:1px solid var(--grid); vertical-align:top }
+  .ev-sttab tr:last-child td { border-bottom:none }
+  .ev-tn { color:var(--ink2); word-break:break-all }
+  .ev-td { color:var(--s2); white-space:nowrap }
+  .ev-ts, .ev-tb { color:var(--muted); white-space:nowrap; font-variant-numeric:tabular-nums }
+  .ev-rblk { background:var(--page); border:1px solid var(--grid); border-radius:8px;
+    padding:10px 12px; margin:0 0 10px }
+  .ev-rblab { font-size:12px; font-weight:600; color:var(--ink2); margin:0 0 8px }
+  .ev-dtrow { display:flex; align-items:center; gap:8px; padding:3px 0 }
+  .ev-dtname { flex:0 0 70px; font-size:12px; color:var(--ink2);
+    font-family:ui-monospace,"SF Mono",Menlo,Consolas,monospace }
+  .ev-dtbar { height:12px; border-radius:3px; min-width:3px; background:var(--s4) }
+  .ev-dtval { font-size:11.5px; color:var(--muted); white-space:nowrap;
+    font-variant-numeric:tabular-nums; margin-left:auto }
+  @media (max-width:760px) { .ev-split { flex-direction:column } .ev-gutter { display:none }
+    .ev-pane { min-width:0 } }
   /* packing pop-out */
   .ev-packbox { margin:2px 0 6px 164px; padding:10px 12px; border-radius:8px; font-size:12.5px;
     color:var(--ink2); background:color-mix(in srgb,var(--s8) 8%,var(--page));
