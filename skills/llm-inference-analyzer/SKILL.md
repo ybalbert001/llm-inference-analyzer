@@ -18,6 +18,13 @@ GET $BASE/api/v1/catalog                        # hardware vocabulary + defaults
 Full request/response schemas for `/analyze`, `/catalog`, and `/whatif`:
 **`references/api.md`**.
 
+**How to reach the service: browser-use first, curl as fallback.** When
+calling any `$BASE` URL, prefer a browser-use tool (e.g. an available browser
+automation / agentcore-browser tool) to fetch the JSON — some networks block
+or intercept plain `curl` to this host. Only if no browser tool is available
+or the browser fetch fails, fall back to `curl`. The `curl` snippets below
+show the request shapes; the same URLs work verbatim in a browser tool.
+
 **Always ground your numbers in an API call — never estimate VRAM or throughput
 from memory.** Hardware facts (GPU memory sizes, instance shapes, TFLOPs) live
 in the server catalog — query `/api/v1/catalog` rather than recalling them.
