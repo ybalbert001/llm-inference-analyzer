@@ -109,6 +109,10 @@ var I18N = {
       return '（每 rank 池，完整 cell 口径，与 SGLang 日志对账；×DP' + dp + ' = 集群 ' + clusterTok +
         ' tokens ≈ ' + clusterReq + ' 个请求）';
     },
+    sumCpSeqLine: function (cp, seqTok) {
+      return 'CP=' + cp + '：单条序列 KV 跨 ' + cp + ' 卡分摊 → <b>最长单序列 ≈ ' + seqTok +
+        ' tokens</b>（这才是 CP 的价值：跑单卡装不下的超长 context；每卡显存与 DP-attention 相同）';
+    },
     pctParen: function (pct) { return '（' + pct + '%）'; },
     layerChipLabel: function (lo, hi, count) { return 'L' + lo + '–L' + hi + ' ×' + count + ' 层'; },
     perLayerFrac: function (tp) { return '，每层 1⁄' + tp; },
@@ -306,6 +310,10 @@ var I18N = {
       return ' (per-rank pool at the full cell, matches the SGLang log; ×DP' + dp + ' = cluster ' + clusterTok +
         ' tokens ≈ ' + clusterReq + ' requests)';
     },
+    sumCpSeqLine: function (cp, seqTok) {
+      return 'CP=' + cp + ': one sequence\'s KV spans ' + cp + ' ranks → <b>longest single sequence ≈ ' + seqTok +
+        ' tokens</b> (this is what CP buys: context too long for one GPU; per-rank memory equals DP-attention)';
+    },
     pctParen: function (pct) { return ' (' + pct + '%)'; },
     layerChipLabel: function (lo, hi, count) { return 'L' + lo + '–L' + hi + ' ×' + count + ' layers'; },
     perLayerFrac: function (tp) { return ', 1⁄' + tp + ' per layer'; },
@@ -461,6 +469,40 @@ if (typeof location !== 'undefined') {
   if (location.hash === '#roofline') setTab('roofline');
 }
 
+/* evidence tab · draggable gutter between the raw-file pane and the parsed-fact
+   pane. Drag sets the two panes' flex-basis from the pointer's position inside
+   the split container; clamped so neither pane collapses. */
+function initEvidenceSplit() {
+  var gutters = document.querySelectorAll('.ev-split > .ev-gutter');
+  Array.prototype.forEach.call(gutters, function (g) {
+    var split = g.parentElement;
+    var left = split.querySelector('.ev-pane-left');
+    var right = split.querySelector('.ev-pane-right');
+    if (!left || !right) return;
+    var dragging = false;
+    function onMove(clientX) {
+      var r = split.getBoundingClientRect();
+      var pct = (clientX - r.left) / r.width * 100;
+      pct = Math.max(20, Math.min(80, pct));           // clamp 20%–80%
+      left.style.flex = '0 0 ' + pct.toFixed(1) + '%';
+      right.style.flex = '1 1 auto';
+    }
+    g.addEventListener('mousedown', function (e) {
+      dragging = true; g.classList.add('drag');
+      document.body.style.userSelect = 'none'; e.preventDefault();
+    });
+    document.addEventListener('mousemove', function (e) { if (dragging) onMove(e.clientX); });
+    document.addEventListener('mouseup', function () {
+      if (!dragging) return;
+      dragging = false; g.classList.remove('drag'); document.body.style.userSelect = '';
+    });
+    g.addEventListener('touchmove', function (e) {
+      if (e.touches[0]) { onMove(e.touches[0].clientX); e.preventDefault(); }
+    }, { passive: false });
+  });
+}
+initEvidenceSplit();
+
 /* ====================== TAB 1: estimate (design_1) ====================== */
 function barHtml(segs, total) {
   var h = '';
@@ -563,9 +605,16 @@ function readParams(){
     instLabel = Tr('instLabel')(inst, s.count, s.gpu, s.memGib);
   }
   var tp = +el('f-tp').value;
+  var cp = +(el('f-cp').value || 1);
+  // CP (context parallel, --enable-prefill-cp) forces, per SGLang source:
+  // enable_dp_attention=True, attn_tp_size=1 (attention weights replicated),
+  // moe_dense_tp_size=1 (dense FFN replicated), and splits the sequence's KV
+  // across cp ranks. So cp>1 implies dp-attention behavior + dense replication.
+  var dpAttn = (el('f-dp').checked && dpAvailable(tp)) || cp > 1;
+  var denseRepl = el('f-dense-repl').checked || cp > 1;
   return {
     tp:tp, pp:+el('f-pp').value, ep:+(el('f-ep').value||1),
-    dpAttn: el('f-dp').checked && dpAvailable(tp),
+    cp:cp, dpAttn:dpAttn, denseRepl:denseRepl,
     memGib:memGib, gpn:gpn, instLabel:instLabel,
     ctx:+el('f-ctx').value, req:+el('f-req').value,
     kvDtype: kvDtypeNow(), frac:+el('f-frac').value
@@ -585,6 +634,18 @@ function rebuildEpOptions(tp){
   var divisors = [];
   for (var d=1; d<=tp; d++) if (tp%d===0) divisors.push(d);
   var pick = divisors.indexOf(prev)>=0 ? prev : tp;
+  sel.innerHTML = divisors.map(function(d){
+    return "<option value='"+d+"'"+(d===pick?' selected':'')+">"+d+"</option>";
+  }).join('');
+}
+
+// CP (context parallel) options are divisors of tp; 1 = off. Only meaningful for
+// MLA/DSA models (where CP splits the latent-KV sequence to serve long context).
+function rebuildCpOptions(tp){
+  var sel = el('f-cp'), prev = +sel.value || 1;
+  var divisors = [];
+  for (var d=1; d<=tp; d++) if (tp%d===0) divisors.push(d);
+  var pick = divisors.indexOf(prev)>=0 ? prev : 1;
   sel.innerHTML = divisors.map(function(d){
     return "<option value='"+d+"'"+(d===pick?' selected':'')+">"+d+"</option>";
   }).join('');
@@ -626,7 +687,9 @@ function gpuMemory(s, P){
   // (original kept for the MHA prefill path) — extra bytes beyond safetensors,
   // sharded by attn-TP. Verified S1 E4: GLM-5.2 +0.27 GiB @TP8, +2.13 @dpAttn.
   w.attention += n * (D.absorbPerLayer||0) / attnTpDiv;
-  w.denseFfn  = nd * L.denseFfn/P.tp;
+  // dense FFN (leading first_k_dense_replace layers): normally /tp, but with
+  // moe_dense_tp_size=1 (P.denseRepl; auto-forced by CP) it's replicated per rank.
+  w.denseFfn  = nd * L.denseFfn/(P.denseRepl ? 1 : P.tp);
   w.moeRouted = nm * L.moeRouted/P.tp;
   w.moeShared = nm * L.moeShared/P.tp;
   // MTP draft: expert FFN always /tp; attention flips to replicated under
@@ -685,9 +748,17 @@ function gpuMemory(s, P){
   var capShard = P.dpAttn ? P.tp : 1;
   var maxReq = (canStart && kv > 0) ? Math.floor(kvCap*P.req/kv/capShard) : 0;
   var maxTokens = (canStart && kv > 0) ? kvCap*P.ctx*P.req/kv/capShard : 0;
+  // CP's distinctive value: one sequence's KV is split across cp ranks, so the
+  // longest single sequence you can serve = cp × (one rank's pool token
+  // capacity). Per-rank pool tokens = kvCap / (KV bytes per token on this rank)
+  // = kvCap*ctx*req/kv. (Without CP a single sequence lives on one rank, so it's
+  // just the per-rank capacity; we only surface this when cp>1.)
+  var poolTokPerRank = (canStart && kv > 0) ? kvCap*P.ctx*P.req/kv : 0;
+  var maxSingleSeq = (P.cp||1) * poolTokPerRank;
   return { w:w, weights:weights, kv:kv, kvParts:kvParts, kvCap:Math.max(kvCap,0),
            kvCapRaw:kvCap, canStart:canStart, act:act, used:used, maxReq:maxReq,
-           maxTokens:maxTokens, linState:linState, layers:[lo,hi], nDense:nd, nMoe:nm };
+           maxTokens:maxTokens, maxSingleSeq:maxSingleSeq, linState:linState,
+           layers:[lo,hi], nDense:nd, nMoe:nm };
 }
 
 // experts held by tp rank t (EP grouping)
@@ -796,7 +867,18 @@ function chips(m, s, t, P){
 function updateParallel(){
   var P = readParams();
   rebuildEpOptions(P.tp); P.ep = +el('f-ep').value || 1;
+  rebuildCpOptions(P.tp); P.cp = +el('f-cp').value || 1;
   el('dp-box').style.display = dpAvailable(P.tp) ? '' : 'none';
+  // CP only matters for MLA/DSA (long-context sequence-KV split); dense-replicate
+  // is meaningful whenever there are leading dense layers. Recompute derived
+  // flags after the option rebuilds so P reflects the current cp selection.
+  el('cp-box').style.display = D.kvIsMla ? '' : 'none';
+  // moe_dense_tp_size only applies to a MoE model's leading dense layers
+  // (first_k_dense_replace) — not to a pure-dense model's FFN. So require both
+  // dense AND MoE layers to exist.
+  el('dense-box').style.display = (D.nDense > 0 && D.nMoe > 0) ? '' : 'none';
+  P.dpAttn = (el('f-dp').checked && dpAvailable(P.tp)) || P.cp > 1;
+  P.denseRepl = el('f-dense-repl').checked || P.cp > 1;
   el('custom-box').style.display = el('f-inst').value==='custom' ? 'inline-flex' : 'none';
 
   var warn = [];
@@ -906,9 +988,16 @@ function updateParallel(){
   var capLine = allStart && isFinite(minMaxTok)
     ? '<br>'+Tr('sumCapLine')(tokLabel(minMaxTok), ctxLabel(P.ctx), minMaxReq, P.frac.toFixed(2))
       + (P.dpAttn ? Tr('sumCapDpSuffix')(P.tp, tokLabel(minMaxTok*P.tp), minMaxReq*P.tp) : '') : '';
+  // CP's distinctive payoff: one sequence's KV spans cp ranks, so the longest
+  // single sequence = cp × per-rank pool tokens (= cp × the bottleneck maxTokens,
+  // since maxTokens is already the per-rank pool under dp/cp). Only shown for cp>1.
+  var cpLine = '';
+  if (P.cp > 1 && allStart && isFinite(minMaxTok)) {
+    cpLine = '<br>'+Tr('sumCpSeqLine')(P.cp, tokLabel(minMaxTok * P.cp));
+  }
   el('sum-line').innerHTML =
     Tr('sumLine')(gib(maxUsed), P.memGib, gib(clusterWeights), gib(D.weightsBytes), gib(Math.max(repl,0)))+
-    '<br>'+kvNote+capLine;
+    '<br>'+kvNote+capLine+cpLine;
 
   // table view
   var th = Tr('tableHeader')();
@@ -1901,9 +1990,10 @@ renderKvWarnings();
 ['f-ctx','f-req','f-kv'].forEach(function(id){
   el(id).addEventListener('change', updateAll);
 });
-['f-pp','f-ep'].forEach(function(id){
+['f-pp','f-ep','f-cp'].forEach(function(id){
   el(id).addEventListener('change', updateParallel);
 });
+el('f-dense-repl').addEventListener('change', updateParallel);
 el('f-tp').addEventListener('change', function(){ updateParallel(); updateRoofline(); });
 el('f-inst').addEventListener('change', function(){ updateParallel(); updateRoofline(); });
 el('f-dp').addEventListener('change', function(){ updateParallel(); updateRoofline(); });
@@ -1913,6 +2003,7 @@ el('f-frac').addEventListener('input', function(){ syncFracLabel(); updateParall
 function syncFracLabel(){ setText('f-frac-val', (+el('f-frac').value).toFixed(2)); }
 syncFracLabel();
 rebuildEpOptions(+el('f-tp').value);
+rebuildCpOptions(+el('f-tp').value);
 if (D.nMoe){ el('f-ep').value = String(EP_INIT); }
 
 /* ========================= language switcher ========================= */

@@ -135,15 +135,22 @@ def _fetch_range(url: str, start: int, length: int) -> bytes:
         return resp.read()
 
 
-def fetch_safetensors_catalog(model_id: str) -> tuple[dict, int | None]:
+def fetch_safetensors_catalog(model_id: str) -> tuple[dict, int | None, int, dict | None]:
     """Per-tensor {name: {dtype, shape, bytes}} from safetensors headers.
 
     Only range-requests each shard's JSON header (a few hundred KB), never the
     weights. This is the ground truth for mixed-precision checkpoints where a
     single bytes-per-param number is wrong.
+
+    Returns (catalog, declared_total_size, n_shards, index_info). The last three
+    come from model.safetensors.index.json: metadata.total_size, the shard count,
+    and index_info — a small sample of the file itself (metadata + a few
+    weight_map entries + shard list) for the evidence tab's "bridge file" view.
+    index_info is None for single-file checkpoints (no index.json).
     """
     base = f"https://huggingface.co/{model_id}/resolve/main"
     declared = None
+    index_info = None
     try:
         # resolve/ follows git-lfs; raw/ would return the LFS pointer for big indexes
         req = urllib.request.Request(
@@ -154,8 +161,17 @@ def fetch_safetensors_catalog(model_id: str) -> tuple[dict, int | None]:
             req.add_header("Authorization", f"Bearer {token}")
         with urllib.request.urlopen(req, timeout=30) as resp:
             idx = json.load(resp)
-        files = sorted(set(idx["weight_map"].values()))
+        wmap = idx.get("weight_map") or {}
+        files = sorted(set(wmap.values()))
         declared = (idx.get("metadata") or {}).get("total_size")
+        # capture the bridge file's own shape: full metadata + a weight_map
+        # sample (first entries; too many to show all) + the shard file list.
+        index_info = {
+            "metadata": idx.get("metadata") or {},
+            "weight_map_sample": list(wmap.items())[:6],
+            "weight_map_total": len(wmap),
+            "shards": files,
+        }
     except urllib.error.HTTPError:
         files = ["model.safetensors"]  # single-file checkpoint
 
@@ -172,7 +188,7 @@ def fetch_safetensors_catalog(model_id: str) -> tuple[dict, int | None]:
             for name, meta in h.items():
                 b = meta["data_offsets"][1] - meta["data_offsets"][0]
                 catalog[name] = {"dtype": meta["dtype"], "shape": meta["shape"], "bytes": b}
-    return catalog, declared
+    return catalog, declared, len(files), index_info
 
 
 def classify_tensor(name: str, num_layers: int) -> str:
@@ -311,6 +327,136 @@ def exact_components(catalog: dict, cfg: dict) -> tuple[dict, dict, dict, dict]:
             "trueBits": (int_bits // pack) if (int_bits and pack > 1) else None,
         }
     return by_key, dtype_hist, comp_dtypes, recon
+
+
+def _dtype_nice(dt: str) -> str:
+    """Map a raw safetensors dtype string to a short human label (file-literal —
+    no sub-byte unpacking, since the evidence pane shows what is *in the file*)."""
+    return {"F8_E4M3": "fp8", "F8_E5M2": "fp8", "BF16": "bf16", "F16": "fp16",
+            "F32": "fp32", "F64": "fp64", "I8": "int8", "U8": "uint8",
+            "I16": "int16", "I32": "int32", "I64": "int64", "BOOL": "bool",
+            "F8_E8M0": "fp8(scale)", "F4": "fp4", "U4": "fp4"}.get(dt, dt)
+
+
+def sample_tensor_catalog(catalog: dict) -> dict:
+    """Pick a representative slice of the real safetensors catalog for the
+    evidence tab's "raw file" pane, so a reader can eyeball the actual dtype /
+    shape of a few tensors instead of all ~10^5 of them.
+
+    Strategy is prototype-based, not layer-number-based, so it generalizes to
+    every family: the transformer stacks identical layers, so we show the FIRST
+    layer of each distinct structural signature (signature = the set of tensor
+    name patterns after stripping the layer index and expert index). A dense
+    model collapses to one sampled layer; GLM (dense prefix + MoE) to two; a
+    hybrid (full-attention + linear/SSM) to two. Within a sampled layer, routed
+    experts are truncated to the first `EXPERT_KEEP`, with a note on the rest.
+    Global tensors (embed / final norm / lm_head) are always shown in full.
+    """
+    # keep a single representative expert — the "…N experts elided" note already
+    # tells the reader the rest are identical, so extra copies are just noise.
+    EXPERT_KEEP = 1
+    MAX_LAYERS = 4
+    # a "layer index" is the first N in either `layers.N.` (text stack) or
+    # `blocks.N.` (ViT / vision-tower stack) — generalizes to families we have
+    # not special-cased. Keep the matched keyword so text and vision layers with
+    # the same index don't collide, and so the signature can tell them apart.
+    lyr_re = re.compile(r"(?:^|\.)(layers|blocks|h)\.(\d+)\.")
+    exp_re = re.compile(r"(?:^|\.)experts\.(\d+)\.")
+
+    def entry(name):
+        m = catalog[name]
+        return {"name": name, "dtype": _dtype_nice(m["dtype"]),
+                "shape": m["shape"], "bytes": m["bytes"]}
+
+    def layer_key(name):
+        m = lyr_re.search(name)
+        return (m.group(1), int(m.group(2))) if m else None
+
+    # --- global (non-layer) tensors: embed, final norm, lm_head, etc. ---------
+    globals_ = sorted(n for n in catalog if layer_key(n) is None)
+    global_rows = [entry(n) for n in globals_]
+
+    # --- group layer tensors by (stack, index), then dedupe by structure ------
+    by_layer = {}
+    for n in catalog:
+        k = layer_key(n)
+        if k:
+            by_layer.setdefault(k, []).append(n)
+
+    def signature(names):
+        # canonicalize each name: drop the concrete layer & expert index so that
+        # two structurally-identical layers hash the same. The stack keyword
+        # stays (via lyr_re group 1 → "N"), so a text layer and a vision block
+        # never share a signature.
+        pats = set()
+        for n in names:
+            c = lyr_re.sub(r".\1.N.", n)
+            c = exp_re.sub(".experts.E.", c)
+            pats.add(c)
+        return frozenset(pats)
+
+    # precompute each layer's signature once; count how many layers share each
+    sigs = {k: signature(by_layer[k]) for k in by_layer}
+    sig_count = {}
+    for sg in sigs.values():
+        sig_count[sg] = sig_count.get(sg, 0) + 1
+
+    seen_sig, sampled = set(), []
+    for k in sorted(by_layer):          # sorts by (stack, idx): text then vision
+        sg = sigs[k]
+        if sg in seen_sig:
+            continue
+        seen_sig.add(sg)
+        sampled.append(k)
+
+    truncated_protos = max(0, len(sampled) - MAX_LAYERS)
+    sampled = sampled[:MAX_LAYERS]
+
+    layers = []
+    for k in sampled:
+        stack, idx = k
+        names = by_layer[k]
+        # count distinct routed experts in this layer; keep only the first few
+        exp_hits = [m for m in (exp_re.search(n) for n in names) if m]
+        experts = sorted({int(m.group(1)) for m in exp_hits})
+        keep_exp = set(experts[:EXPERT_KEEP])
+        rows = []
+        for n in sorted(names):
+            me = exp_re.search(n)
+            if me and int(me.group(1)) not in keep_exp:
+                continue
+            rows.append(entry(n))
+        label = f"{stack}.{idx}" if stack != "layers" else f"layer {idx}"
+        layers.append({
+            "idx": idx,
+            "stack": stack,
+            "label": label,
+            "rows": rows,
+            "n_experts": len(experts),
+            "expert_kept": min(len(experts), EXPERT_KEEP),
+            "same_count": sig_count[sigs[k]],
+        })
+
+    # --- raw dtype histogram (file-literal bytes, no unpacking) ----------------
+    hist = {}
+    for m in catalog.values():
+        hist[m["dtype"]] = hist.get(m["dtype"], 0) + m["bytes"]
+    total = sum(hist.values()) or 1
+    dtype_summary = [{"name": _dtype_nice(dt), "bytes": b, "pct": b / total}
+                     for dt, b in sorted(hist.items(), key=lambda kv: -kv[1])]
+
+    return {
+        "n_tensors": len(catalog),
+        "n_layers_total": len(by_layer),
+        "n_shards": None,   # filled by caller if index.json was read
+        "global_rows": global_rows,
+        "layers": layers,
+        "truncated_protos": truncated_protos,
+        "dtype_summary": dtype_summary,
+        "total_bytes": sum(m["bytes"] for m in catalog.values()),
+        # any quant-scale tensor present? (weight_scale_inv / qzeros / g_idx …)
+        "has_scale": any(QUANT_META.search(n) for n in catalog),
+    }
 
 
 def dtype_label(dtype_hist: dict) -> str:
@@ -1146,6 +1292,18 @@ def _gib(nbytes: float) -> str:
     return f"{v:,.1f}" if v >= 0.95 else f"{v:.2f}"
 
 
+def _bytes_h(nbytes: float) -> str:
+    """Human byte size for a single tensor: KiB / MiB / GiB, whichever reads
+    cleanest (individual tensors are far below 1 GiB, so _gib flattens them)."""
+    if nbytes >= GIB:
+        return f"{nbytes / GIB:,.2f} GiB"
+    if nbytes >= 2 ** 20:
+        return f"{nbytes / 2 ** 20:,.1f} MiB"
+    if nbytes >= 2 ** 10:
+        return f"{nbytes / 2 ** 10:,.1f} KiB"
+    return f"{int(nbytes)} B"
+
+
 def _b(params: float) -> str:
     v = params / 1e9
     return f"{v:,.1f}B" if v >= 10 else f"{v:.2f}B"
@@ -1227,10 +1385,179 @@ def build_parallel_struct(a: dict, cfg: dict) -> str:
     return h
 
 
+# config fields worth surfacing verbatim in the raw-evidence pane. Only the
+# structurally-meaningful ones (what the formulas consume) — not the full file,
+# which stays in the collapsible <details>. Order is display order.
+_RAW_CFG_KEYS = [
+    "model_type", "architectures", "torch_dtype", "hidden_size",
+    "num_hidden_layers", "num_attention_heads", "num_key_value_heads",
+    "head_dim", "vocab_size", "intermediate_size",
+    "kv_lora_rank", "q_lora_rank", "qk_nope_head_dim", "qk_rope_head_dim",
+    "v_head_dim", "n_routed_experts", "num_experts", "num_local_experts",
+    "num_experts_per_tok", "moe_intermediate_size", "n_shared_experts",
+    "first_k_dense_replace", "index_topk", "sliding_window",
+    "num_nextn_predict_layers", "quantization_config",
+]
+
+
+def _esc(s: str) -> str:
+    return (str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
+
+
+def build_raw_evidence(a: dict, cfg: dict) -> str:
+    """Section 0 of the evidence tab: the two primary source files, verbatim,
+    beside the facts the tool parsed from them. Left = raw config.json (key
+    fields + collapsible full text) and a representative safetensors tensor
+    sample; right = parsed architecture facts + dtype mix + Σ cross-check. A
+    draggable gutter sits between the two panes. Returns '' if safetensors was
+    not read (the pane's whole point is the file-vs-tool comparison)."""
+    raw = a.get("raw_evidence")
+    if not raw:
+        return ""
+
+    # ---------- LEFT · config.json (key fields highlighted) ----------
+    cfg_rows = ""
+    for k in _RAW_CFG_KEYS:
+        if k not in cfg:
+            continue
+        v = cfg[k]
+        if isinstance(v, dict):
+            # collapse any long list-valued sub-field (e.g. quantization_config's
+            # modules_to_not_convert lists 400+ layer names) to a count, keeping
+            # the high-signal scalar fields (quant_method, weight_block_size…).
+            v = {kk: (f"[{len(vv)} 项]" if isinstance(vv, list) and len(vv) > 6 else vv)
+                 for kk, vv in v.items()}
+            v = json.dumps(v, ensure_ascii=False)
+        elif isinstance(v, list):
+            v = json.dumps(v, ensure_ascii=False)
+        vs = _esc(v)
+        if len(vs) > 160:
+            vs = vs[:158] + "…"
+        cfg_rows += (f"<div class='ev-kv'><span class='ev-k'>{_esc(k)}</span>"
+                     f"<span class='ev-v'>{vs}</span></div>")
+    full_cfg = _esc(json.dumps(cfg, ensure_ascii=False, indent=2))
+    cfg_block = (
+        f"<details class='ev-det'><summary>{t('ev.raw_cfg_summary')}</summary>"
+        f"<div class='ev-kvlist'>{cfg_rows}</div>"
+        f"<details class='ev-det ev-sub'><summary>{t('ev.raw_cfg_full')}</summary>"
+        f"<pre class='ev-raw'>{full_cfg}</pre></details></details>")
+
+    # ---------- LEFT · safetensors sampled tensors ----------
+    def trow(r):
+        shp = "×".join(str(x) for x in r["shape"]) if r["shape"] else "—"
+        return (f"<tr><td class='ev-tn'>{_esc(r['name'])}</td>"
+                f"<td class='ev-td'>{_esc(r['dtype'])}</td>"
+                f"<td class='ev-ts'>{shp}</td>"
+                f"<td class='ev-tb'>{_bytes_h(r['bytes'])}</td></tr>")
+
+    thead = (f"<thead><tr><th>{t('ev.raw_col_tensor')}</th><th>{t('ev.raw_col_dtype')}</th>"
+             f"<th>{t('ev.raw_col_shape')}</th><th>{t('ev.raw_col_bytes')}</th></tr></thead>")
+    st_body = (f"<div class='ev-stgrp'><span class='ev-stlab'>{t('ev.raw_st_globals')}</span>"
+               f"<table class='ev-sttab'>{thead}<tbody>"
+               + "".join(trow(r) for r in raw["global_rows"]) + "</tbody></table></div>")
+    for lay in raw["layers"]:
+        note = ""
+        if lay["n_experts"] > lay["expert_kept"]:
+            note += " " + t("ev.raw_st_expertnote", kept=lay["expert_kept"],
+                            total=lay["n_experts"],
+                            rest=lay["n_experts"] - lay["expert_kept"])
+        if lay["same_count"] > 1:
+            note += " " + t("ev.raw_st_samenote", n=lay["same_count"] - 1)
+        st_body += (f"<div class='ev-stgrp'><span class='ev-stlab'>{_esc(lay['label'])}"
+                    f"<span class='ev-stdim'>{note}</span></span>"
+                    f"<table class='ev-sttab'>{thead}<tbody>"
+                    + "".join(trow(r) for r in lay["rows"]) + "</tbody></table></div>")
+    if raw["truncated_protos"]:
+        st_body += f"<div class='ev-stdim ev-sttrunc'>{t('ev.raw_st_trunc', n=raw['truncated_protos'])}</div>"
+    st_block = (f"<details class='ev-det'><summary>{t('ev.raw_st_summary')}</summary>"
+                f"{st_body}</details>")
+
+    # ---------- LEFT · the bridge file (index.json) between config & weights ----
+    info = raw.get("index_info")
+    if info:
+        meta_json = _esc(json.dumps(info.get("metadata") or {}, ensure_ascii=False, indent=2))
+        wmap_rows = "".join(
+            f"<div class='ev-kv'><span class='ev-k'>{_esc(name)}</span>"
+            f"<span class='ev-v'>{_esc(shard)}</span></div>"
+            for name, shard in info.get("weight_map_sample", []))
+        shards = info.get("shards") or []
+        shard_show = shards[:2] + (["…", shards[-1]] if len(shards) > 3 else shards[2:])
+        shard_txt = _esc(", ".join(shard_show))
+        idx_block = (
+            f"<details class='ev-det'><summary>{t('ev.raw_idx_summary')}</summary>"
+            f"<div class='ev-stdim' style='margin:0 0 8px'>{t('ev.raw_idx_bridge_note')}</div>"
+            f"<div class='ev-stlab'>{t('ev.raw_idx_metalab')}</div>"
+            f"<pre class='ev-raw'>{meta_json}</pre>"
+            f"<div class='ev-stlab'>{t('ev.raw_idx_wmaplab', shown=len(info.get('weight_map_sample', [])), total=info.get('weight_map_total', 0))}</div>"
+            f"<div class='ev-kvlist'>{wmap_rows}</div>"
+            f"<div class='ev-stlab'>{t('ev.raw_idx_shardlab', n=len(shards))}</div>"
+            f"<div class='ev-stdim'>{shard_txt}</div></details>")
+    else:
+        idx_block = ""
+
+    left = (f"<div class='ev-pane ev-pane-left'>"
+            f"<div class='ev-panetitle'>{t('ev.raw_left_title')}</div>"
+            f"{cfg_block}{idx_block}{st_block}</div>")
+
+    # ---------- RIGHT · parsed facts + dtype mix + Σ ----------
+    arch = a.get("arch", "?")
+    struct_bits = [t("ev.raw_fact_layers", L=cfg["num_hidden_layers"])]
+    if a["p"]["moe_layers"]:
+        nr = (cfg.get("n_routed_experts") or cfg.get("num_experts")
+              or cfg.get("num_local_experts"))
+        struct_bits.append(f"MoE ×{nr}")
+    struct_bits.append("MLA" if a["p"]["is_mla"] else "GQA/MHA")
+    if cfg.get("index_topk"):
+        struct_bits.append(f"DSA top-k {cfg['index_topk']}")
+    if a["p"].get("mtp"):
+        struct_bits.append(f"MTP ×{cfg.get('num_nextn_predict_layers')}")
+    if a.get("vision"):
+        struct_bits.append("vision tower")
+    facts = (f"<div class='ev-kv'><span class='ev-k'>{t('ev.raw_fact_arch')}</span>"
+             f"<span class='ev-v'>{_esc(arch)}</span></div>"
+             f"<div class='ev-kv'><span class='ev-k'>{t('ev.raw_fact_struct')}</span>"
+             f"<span class='ev-v'>{' · '.join(struct_bits)}</span></div>")
+
+    has_scale = raw.get("has_scale")
+    dbars = ""
+    maxb = max((d["bytes"] for d in raw["dtype_summary"]), default=1)
+    for d in raw["dtype_summary"]:
+        w = max(2.0, d["bytes"] / maxb * 100)
+        dbars += (f"<div class='ev-dtrow'><span class='ev-dtname'>{_esc(d['name'])}</span>"
+                  f"<span class='ev-dtbar' style='width:{w:.1f}%'></span>"
+                  f"<span class='ev-dtval'>{_gib(d['bytes'])}G · {d['pct']:.0%}</span></div>")
+    dtype_block = (f"<div class='ev-rblk'><div class='ev-rblab'>{t('ev.raw_fact_dtypes')}</div>"
+                   f"{dbars}"
+                   + (f"<div class='ev-stdim'>{t('ev.raw_fact_scale_note')}</div>" if has_scale else "")
+                   + "</div>")
+
+    idx = raw.get("index_total")
+    tot = raw["total_bytes"]
+    if idx:
+        dev = abs(tot - idx) / idx
+        sigma = t("ev.raw_sigma_ok", sigma=_gib(tot), idx=_gib(idx), dev=f"{dev:.1%}")
+    else:
+        sigma = t("ev.raw_sigma_line", sigma=_gib(tot))
+
+    right = (f"<div class='ev-pane ev-pane-right'>"
+             f"<div class='ev-panetitle'>{t('ev.raw_right_title')}</div>"
+             f"<div class='ev-rblk'>{facts}</div>{dtype_block}"
+             f"<div class='ev-sigma'>{sigma}</div></div>")
+
+    split = (f"<div class='ev-split'>{left}"
+             f"<div class='ev-gutter' title='drag'></div>{right}</div>")
+    # 3 files when there's an index.json bridge; 2 for single-file checkpoints
+    title = t("ev.raw_title") if info else t("ev.raw_title2")
+    note = t("ev.raw_note") if info else t("ev.raw_note2")
+    return (f"<div class='ev-sec'><div class='ev-h'>{title}</div>"
+            f"<div class='ev-note'>{note}</div>{split}</div>")
+
+
 def build_evidence(a: dict, cfg: dict, p: dict) -> str:
     """Evidence tab (first tab): why the weight numbers are trustworthy.
 
-    Three stacked sections, top-to-bottom = the reasoning order:
+    Sections, top-to-bottom = the reasoning order:
+      0 · raw sources — config.json + sampled safetensors beside parsed facts
       A · the config.json fields the formulas consume (the input)
       B · per-component parameter formula: symbolic = substituted = result
       C · reconciliation — config formula vs safetensors shapes, as paired bars.
@@ -1389,11 +1716,31 @@ def build_evidence(a: dict, cfg: dict, p: dict) -> str:
                  "moe_routed", "moe_shared", "mtp", "vision"]
         rows = [(k, recon[k]) for k in order
                 if k in recon and recon[k].get("formula") and recon[k].get("apparent")]
+        # Log scale for bar length: params span ~1000x (MoE 724B vs embed 0.95B),
+        # so a linear bar crushes every small component to the 2% floor and you
+        # can't tell 12.9B from 0.95B. Map log(value) into [FLOOR%, 100%]: the
+        # largest fills the bar, smaller ones shrink but stay clearly visible and
+        # correctly ordered. Both bars of a row share the scale, so "equal length
+        # = sources agree" and "apparent half of formula = sub-byte packing" both
+        # still read correctly.
+        FLOOR = 8.0  # min visible bar width (%) for the smallest component
         max_f = max((r["formula"] for _, r in rows), default=1)
+        min_v = min((min(r["formula"], r["apparent"]) for _, r in rows
+                     if r["formula"] and r["apparent"]), default=max_f)
+        lo = math.log(min_v) if min_v > 0 else 0
+        hi = math.log(max_f) if max_f > 0 else 1
+        span = (hi - lo) or 1
+
+        def barw(v):
+            if v <= 0:
+                return FLOOR
+            frac = (math.log(v) - lo) / span          # 0 (smallest) .. 1 (largest)
+            return FLOOR + frac * (100 - FLOOR)
+
         bars = ""
         for key, r in rows:
-            fw = max(2.0, r["formula"] / max_f * 100)
-            aw = max(2.0, r["apparent"] / max_f * 100)
+            fw = barw(r["formula"])
+            aw = barw(r["apparent"])
             color = _var(COMP_SLOT.get(key, 7))
             packed = r["pack"] > 1
             if packed:
@@ -1438,7 +1785,8 @@ def build_evidence(a: dict, cfg: dict, p: dict) -> str:
                f"　<span class='ev-dim'>{t('ev.kv_foot_body')}</span></div>")
 
     return (
-        f"<div class='ev-sec'><div class='ev-h'>{t('ev.sec_ab_title')}</div>"
+        build_raw_evidence(a, cfg)
+        + f"<div class='ev-sec'><div class='ev-h'>{t('ev.sec_ab_title')}</div>"
         f"<div class='ev-note'>{t('ev.sec_ab_note')}</div>{ab_table}</div>"
         f"<div class='ev-sec'><div class='ev-h'>{t('ev.sec_c_title')}</div>"
         f"<div class='ev-note'>{t('ev.sec_c_note')}</div>{sec_c}</div>"
@@ -1766,6 +2114,7 @@ def _build_lang_fragments(a: dict, cfg: dict, p: dict, is_moe: bool, short: str,
         "lbl_req": t("html.lbl_req"),
         "lbl_kv": t("html.lbl_kv"),
         "lbl_dp": t("html.lbl_dp"),
+        "lbl_dense_repl": t("html.lbl_dense_repl"),
         "lbl_inst": t("html.lbl_inst"),
         "lbl_frac": t("html.lbl_frac"),
         "lbl_custom_mem": t("html.lbl_custom_mem"),
@@ -2020,10 +2369,12 @@ def main():
 
     catalog = None
     declared = None
+    n_shards = 0
+    index_info = None
     weight_warnings = []
     if not args.no_exact:
         try:
-            catalog, declared = fetch_safetensors_catalog(args.model_id)
+            catalog, declared, n_shards, index_info = fetch_safetensors_catalog(args.model_id)
             got = sum(tv["bytes"] for tv in catalog.values())
             if declared and abs(got - declared) / declared > 0.01:
                 msg = (f"权重总量存疑：safetensors 头求和 {got / GIB:,.1f} GiB "
@@ -2041,6 +2392,14 @@ def main():
     a["kv_auto"] = kv_auto
     a["kv_choice"] = kv_choice
     a["index_total"] = declared            # official total_size for the Σ cross-check
+    # evidence tab: a representative slice of the raw safetensors catalog +
+    # the config fields, so the report can show the primary sources side-by-side
+    if catalog:
+        raw = sample_tensor_catalog(catalog)
+        raw["index_total"] = declared
+        raw["n_shards"] = n_shards
+        raw["index_info"] = index_info   # the bridge file's own structure
+        a["raw_evidence"] = raw
     if a.get("absorb_per_layer"):
         n_mtp = cfg.get("num_nextn_predict_layers", 0) or 0
         full = a["absorb_per_layer"] * (cfg["num_hidden_layers"] + n_mtp)
