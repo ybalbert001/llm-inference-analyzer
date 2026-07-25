@@ -113,6 +113,16 @@ var I18N = {
       return 'CP=' + cp + '：单条序列 KV 跨 ' + cp + ' 卡分摊 → <b>最长单序列 ≈ ' + seqTok +
         ' tokens</b>（这才是 CP 的价值：跑单卡装不下的超长 context；每卡显存与 DP-attention 相同）';
     },
+    shardTipPrefix: '切分：',
+    shardReplicated: '每卡整份复制（不切）',
+    shardByTp: function (tp) { return '按 TP 切 1⁄' + tp; },
+    shardByEp: function (ep) { return '按 EP 切到 ' + ep + ' 组专家（每卡持有 1⁄' + ep + ' 的专家）'; },
+    shardByKvHeads: function (d) { return '按 KV 头切 1⁄' + d + '（TP 超过 KV 头数则封顶）'; },
+    shardKvRepl: '每卡整份复制（MLA latent 无 head 维，纯 TP 复制）',
+    shardKvPerTp: function (tp) { return '每卡存 1⁄' + tp + '（dp-attention/CP：各 rank 只存自己那份 KV）'; },
+    shardLmHeadNote: '（lm_head 不随 dp/CP 复制，enable_dp_lm_head 默认关）',
+    shardDenseReplNote: '（moe_dense_tp=1：前置 dense 层每卡整份，CP 会强制此项）',
+    shardSharedEpNote: '（EP 后端 deepep/mooncake/nixl 下 shared expert 复制；纯 TP 则 /tp）',
     pctParen: function (pct) { return '（' + pct + '%）'; },
     layerChipLabel: function (lo, hi, count) { return 'L' + lo + '–L' + hi + ' ×' + count + ' 层'; },
     perLayerFrac: function (tp) { return '，每层 1⁄' + tp; },
@@ -314,6 +324,16 @@ var I18N = {
       return 'CP=' + cp + ': one sequence\'s KV spans ' + cp + ' ranks → <b>longest single sequence ≈ ' + seqTok +
         ' tokens</b> (this is what CP buys: context too long for one GPU; per-rank memory equals DP-attention)';
     },
+    shardTipPrefix: 'sharding: ',
+    shardReplicated: 'full copy per rank (not split)',
+    shardByTp: function (tp) { return 'split 1⁄' + tp + ' by TP'; },
+    shardByEp: function (ep) { return 'split across ' + ep + ' EP groups (each rank holds 1⁄' + ep + ' of experts)'; },
+    shardByKvHeads: function (d) { return 'split 1⁄' + d + ' by KV heads (capped when TP exceeds KV-head count)'; },
+    shardKvRepl: 'full copy per rank (MLA latent has no head dim, replicated under pure TP)',
+    shardKvPerTp: function (tp) { return '1⁄' + tp + ' per rank (dp-attention/CP: each rank stores only its own KV)'; },
+    shardLmHeadNote: ' (lm_head is not replicated under dp/CP; enable_dp_lm_head defaults off)',
+    shardDenseReplNote: ' (moe_dense_tp=1: leading dense layers kept whole per rank; CP forces this)',
+    shardSharedEpNote: ' (EP backends deepep/mooncake/nixl replicate the shared expert; pure TP splits it /tp)',
     pctParen: function (pct) { return ' (' + pct + '%)'; },
     layerChipLabel: function (lo, hi, count) { return 'L' + lo + '–L' + hi + ' ×' + count + ' layers'; },
     perLayerFrac: function (tp) { return ', 1⁄' + tp + ' per layer'; },
@@ -691,7 +711,12 @@ function gpuMemory(s, P){
   // moe_dense_tp_size=1 (P.denseRepl; auto-forced by CP) it's replicated per rank.
   w.denseFfn  = nd * L.denseFfn/(P.denseRepl ? 1 : P.tp);
   w.moeRouted = nm * L.moeRouted/P.tp;
-  w.moeShared = nm * L.moeShared/P.tp;
+  // shared experts: sharded /tp with the plain `none` MoE backend, but the EP
+  // backends (deepep/mooncake/nixl/…, which force ep_size=tp_size) build the
+  // shared expert REPLICATED (tp1). We proxy "EP backend in use" by ep>1, so
+  // ep>1 → replicated (/1), ep==1 → /tp. Verified against SGLang deepseek_v2.py
+  // (_shared_expert_use_tp1) — modeling it as /tp under EP under-counts memory.
+  w.moeShared = nm * L.moeShared/(P.ep > 1 ? 1 : P.tp);
   // MTP draft: expert FFN always /tp; attention flips to replicated under
   // dp-attention (mtpAttnFrac); plus the draft's own bf16 embed + w_kc/w_vc,
   // allocated at load (aliased to target later, but pool sizing sees them).
@@ -771,25 +796,63 @@ function expertInfo(t, P){
   return { cnt:cnt, lo:lo, hi:lo+cnt-1, sliceDenom:grp };
 }
 
+// one-line "how this component is sharded" for the mem-bar tooltip, reflecting
+// the current tp/ep/dp/cp/denseRepl. Mirrors gpuMemory()'s divisors exactly so
+// the tooltip and the bar length always agree.
+function shardRule(k, P){
+  var repl = Tr('shardReplicated'), byTp = Tr('shardByTp')(P.tp);
+  switch(k){
+    case 'embed':
+    case 'attention':
+      // in the attn-TP group: replicated under dp-attention/CP, else /tp
+      return P.dpAttn ? repl : byTp;
+    case 'lmHead':
+      return byTp + Tr('shardLmHeadNote');            // always /tp (dp_lm_head off)
+    case 'denseFfn':
+      return P.denseRepl ? repl + Tr('shardDenseReplNote') : byTp;
+    case 'moeRouted':
+      return P.ep > 1 ? Tr('shardByEp')(P.ep) : byTp;
+    case 'moeShared':
+      // EP backends (deepep/mooncake/nixl) build shared experts replicated; we
+      // proxy that by ep>1. Plain TP (ep==1) shards them /tp like a normal MLP.
+      return P.ep > 1 ? repl + Tr('shardSharedEpNote') : byTp;
+    case 'vision':
+      return P.dpAttn ? repl : byTp;                   // ViT attn shards, MLP replicated (approx)
+    case 'mtp':
+      return P.dpAttn ? repl : byTp;                   // attn part flips w/ dp; expert part /tp
+    default:
+      return byTp;
+  }
+}
+
 function memBar(m, P){
   var cap = P.memGib*GIB, h = '';
   // static region fills left-to-right; non-static blocks (activation) anchor at
   // the RIGHT edge with the free headroom in between, so they never overlap the
   // frac boundary line.
   var parts = [];
-  COMPS.forEach(function(c){ if (m.w[c.k] > 0) parts.push({label:c.label, b:m.w[c.k], color:c.color}); });
+  COMPS.forEach(function(c){ if (m.w[c.k] > 0) parts.push({label:c.label, b:m.w[c.k], color:c.color, k:c.k}); });
   parts.push({label:Tr('fixedOverhead')(), b:D.fixedGib*GIB, color:'var(--fixed)'});
   if (m.linState > 0) parts.push({label:Tr('linStateLabel')(P.req), b:m.linState,
                                   color:C.linState, note:Tr('linStateTipNote')()});
-  if (m.canStart) parts.push({label:Tr('kvCapLabel')(), b:m.kvCap, color:C.kv});
+  if (m.canStart) {
+    // KV pool has its own sharding story: replicated per rank under pure-TP MLA,
+    // else 1/tp under dp-attention/CP (or GQA over kv-heads).
+    var kvRule = P.dpAttn ? Tr('shardKvPerTp')(P.tp)
+               : D.kvIsMla ? Tr('shardKvRepl')
+                           : Tr('shardByKvHeads')(Math.min(P.tp, D.kvNKvHeads||P.tp));
+    parts.push({label:Tr('kvCapLabel')(), b:m.kvCap, color:C.kv, note:Tr('shardTipPrefix')+kvRule});
+  }
   function seg(s0){
     // clamp tiny-but-real segments to ~0.6% so they stay visible (activation
     // per GPU can be <0.2% of the card); flex-grow normalizes the slight excess
     var frac = Math.min(Math.max(s0.b/cap, 0.006), 1);
+    // per-component sharding rule (weights carry a key k; KV/linState carry note)
+    var rule = s0.note ? s0.note : (s0.k ? Tr('shardTipPrefix')+shardRule(s0.k, P) : '');
     return "<div class='seg' style='flex:"+frac.toFixed(6)+" 0 0;background:"+s0.color+
          "' data-tip='<b>"+s0.label+"</b>&emsp;"+gib(s0.b)+" GiB "+
          "<span class=\"tpct\">"+Tr('gpuPctTip')(P.memGib, (s0.b/cap*100).toFixed(1))+"</span>"+
-         (s0.note ? "<br>"+s0.note : "")+"'></div>";
+         (rule ? "<br>"+rule : "")+"'></div>";
   }
   parts.forEach(function(s0){ h += seg(s0); });
   var free = cap - m.used;
