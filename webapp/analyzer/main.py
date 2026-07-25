@@ -930,30 +930,103 @@ def attention_core_spec(cfg: dict) -> dict:
     return {"geometry": geometry, "pattern": pattern}
 
 
-def activation_bytes(cfg: dict, p: dict, batch_tokens: int) -> tuple[int, str]:
-    """Peak activation workspace for one forward pass over `batch_tokens` tokens.
+# Serving-time transient model: BASIC structural terms x one universal
+# multiplier. Deliberately simple — an earlier revision enumerated every
+# named allocation from a torch memory snapshot (hc residual lanes, fp8
+# staging, draft-MTP buffers…), but the terms are architecture-specific and
+# a blind test on an unseen model still missed by 17%, so the per-model
+# detail bought complexity without robustness. The multiplier absorbs all of
+# it. Calibration (validate_experiments/S1M_b200_memfrac/, 8xB200,
+# sglang v0.5.15.post1, measured slope / structural slope, MTP off):
+#   Qwen3-32B  dense                1.42
+#   DSv4-Pro   MoE+DSA+hc           1.50
+#   DSv4-Flash MoE+DSA+hc (derived) 1.88   <- multiplier grows with
+#                                             structural feature density
+# ACT_RUNTIME_MULT = 1.6 is the compromise: +7% on Qwen/Pro (conservative,
+# the safe direction for an OOM verdict), −15% on Flash. That worst case,
+# plus the two known biases below, is what the 25% margin engine.py keeps on
+# the serving-risk verdict absorbs:
+#   * MTP/speculative decoding adds ~15% (DSv4-Pro measured 0.654 -> 0.756)
+#     — NOT modeled here; the default assumes MTP off.
+#   * Dense models pre-reserve this workspace at startup via prefill CUDA
+#     graph capture (serving transient ≈ 0; same GiB, different failure
+#     mode: dense fails at startup, not on the first serving chunk).
+ACT_BASE_BYTES = int(0.9 * GIB)  # F-independent floor: allreduce/graph
+                                 # workspace, autotuner pools (S1M-S intercept)
+ACT_HIDDEN_BUFS = 8              # live hidden-sized buffers per token:
+                                 # residual, attn in/out, norm, double-buffer
+ACT_RUNTIME_MULT = 1.6           # structural bytes -> observed peak: quant
+                                 # staging, extra residual streams, kernel
+                                 # workspace, allocator rounding. Measured
+                                 # spread 1.42–1.61 across dense/MoE/DSA
+                                 # (MTP off); grows with structural complexity
 
-    Layers execute sequentially, so only one layer's intermediates are live at a
-    time (plus residual/hidden buffers and the logits for the sampled positions).
-    Per token, in bf16 (2 bytes): a few hidden-sized buffers (residual, attn in/out,
-    double-buffering) + the FFN up/gate intermediate. MoE: each token runs top-k
-    experts, so the intermediate is top_k x moe_intermediate. This matches the
-    order of what vLLM's memory profiler reserves; it is a workspace estimate,
-    not an exact number.
+
+def activation_parts(cfg: dict, p: dict) -> dict:
+    """Per-token serving-transient coefficients, split by TP-sharding behavior.
+
+    Bytes allocated during one forward pass over F tokens, where
+    F = min(chunked_prefill_size, prompt tokens actually in flight) — the
+    real step size, not the chunk config (S1M-S discriminator cell: chunk 16K
+    at concurrency 1 behaves like chunk 8K). Per GPU, bf16 (2 B).
+
+    UNSHARDED per token — every TP rank holds full-token, full-hidden copies
+    (TP slices weight matrices, not the activations' hidden dim):
+      * ACT_HIDDEN_BUFS x H       — residual/attn/norm buffers
+      * 2 x (top_k+shared) x H    — MoE dispatch: each token copied once per
+        selected expert into the grouped GEMM and back (in + out)
+      * index_heads x index_topk  — DSA indexer logits (the exact 1.96 GiB
+        failed alloc @F=16384 in the S1M-H OOM dumps)
+
+    SHARDED per token — divided by TP downstream (engine.gpu_memory):
+      * 2 x inter_eff             — FFN gate/up intermediate, follows its
+        TP/EP-sliced weight slice
+
+    Both sides x ACT_RUNTIME_MULT (see calibration table above);
+    ACT_BASE_BYTES on top once.
     """
     H = cfg["hidden_size"]
     inter = cfg.get("intermediate_size") or 4 * H
+    topk_sh = 0
     if p["moe_layers"]:
         topk = cfg.get("num_experts_per_tok", 1)
         n_shared = cfg.get("n_shared_experts", 0) or 0
-        inter_eff = (topk + n_shared) * cfg.get("moe_intermediate_size", inter)
+        topk_sh = topk + n_shared
+        inter_eff = topk_sh * cfg.get("moe_intermediate_size", inter)
     else:
         inter_eff = inter
-    per_token = 2 * (8 * H + 2 * inter_eff)   # bf16: ~8 hidden-size buffers + gate/up
-    total = batch_tokens * per_token
-    moe_note = t("act.desc_moe_note") if p["moe_layers"] else ""
-    desc = t("act.desc", H=H, inter_eff=f"{inter_eff:,}",
-             per_token_kib=f"{per_token / 1024:,.0f}", moe_note=moe_note)
+    unshard = 2 * ACT_HIDDEN_BUFS * H
+    if topk_sh:
+        unshard += 2 * 2 * topk_sh * H            # dispatch in + out
+    idx_heads, idx_topk = cfg.get("index_n_heads"), cfg.get("index_topk")
+    is_dsa = bool(idx_heads and idx_topk)
+    if is_dsa:
+        unshard += 2 * idx_heads * idx_topk       # indexer logits
+    return {
+        "base": ACT_BASE_BYTES,
+        "unshard_per_tok": unshard * ACT_RUNTIME_MULT,
+        "shard_per_tok": 2 * 2 * inter_eff * ACT_RUNTIME_MULT,
+        "is_moe": bool(topk_sh), "is_dsa": is_dsa,
+    }
+
+
+def activation_bytes(cfg: dict, p: dict, batch_tokens: int) -> tuple[int, str]:
+    """Peak serving transient for one forward over `batch_tokens` tokens, at
+    TP=1 (the estimate tab's hardware-agnostic view; engine.gpu_memory applies
+    the shard split per TP rank). See activation_parts() for the model and its
+    S1M-S calibration. `batch_tokens` should be the worst-case F: under
+    sustained load the scheduler fills the chunk, so the chunked-prefill size
+    is the right default; light single-request traffic peaks lower."""
+    parts = activation_parts(cfg, p)
+    per_token = parts["unshard_per_tok"] + parts["shard_per_tok"]
+    total = parts["base"] + batch_tokens * per_token
+    moe_note = t("act.desc_moe_note") if parts["is_moe"] else ""
+    dsa_note = t("act.desc_dsa_note") if parts["is_dsa"] else ""
+    desc = t("act.desc", H=cfg["hidden_size"],
+             unshard_kib=f"{parts['unshard_per_tok'] / 1024:,.0f}",
+             shard_kib=f"{parts['shard_per_tok'] / 1024:,.0f}",
+             base_gib=f"{parts['base'] / GIB:.1f}",
+             moe_note=moe_note, dsa_note=dsa_note)
     return total, desc
 
 
@@ -2235,7 +2308,10 @@ def render_html(a: dict, out_path: str, ctx_options: list, req_options: list,
     # Lazy import: engine imports this module back at module load.
     import engine
     D0 = engine.deploy_data(a, cfg)
-    fixed_gib = pargs.fixed_overhead_gib if pargs else 1.0
+    # TP-scaled default (see --fixed-overhead-gib help); explicit flag wins
+    fixed_gib = (pargs.fixed_overhead_gib
+                 if pargs and pargs.fixed_overhead_gib is not None
+                 else round(0.65 + 0.265 * (tp_init - 1), 2))
     D0["fixedGib"] = fixed_gib
     inst_spec = (instances or {}).get(inst_init) or {"gpu": None, "count": 8, "memGib": 80}
     P0 = {"tp": tp_init, "pp": pp_init, "ep": ep_init, "dpAttn": False,
@@ -2324,8 +2400,10 @@ def main():
     ap.add_argument("--ep", default="auto", help="initial expert-parallel size (default auto = TP for MoE)")
     ap.add_argument("--instance", default="p5en.48xlarge",
                     help="initial AWS instance type (default p5en.48xlarge)")
-    ap.add_argument("--fixed-overhead-gib", type=float, default=1.0,
-                    help="per-GPU fixed overhead: CUDA context / NCCL buffers (default 1 GiB)")
+    ap.add_argument("--fixed-overhead-gib", type=float, default=None,
+                    help="per-GPU fixed overhead: CUDA context / NCCL buffers. "
+                         "Default scales with TP: 0.65 + 0.265*(tp-1) GiB "
+                         "(measured: 0.65 @TP1 S0, 2.5 @TP8 S1, 2.90 pre-load @TP8 S1M)")
     ap.add_argument("--mem-fraction-static", type=float, default=0.9,
                     help="initial mem-fraction-static for the parallel tab: fraction of GPU "
                          "memory pre-allocated as weights + KV pool, mirroring SGLang "

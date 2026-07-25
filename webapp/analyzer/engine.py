@@ -138,6 +138,11 @@ def deploy_data(a: dict, cfg: dict) -> dict:
                            if a.get("vision") else 0),
         "visionActBytes": a.get("vision_act", 0),
         "actBytes": a["act_total"],
+        # per-token transient coefficients split by TP-sharding behavior
+        # (see core.activation_parts docstring); actTokens is the F the
+        # estimate was built at — gpu_memory() recombines these per rank
+        "actParts": core.activation_parts(cfg, a["p"]),
+        "actTokens": a["batch_tokens"],
         "weightsBytes": a["total_bytes"],
         "weightDtype": ("fp4" if "fp4" in a["wname"] else
                         "fp8" if "fp8" in a["wname"] else "bf16"),
@@ -217,7 +222,17 @@ def gpu_memory(D: dict, P: dict, s: int) -> dict:
                 for g_layers, g_win in groups]
     kv = sum(g["b"] for g in kv_parts)
 
-    act = D["actBytes"] / tp + (D["visionActBytes"] or 0)
+    # Serving transient per rank. TP slices weight matrices, NOT the token
+    # dimension: every rank runs all F tokens, so hidden-sized buffers, MoE
+    # dispatch staging, and the DSA indexer workspace are full-size per rank
+    # (unshard); only the FFN/expert intermediate follows its sliced weights
+    # (shard / tp). The old `actBytes / tp` divided everything by tp — with
+    # the missing MoE/DSA terms that compounded to a ~60x underestimate
+    # (0.19 vs 13 GiB measured, S1M-S). The base floor is per-rank as-is.
+    ap = D["actParts"]
+    act = (ap["base"]
+           + D["actTokens"] * (ap["unshard_per_tok"] + ap["shard_per_tok"] / tp)
+           + (D["visionActBytes"] or 0))
     lin_state = (D["linStateBytes"] or 0) * P["req"] * n / L_total / tp
     cap = P["memGib"] * GIB
     fixed = P["fixedGib"] * GIB
@@ -252,6 +267,17 @@ def _parallel_compute(D: dict, P: dict) -> dict | None:
         "world": P["tp"] * P["pp"],
         "oom": sum(1 for m in stages for _ in range(P["tp"])
                    if not m["canStart"] or m["free"] < 0),
+        # startup and serving fail differently (S1M/S1M-H): the KV pool is
+        # sized to whatever the static budget leaves (canStart), but the
+        # serving transient lives OUTSIDE the static region — a config can
+        # start cleanly and still crash on the first full-chunk prefill.
+        # The act estimate itself is best-effort: on the calibration model
+        # (DSv4-Pro) it lands within ±2%, but the blind test on DSv4-Flash
+        # (S1M-B) under-predicted by 17% — new architectures carry unnamed
+        # allocations. Hence the risk trigger keeps a 25% act margin rather
+        # than free < 0 exactly.
+        "serving_risk": sum(1 for m in stages for _ in range(P["tp"])
+                            if m["canStart"] and m["free"] < 0.25 * m["act"]),
         "all_start": all(m["canStart"] for m in stages),
         "kv_fits": all(m["canStart"] and m["kv"] <= m["kvCap"] for m in stages),
         "max_used": max(m["used"] for m in stages),
@@ -310,9 +336,23 @@ def parallel_verdict(D: dict, P: dict) -> dict:
         "mem_fraction_static": P["frac"],
         "fixed_overhead_gib": P["fixedGib"],
         "fits": all_start and oom == 0 and kv_fits,
-        "weights_fit": all_start and oom == 0,
+        # startability only (SKILL.md contract: false = engine can't even
+        # start). Serving-transient overflow is NOT startup failure — it
+        # reports through serving_oom_risk, and through fits via oom_gpus.
+        "weights_fit": all_start,
         "kv_fits_demand": kv_fits,
         "oom_gpus": oom,
+        # engine starts (KV pool > 0) but the serving transient exceeds what
+        # the static region left free: crashes on the first full-chunk
+        # prefill, not at startup. Validated S1M-H: frac >= 0.94 on 8xB200
+        # launched READY at every value and died serving. When true, quote
+        # serving_note, don't just say "fits=false".
+        "serving_oom_risk": pc["serving_risk"] > 0,
+        "serving_note": (
+            f"starts but serving transient (~{_gib(stages[0]['act'])} GiB "
+            f"peak per forward at {D['actTokens']:,} tokens) exceeds the "
+            f"non-static headroom — lower mem_fraction_static or "
+            f"chunked_prefill_size" if pc["serving_risk"] > 0 else None),
         "per_gpu": per_stage,  # one entry per pp stage; all tp ranks of a stage are identical
         "max_used_gib": _gib(max_used),
         "cluster_weights_gib": _gib(cluster_weights),

@@ -105,10 +105,13 @@ Call with `gpu=H100&gpus_per_node=8` (or the matching `instance`). Total need is
 grand_total ÷ GPU count** (TP replication, MLA KV replication, and the SGLang
 memory budget all break naive division; `parallel.kv_note` explains what
 replicates). If it doesn't fit, `per_gpu[].short_by_gib` and
-`kv_utilization_pct` say by how much and why. Distinguish the two failure
+`kv_utilization_pct` say by how much and why. Distinguish the three failure
 modes: `weights_fit=false` = engine can't even start; `kv_fits_demand=false` =
 starts, but not at the requested context × concurrency (then quote
-`max_concurrency`). Hand off: `#estimate` (breakdown) and `#parallel` (fit).
+`max_concurrency`); `serving_oom_risk=true` = starts, then **crashes on the
+first full-chunk prefill** — quote `serving_note` (the fix is a lower
+mem_fraction_static or smaller chunked_prefill_size, not more GPUs).
+Hand off: `#estimate` (breakdown) and `#parallel` (fit).
 
 ### "用 H100 部署需要多少张卡？每张卡占多少、剩多少？"
 
@@ -189,8 +192,13 @@ Run what-ifs and quantify each lever with real deltas — the API call is cheap:
   the memory sections.)
 - **More partitioning**: higher TP / adding PP shrinks per-GPU weights
   (`tp_sweep.rows`); dp-attention removes KV replication for MLA models.
-- **`mem_fraction_static`**: lowering it shrinks the KV pool, not real usage —
-  raise it (≤0.95) only when activation headroom allows; mention the trade.
+- **`mem_fraction_static`**: lowering it shrinks the KV pool, not real usage.
+  Raising it is bounded by the serving transient (per-forward activation peak,
+  which lives *outside* the static region): a too-high frac **starts fine and
+  then crashes on the first full-chunk prefill**. Check `serving_oom_risk` /
+  `serving_note` before recommending any frac above the default — for
+  large-chunk MoE models the crash line can be as low as ~0.93 (measured,
+  DSv4-Pro @B200 16K chunk).
 
 ## Calling notes
 

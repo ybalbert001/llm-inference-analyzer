@@ -36,8 +36,8 @@ effective value and lists which came from defaults (`defaults_used`).
 | `gpus_per_node` | int 1 – 72 | 8 | used with `gpu`/`gpu_mem_gib` |
 | `gpu_mem_gib` | float > 0 | — | raw GiB-per-GPU fallback for uncataloged hardware (no roofline section then) |
 | `mem_fraction_static` | 0.3 – 0.99 | 0.9 | SGLang semantics: fraction pre-allocated for weights + KV pool |
-| `fixed_overhead_gib` | 0 – 16 | 1.0 | per-GPU CUDA context/NCCL (measured 2.5 at TP8 on B200) |
-| `batch_tokens` | int 128 – 131072 | 8192 | decode-step batch context for roofline |
+| `fixed_overhead_gib` | 0 – 16 | tp-scaled | per-GPU CUDA context/NCCL; default `0.65 + 0.265×(tp−1)` (measured 0.65 @TP1, 2.5–2.9 @TP8 on B200); explicit value overrides |
+| `batch_tokens` | int 128 – 131072 | 8192 | tokens per forward (F) for the serving-transient estimate + decode roofline; set to the engine's chunked-prefill size under sustained load (SGLang DSv4 default: 16384) |
 | `chunk_tokens` | int 128 – 131072 | =batch_tokens | chunked-prefill size for the prefill roofline verdict |
 | `weight_dtype` | `bf16` `fp8` `fp4` | checkpoint's | roofline what-if: idealized dtype conversion (weights section still reports the real checkpoint) |
 
@@ -85,7 +85,9 @@ effective value and lists which came from defaults (`defaults_used`).
   },
 
   "runtime": {
-    "activation_gib": 8.4,                    // concurrency-independent workspace
+    "activation_gib": 8.4,                    // serving transient peak per forward over batch_tokens (F);
+                                              // ≈ base + per-token × F, calibrated on B200 measurements —
+                                              // this lives OUTSIDE the mem-fraction static region
     "vision_encoder_activation_gib": 0,       // VLMs only
     "runtime_total_gib": 145.8,               // kv total + linear state + activations
     "grand_total_gib": 309.1,                 // weights + runtime + 5% fragmentation,
@@ -97,10 +99,14 @@ effective value and lists which came from defaults (`defaults_used`).
     "tp": 8, "pp": 1, "ep": 8, "dp_attention": false,
     "world_gpus": 8, "gpu_mem_gib": 141.0,
     "mem_fraction_static": 0.9, "fixed_overhead_gib": 1.0,
-    "fits": true,                             // weights_fit AND kv_fits_demand — the headline verdict
-    "weights_fit": true,                      // engine can start (weights + overhead < budget)
+    "fits": true,                             // the headline verdict: starts, KV fits, AND serving transient fits
+    "weights_fit": true,                      // engine can start (weights + overhead < static budget)
     "kv_fits_demand": true,                   // requested context×requests fits the KV pool
     "oom_gpus": 0,
+    "serving_oom_risk": false,                // true = STARTS but crashes on the first full-chunk
+                                              // prefill (transient > non-static headroom); always
+                                              // quote serving_note instead of a bare "not fits"
+    "serving_note": null,                     // human explanation + levers when serving_oom_risk
     "per_gpu": [                              // one entry per pp stage (tp ranks of a stage are identical)
       {"pp_stage": 0, "layers": "L0-L91",
        "weights_gib": 20.1, "kv_pool_gib": 96.2,     // pool CAPACITY (SGLang pre-allocation)

@@ -1,0 +1,26 @@
+{
+  "skill_name": "llm-inference-analyzer",
+  "evals": [
+    {
+      "id": 0,
+      "eval_name": "instance-recommendation-three-tier",
+      "prompt": "帮我选个机型跑 zai-org/GLM-5.2-FP8，候选是 p5.48xlarge、p5en.48xlarge、p6-b200.48xlarge、p6-b300.48xlarge，场景是 128K context、32 并发。给个推荐。",
+      "expected_output": "Three-tier 🥇/🥈/🔹 recommendation covering every candidate that can start (none excluded), each tier with concrete numbers (per-GPU used/free, max_concurrency, tokens/s), dp-attention assumed for this MoE/MLA model, report_url offered for deeper exploration, concise (not a wall of tables).",
+      "files": []
+    },
+    {
+      "id": 1,
+      "eval_name": "fit-question-provenance-and-brevity",
+      "prompt": "Qwen/Qwen3-32B 能跑在 4×L40S 上吗？context 32K，大概 30 个并发。",
+      "expected_output": "Clear verdict grounded in API fields (parallel.fits / max_concurrency), shows the arithmetic behind the verdict (per_request_gib × requests vs pool), states assumptions used, hands off report_url, stays concise.",
+      "files": []
+    },
+    {
+      "id": 2,
+      "eval_name": "optimal-params-dp-attention-default",
+      "prompt": "deepseek-ai/DeepSeek-V4-Flash 在 p6-b200.48xlarge 单机上最优部署参数是什么？",
+      "expected_output": "Recommendation synthesized at best-known config: dp_attention=true assumed by default for this MoE model (verified via assumptions.dp_attention), smallest fitting TP from tp_sweep, kv_dtype named, roofline guidance quoted, static-analysis caveat, report_url handoff.",
+      "files": []
+    }
+  ]
+}

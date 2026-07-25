@@ -497,7 +497,7 @@ def _prepare_analysis(request: Request, *, model: str, context: int, requests: i
                       kv_dtype: str, tp: int, pp: int, ep: int | None,
                       dp_attention: bool, instance: str | None, gpu: str | None,
                       gpu_mem_gib: float | None, gpus_per_node: int,
-                      mem_fraction_static: float, fixed_overhead_gib: float,
+                      mem_fraction_static: float, fixed_overhead_gib: float | None,
                       batch_tokens: int, weight_dtype: str | None,
                       rate_prefix: str, rate_limit: int,
                       rate_what: str) -> tuple:
@@ -526,13 +526,29 @@ def _prepare_analysis(request: Request, *, model: str, context: int, requests: i
     kv_effective = engine.resolve_kv_auto(cfg) if kv_dtype == "auto" else kv_dtype
     a = core.analyze(model, cfg, context, requests, kv_effective,
                      batch_tokens, 0.05, catalog=catalog, exact_parts=exact_parts)
+    # fp4 checkpoints inflate at load: engines materialize scale/dequant
+    # side-buffers beyond the packed safetensors bytes. Measured on B200:
+    # DSv4-Pro +4.6% whole-model (mxfp4 experts, S1M), DSv4-Flash +12%
+    # (mxfp4) to +22% (dequant path, S1). Spread too wide for a silent
+    # multiplier — warn instead so fit verdicts near the boundary get a
+    # human check.
+    if "fp4" in a["wname"]:
+        weight_warnings = list(weight_warnings) + [
+            "fp4 权重运行时会膨胀（B200 实测 +4.6%~+22%，随 kernel 路径而异）——"
+            "safetensors 口径的 weights 偏乐观，贴边的 fit 判定请留余量"]
     D = engine.deploy_data(a, cfg)
-    D["fixedGib"] = fixed_overhead_gib
+    # default fixed overhead is TP-scaled (CUDA context + NCCL buffers grow
+    # with world size): 0.65 GiB @TP1 (S0 measured) + 0.265/extra rank
+    # (anchors: S1 2.5 GiB @TP8; S1M re-measured 2.90 pre-load @TP8).
+    # An explicit fixed_overhead_gib query param still wins.
+    fixed_eff = (fixed_overhead_gib if fixed_overhead_gib is not None
+                 else round(0.65 + 0.265 * (tp - 1), 2))
+    D["fixedGib"] = fixed_eff
     P = {"tp": tp, "pp": pp, "ep": ep or tp,
          "dpAttn": dp_attention and engine.dp_available(D, tp),
          "memGib": hw["memGib"], "gpn": hw["gpn"], "ctx": context, "req": requests,
          "kvDtype": kv_effective, "frac": mem_fraction_static,
-         "fixedGib": fixed_overhead_gib}
+         "fixedGib": fixed_eff}
     return a, cfg, D, P, hw, weight_warnings
 
 
@@ -552,7 +568,7 @@ def api_v1_analyze(  # sync def: FastAPI runs it in a worker thread (blocking HF
     gpu_mem_gib: float | None = Query(None, gt=0),
     gpus_per_node: int = Query(8, ge=1, le=72),
     mem_fraction_static: float = Query(0.9, ge=0.3, le=0.99),
-    fixed_overhead_gib: float = Query(1.0, ge=0, le=16),
+    fixed_overhead_gib: float | None = Query(None, ge=0, le=16),  # default: TP-scaled 0.65+0.265*(tp-1)
     batch_tokens: int = Query(8192, ge=128, le=131_072),
     chunk_tokens: int | None = Query(None, ge=128, le=131_072),
     weight_dtype: str | None = Query(None, description="roofline what-if override"),
@@ -600,7 +616,7 @@ def api_v1_analyze(  # sync def: FastAPI runs it in a worker thread (blocking HF
             "dp_attention": dp_effective,
             "dp_attention_requested": dp_attention,
             "mem_fraction_static": mem_fraction_static,
-            "fixed_overhead_gib": fixed_overhead_gib,
+            "fixed_overhead_gib": P["fixedGib"],  # effective: TP-scaled default unless overridden
             "batch_tokens": batch_tokens,
             "chunk_tokens": chunk_tokens or batch_tokens,
             "defaults_used": defaults_used,
@@ -668,7 +684,7 @@ def api_v1_whatif(  # sync def: worker thread (config fetch may block on first h
     gpu_mem_gib: float | None = Query(None, gt=0),
     gpus_per_node: int = Query(8, ge=1, le=72),
     mem_fraction_static: float = Query(0.9, ge=0.3, le=0.99),
-    fixed_overhead_gib: float = Query(1.0, ge=0, le=16),
+    fixed_overhead_gib: float | None = Query(None, ge=0, le=16),  # default: TP-scaled 0.65+0.265*(tp-1)
     batch_tokens: int = Query(8192, ge=128, le=131_072),
     chunk_tokens: int | None = Query(None, ge=128, le=131_072),
     weight_dtype: str | None = Query(None),
@@ -704,7 +720,8 @@ async def api_v1_catalog():
         "kv_dtypes": list(KV_DTYPES),
         "defaults": {"context": 131_072, "requests": 16, "kv_dtype": "auto",
                      "tp": 8, "pp": 1, "instance": "p5en.48xlarge",
-                     "mem_fraction_static": 0.9, "fixed_overhead_gib": 1.0,
+                     "mem_fraction_static": 0.9,
+                     "fixed_overhead_gib": "tp-scaled: 0.65+0.265*(tp-1)",
                      "batch_tokens": 8192},
     })
 
