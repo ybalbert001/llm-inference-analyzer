@@ -463,6 +463,41 @@ if (typeof location !== 'undefined') {
   if (location.hash === '#roofline') setTab('roofline');
 }
 
+/* evidence tab · draggable gutter between the raw-file pane and the parsed-fact
+   pane. Drag sets the two panes' flex-basis from the pointer's position inside
+   the split container; clamped so neither pane collapses. The evidence tab is
+   server-rendered (baked into the page), so this runs once at load. */
+function initEvidenceSplit() {
+  var gutters = document.querySelectorAll('.ev-split > .ev-gutter');
+  Array.prototype.forEach.call(gutters, function (g) {
+    var split = g.parentElement;
+    var left = split.querySelector('.ev-pane-left');
+    var right = split.querySelector('.ev-pane-right');
+    if (!left || !right) return;
+    var dragging = false;
+    function onMove(clientX) {
+      var r = split.getBoundingClientRect();
+      var pct = (clientX - r.left) / r.width * 100;
+      pct = Math.max(20, Math.min(80, pct));           // clamp 20%–80%
+      left.style.flex = '0 0 ' + pct.toFixed(1) + '%';
+      right.style.flex = '1 1 auto';
+    }
+    g.addEventListener('mousedown', function (e) {
+      dragging = true; g.classList.add('drag');
+      document.body.style.userSelect = 'none'; e.preventDefault();
+    });
+    document.addEventListener('mousemove', function (e) { if (dragging) onMove(e.clientX); });
+    document.addEventListener('mouseup', function () {
+      if (!dragging) return;
+      dragging = false; g.classList.remove('drag'); document.body.style.userSelect = '';
+    });
+    g.addEventListener('touchmove', function (e) {
+      if (e.touches[0]) { onMove(e.touches[0].clientX); e.preventDefault(); }
+    }, { passive: false });
+  });
+}
+initEvidenceSplit();
+
 /* ====================== what-if fetch orchestration ====================== */
 // Controls → query string → /api/v1/whatif → W → renderAll(). The initial
 // combination is baked in (D.whatif0), so first paint needs no network.
