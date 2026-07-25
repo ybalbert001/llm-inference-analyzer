@@ -175,6 +175,20 @@ def fetch_safetensors_catalog(model_id: str) -> tuple[dict, int | None]:
     return catalog, declared
 
 
+# classify_tensor patterns, precompiled: fine-grained MoE checkpoints hold
+# 100k+ tensors, so this function runs hot
+_RE_VISION = re.compile(r"(?:^|\.)(?:vision_tower|vision_model|vision_encoder|visual"
+                        r"|mm_projector|multi_modal_projector)\.")
+_RE_MTP = re.compile(r"(?:^|\.)(?:mtp|nextn)\.")
+_RE_LAYER = re.compile(r"layers\.(\d+)\.")
+_RE_HC = re.compile(r"(?:^|\.)hc_")
+_RE_NORM = re.compile(r"(?:^|[._])norm\b")
+_RE_HEAD = re.compile(r"(?:model\.)?head\.")
+_RE_EXPERTS = re.compile(r"\.experts\.")
+_RE_GATE = re.compile(r"\.(?:mlp|ffn)\.gate\.")
+_RE_FFN = re.compile(r"\.(?:mlp|ffn)\.")
+
+
 def classify_tensor(name: str, num_layers: int) -> str:
     """Map a tensor name to a component key. Handles HF-standard naming
     (model.layers.N.self_attn...) and DeepSeek-style (layers.N.attn.wkv...)."""
@@ -182,32 +196,30 @@ def classify_tensor(name: str, num_layers: int) -> str:
     # vision tower + multimodal projector, checked first: ViT tensors contain
     # substrings ("embed" in patch_embed, "norm" in layernorms) that would
     # otherwise leak into text components.
-    if re.search(r"(?:^|\.)(?:vision_tower|vision_model|vision_encoder|visual"
-                 r"|mm_projector|multi_modal_projector)\.", n):
+    if _RE_VISION.search(n):
         return "vision"
-    m = re.search(r"(?:^|\.)(?:mtp|nextn)\.", n)
-    if m:
+    if _RE_MTP.search(n):
         return "mtp"
-    lm = re.search(r"layers\.(\d+)\.", n)
+    lm = _RE_LAYER.search(n)
     if lm and int(lm.group(1)) >= num_layers:   # extra layers beyond L are MTP
         return "mtp"
-    if re.search(r"(?:^|\.)hc_", n):            # hyper-connection / highway params
+    if _RE_HC.search(n):                        # hyper-connection / highway params
         return "norms"
-    if "layernorm" in n or re.search(r"(?:^|[._])norm\b", n) or n.endswith("norm.weight"):
+    if "layernorm" in n or _RE_NORM.search(n) or n.endswith("norm.weight"):
         return "norms"
     if "embed" in n:
         return "embed"
-    if "lm_head" in n or re.match(r"(?:model\.)?head\.", n):
+    if "lm_head" in n or _RE_HEAD.match(n):
         return "lm_head"
     if "indexer" in n:
         return "indexer"
     if "shared_expert" in n:
         return "moe_shared"
-    if re.search(r"\.experts\.", n):
+    if _RE_EXPERTS.search(n):
         return "moe_routed"
-    if re.search(r"\.(?:mlp|ffn)\.gate\.", n):  # router (gate_proj is dense FFN)
+    if _RE_GATE.search(n):                      # router (gate_proj is dense FFN)
         return "moe_gate"
-    if re.search(r"\.(?:mlp|ffn)\.", n):
+    if _RE_FFN.search(n):
         return "dense_ffn"
     if "attn" in n or "attention" in n:
         return "attention"
@@ -255,6 +267,15 @@ def exact_components(catalog: dict, cfg: dict) -> tuple[dict, dict, dict, dict]:
     # config-declared hint (e.g. DeepSeek expert_dtype) as fallback confirmation
     hint_fp4 = str(cfg.get("expert_dtype", "")).lower() in ("fp4", "mxfp4", "nvfp4")
 
+    # _sub_byte_name is pure in (cfg, bits); memoize per bits — packed MoE
+    # checkpoints would otherwise recompute it for every expert tensor
+    _sub_byte_cache: dict[int, str] = {}
+
+    def sub_byte(bits: int) -> str:
+        if bits not in _sub_byte_cache:
+            _sub_byte_cache[bits] = _sub_byte_name(cfg, bits)
+        return _sub_byte_cache[bits]
+
     by_key, dtype_hist, comp_dtypes, recon = {}, {}, {}, {}
     for key, tensors in groups.items():
         apparent = 0
@@ -288,7 +309,7 @@ def exact_components(catalog: dict, cfg: dict) -> tuple[dict, dict, dict, dict]:
             if is_meta:
                 dt = "QSCALE"
             elif pack > 1 and t["dtype"] in INT_DTYPES:
-                dt = _sub_byte_name(cfg, INT_DTYPES[t["dtype"]] // pack)
+                dt = sub_byte(INT_DTYPES[t["dtype"]] // pack)
             else:
                 dt = t["dtype"]
             d["bytes"] += t["bytes"]
@@ -793,11 +814,16 @@ def activation_bytes(cfg: dict, p: dict, batch_tokens: int) -> tuple[int, str]:
 # ---------------------------------------------------------------- analyze
 
 def analyze(model_id: str, cfg: dict, ctx: int, requests: int, kv_dtype: str,
-            batch_tokens: int, overhead: float, catalog: dict | None = None) -> dict:
+            batch_tokens: int, overhead: float, catalog: dict | None = None,
+            exact_parts: tuple | None = None) -> dict:
     """All numbers the text report and the HTML diagram share.
 
     With a safetensors `catalog`, component bytes come from the real tensor
     sizes (exact, handles mixed precision); otherwise from formula x dtype.
+    `exact_parts` is an optional precomputed exact_components(catalog, cfg)
+    result — it only depends on (catalog, cfg), and scanning a 100k+-tensor
+    MoE catalog costs seconds, so callers serving many requests per model
+    should compute it once and pass it in.
     """
     wbytes, wname = weight_bytes_per_param(cfg)
     p = count_params(cfg)
@@ -818,7 +844,9 @@ def analyze(model_id: str, cfg: dict, ctx: int, requests: int, kv_dtype: str,
 
     exact = comp_dtypes = recon = None
     if catalog:
-        exact, dtype_hist, comp_dtypes, recon = exact_components(catalog, cfg)
+        exact, dtype_hist, comp_dtypes, recon = (
+            exact_parts if exact_parts is not None
+            else exact_components(catalog, cfg))
         wname = dtype_label(dtype_hist)
 
     comps = []

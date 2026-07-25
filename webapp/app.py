@@ -413,16 +413,19 @@ GPU_CATALOG: dict[str, float] = {}
 for _name, (_gpu, _cnt, _mib) in core.STATIC_INSTANCES.items():
     GPU_CATALOG[_gpu] = max(GPU_CATALOG.get(_gpu, 0), round(_mib / 1024, 1))
 
-_model_cache: dict[str, tuple[float, dict, dict | None, list[str]]] = {}
+_model_cache: dict[str, tuple[float, dict, dict | None, list[str], tuple | None]] = {}
 _model_cache_lock = threading.Lock()
 
 
-def _load_model(model_id: str) -> tuple[dict, dict | None, list[str]]:
-    """config + safetensors catalog, cached (headers fetch takes seconds)."""
+def _load_model(model_id: str) -> tuple[dict, dict | None, list[str], tuple | None]:
+    """config + safetensors catalog + precomputed exact_components, cached.
+    The headers fetch takes seconds, and exact_components over a 100k+-tensor
+    MoE catalog takes seconds of CPU — both depend only on the model, so they
+    are computed once per cache fill, not per request."""
     with _model_cache_lock:
         hit = _model_cache.get(model_id)
         if hit and time.time() - hit[0] < MODEL_CACHE_TTL_S:
-            return hit[1], hit[2], hit[3]
+            return hit[1], hit[2], hit[3], hit[4]
     cfg = engine.normalize_config(core.fetch_config(model_id))
     catalog, warnings = None, []
     try:
@@ -435,12 +438,13 @@ def _load_model(model_id: str) -> tuple[dict, dict | None, list[str]]:
     except Exception as exc:  # noqa: BLE001 — degrade to formula estimate
         warnings.append(f"could not read safetensors headers ({exc}); "
                         "weight numbers are formula estimates")
+    exact_parts = core.exact_components(catalog, cfg) if catalog else None
     with _model_cache_lock:
-        _model_cache[model_id] = (time.time(), cfg, catalog, warnings)
+        _model_cache[model_id] = (time.time(), cfg, catalog, warnings, exact_parts)
         if len(_model_cache) > 64:  # bound memory: drop oldest entries
             for k in sorted(_model_cache, key=lambda k: _model_cache[k][0])[:16]:
                 _model_cache.pop(k, None)
-    return cfg, catalog, warnings
+    return cfg, catalog, warnings, exact_parts
 
 
 def _resolve_hardware(instance: str | None, gpu: str | None,
@@ -513,7 +517,7 @@ def _prepare_analysis(request: Request, *, model: str, context: int, requests: i
     check_rate(f"{rate_prefix}:{ip}", rate_limit, rate_what)
 
     try:
-        cfg, catalog, weight_warnings = _load_model(model)
+        cfg, catalog, weight_warnings, exact_parts = _load_model(model)
     except Exception as exc:  # noqa: BLE001 — nonexistent/gated/network
         raise HTTPException(
             404, f"cannot fetch {model} from huggingface.co ({exc}); nonexistent or "
@@ -521,7 +525,7 @@ def _prepare_analysis(request: Request, *, model: str, context: int, requests: i
 
     kv_effective = engine.resolve_kv_auto(cfg) if kv_dtype == "auto" else kv_dtype
     a = core.analyze(model, cfg, context, requests, kv_effective,
-                     batch_tokens, 0.05, catalog=catalog)
+                     batch_tokens, 0.05, catalog=catalog, exact_parts=exact_parts)
     D = engine.deploy_data(a, cfg)
     D["fixedGib"] = fixed_overhead_gib
     P = {"tp": tp, "pp": pp, "ep": ep or tp,
