@@ -191,7 +191,8 @@ No parameters. The hardware vocabulary — **query this instead of recalling GPU
     "p6-b200.48xlarge": {"gpu": "B200", "gpus": 8, "gpu_mem_gib": 179.1},
     "p5en.48xlarge":    {"gpu": "H200", "gpus": 8, "gpu_mem_gib": 141.0},
     "p5.48xlarge":      {"gpu": "H100", "gpus": 8, "gpu_mem_gib": 80.0},
-    // + p4de/p4d (A100), g6e (L40S), g5 (A10G), h800-8gpu, h20-8gpu
+    // + p4de/p4d (A100), g7e (RTX PRO Server 6000, 96G Blackwell), g6e (L40S),
+    // g7 (RTX PRO 4500, 32G Blackwell), g6 (L4), g5 (A10G), h800-8gpu, h20-8gpu
   },
   "gpus": {"H200": 141.0, "B300": 268.6, …},  // valid `gpu` values → GiB (largest variant)
   "gpu_perf": {                               // GPUs with roofline support

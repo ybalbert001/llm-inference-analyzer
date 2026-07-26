@@ -147,7 +147,7 @@ var I18N = {
     dsaPrefillNote: function (topk) { return 'chunk 内 top-' + topk + ' causal attention；HBM 为理想下界，不含 gather 重读'; },
     customInstNoSpec: function () { return '自定义机型无算力/带宽规格'; },
     customInstNoSpecNote: function () {
-      return '请选择一个预设机型（H100/H200/H800/H20/B200/B300/A100/L40S/A10G）以绘制 roofline。';
+      return '请选择一个预设机型（H100/H200/H800/H20/B200/B300/A100/RTX PRO 6000/RTX PRO 4500/L40S/L4/A10G）以绘制 roofline。';
     },
     roofTitle: function (gpu, dtype, peak, bw, fallbackPart) {
       return 'Roofline（单卡）：' + gpu + ' — ' + dtype + ' dense ≈ ' + peak + ' TFLOPs/s · HBM ' + bw + ' TB/s' + fallbackPart;
@@ -346,7 +346,7 @@ var I18N = {
     dsaPrefillNote: function (topk) { return 'top-' + topk + ' causal attention within the chunk; HBM is the ideal lower bound, excluding gather reloads'; },
     customInstNoSpec: function () { return 'Custom instance has no compute/bandwidth spec'; },
     customInstNoSpecNote: function () {
-      return 'Select a preset instance (H100/H200/H800/H20/B200/B300/A100/L40S/A10G) to draw the roofline.';
+      return 'Select a preset instance (H100/H200/H800/H20/B200/B300/A100/RTX PRO 6000/RTX PRO 4500/L40S/L4/A10G) to draw the roofline.';
     },
     roofTitle: function (gpu, dtype, peak, bw, fallbackPart) {
       return 'Roofline (per-GPU): ' + gpu + ' — ' + dtype + ' dense ≈ ' + peak + ' TFLOPs/s · HBM ' + bw + ' TB/s' + fallbackPart;

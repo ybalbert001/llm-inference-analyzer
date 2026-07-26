@@ -459,8 +459,9 @@ def _resolve_hardware(instance: str | None, gpu: str | None,
         return {"gpu": g, "gpn": cnt, "memGib": round(mib / 1024, 1),
                 "label": f"{instance} ({cnt}x{g} {mib / 1024:.0f} GiB)"}
     if gpu:
-        name = gpu.strip().upper()
-        if name not in GPU_CATALOG:
+        # case-insensitive: catalog keys like "RTX PRO Server 6000" are mixed-case
+        name = {g.upper(): g for g in GPU_CATALOG}.get(gpu.strip().upper())
+        if name is None:
             raise HTTPException(400, f"unknown GPU '{gpu}'; supported: "
                                      f"{', '.join(sorted(GPU_CATALOG))}. For other "
                                      f"hardware pass gpu_mem_gib=<GiB per GPU> instead")

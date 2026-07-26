@@ -48,7 +48,8 @@ COMP_SLOT = {"embed": 0, "lm_head": 0, "attention": 1, "dense_ffn": 2,
 # ever come from the static table below.
 INSTANCE_TYPES = [
     "p6-b300.48xlarge", "p6-b200.48xlarge", "p5en.48xlarge", "p5.48xlarge",
-    "p4de.24xlarge", "p4d.24xlarge", "g6e.48xlarge", "g6e.12xlarge", "g5.48xlarge",
+    "p4de.24xlarge", "p4d.24xlarge", "g7e.48xlarge", "g7e.24xlarge",
+    "g6e.48xlarge", "g6e.12xlarge", "g7.48xlarge", "g6.48xlarge", "g5.48xlarge",
     "h800-8gpu", "h20-8gpu",
 ]
 
@@ -61,8 +62,12 @@ STATIC_INSTANCES = {  # name: (gpu, count per node, MiB per GPU)
     "p5.48xlarge":      ("H100", 8, 81920),
     "p4de.24xlarge":    ("A100", 8, 81920),
     "p4d.24xlarge":     ("A100", 8, 40960),
+    "g7e.48xlarge":     ("RTX PRO Server 6000", 8, 98304),  # Blackwell GB202, GDDR7
+    "g7e.24xlarge":     ("RTX PRO Server 6000", 4, 98304),
     "g6e.48xlarge":     ("L40S", 8, 45776),
     "g6e.12xlarge":     ("L40S", 4, 45776),
+    "g7.48xlarge":      ("RTX PRO 4500", 8, 32768),         # Blackwell GB203, GDDR7
+    "g6.48xlarge":      ("L4", 8, 22888),
     "g5.48xlarge":      ("A10G", 8, 22888),
     "h800-8gpu":        ("H800", 8, 81920),   # 80 GiB SXM
     "h20-8gpu":         ("H20",  8, 98304),   # 96 GiB SXM
@@ -82,6 +87,11 @@ GPU_PERF = {
     "A100": {"bf16": 312,  "fp8": None, "fp4": None,  "bw": 2.0},  # 80G SXM; 40G is 1.6
     "L40S": {"bf16": 362,  "fp8": 733,  "fp4": None,  "bw": 0.864},
     "A10G": {"bf16": 125,  "fp8": None, "fp4": None,  "bw": 0.6},
+    # RTX PRO Blackwell (GDDR7, no NVLink — inter-GPU traffic rides PCIe Gen5).
+    # NVIDIA quotes these with sparsity; halved here to keep the dense convention.
+    "RTX PRO Server 6000": {"bf16": 500, "fp8": 1000, "fp4": 2000, "bw": 1.597},
+    "RTX PRO 4500":        {"bf16": 203, "fp8": 405,  "fp4": 800,  "bw": 0.8},
+    "L4": {"bf16": 121, "fp8": 242, "fp4": None, "bw": 0.3},
 }
 
 
