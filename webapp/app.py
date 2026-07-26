@@ -498,7 +498,8 @@ def _prepare_analysis(request: Request, *, model: str, context: int, requests: i
                       dp_attention: bool, instance: str | None, gpu: str | None,
                       gpu_mem_gib: float | None, gpus_per_node: int,
                       mem_fraction_static: float, fixed_overhead_gib: float | None,
-                      batch_tokens: int, weight_dtype: str | None,
+                      batch_tokens: int, chunk_tokens: int | None,
+                      weight_dtype: str | None,
                       rate_prefix: str, rate_limit: int,
                       rate_what: str) -> tuple:
     """Validate + rate-limit + load + analyze — the shared front half of
@@ -524,8 +525,12 @@ def _prepare_analysis(request: Request, *, model: str, context: int, requests: i
                  f"gated models are not supported") from exc
 
     kv_effective = engine.resolve_kv_auto(cfg) if kv_dtype == "auto" else kv_dtype
+    # effective forward size F: chunk_tokens (the chunked-prefill control)
+    # wins over the legacy batch_tokens, so runtime.activation_gib and the
+    # parallel-tab serving transient agree on the same F
     a = core.analyze(model, cfg, context, requests, kv_effective,
-                     batch_tokens, 0.05, catalog=catalog, exact_parts=exact_parts)
+                     chunk_tokens or batch_tokens, 0.05,
+                     catalog=catalog, exact_parts=exact_parts)
     # fp4 checkpoints inflate at load: engines materialize scale/dequant
     # side-buffers beyond the packed safetensors bytes. Measured on B200:
     # DSv4-Pro +4.6% whole-model (mxfp4 experts, S1M), DSv4-Flash +12%
@@ -548,7 +553,11 @@ def _prepare_analysis(request: Request, *, model: str, context: int, requests: i
          "dpAttn": dp_attention and engine.dp_available(D, tp),
          "memGib": hw["memGib"], "gpn": hw["gpn"], "ctx": context, "req": requests,
          "kvDtype": kv_effective, "frac": mem_fraction_static,
-         "fixedGib": fixed_eff}
+         "fixedGib": fixed_eff,
+         # forward step size F for the serving-transient estimate: the
+         # chunked-prefill-size control drives both the roofline chunk and
+         # the parallel tab's activation term
+         "chunk": chunk_tokens or batch_tokens}
     return a, cfg, D, P, hw, weight_warnings
 
 
@@ -579,7 +588,7 @@ def api_v1_analyze(  # sync def: FastAPI runs it in a worker thread (blocking HF
         instance=instance, gpu=gpu, gpu_mem_gib=gpu_mem_gib,
         gpus_per_node=gpus_per_node, mem_fraction_static=mem_fraction_static,
         fixed_overhead_gib=fixed_overhead_gib, batch_tokens=batch_tokens,
-        weight_dtype=weight_dtype,
+        chunk_tokens=chunk_tokens, weight_dtype=weight_dtype,
         rate_prefix="api", rate_limit=API_PER_HOUR, rate_what="analyses per IP")
     ip = request.client.host if request.client else "unknown"
     log_access(f"api:{ip}", "analyze", model)
@@ -700,7 +709,7 @@ def api_v1_whatif(  # sync def: worker thread (config fetch may block on first h
         instance=instance, gpu=gpu, gpu_mem_gib=gpu_mem_gib,
         gpus_per_node=gpus_per_node, mem_fraction_static=mem_fraction_static,
         fixed_overhead_gib=fixed_overhead_gib, batch_tokens=batch_tokens,
-        weight_dtype=weight_dtype,
+        chunk_tokens=chunk_tokens, weight_dtype=weight_dtype,
         rate_prefix="whatif", rate_limit=API_PER_HOUR * 10, rate_what="what-ifs per IP")
     return JSONResponse(engine.whatif_payload(
         a, cfg, D, P, hw["gpu"], chunk_tokens or batch_tokens, weight_dtype))

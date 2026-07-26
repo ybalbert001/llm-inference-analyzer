@@ -943,11 +943,12 @@ def attention_core_spec(cfg: dict) -> dict:
 #   DSv4-Flash MoE+DSA+hc (derived) 1.88   <- multiplier grows with
 #                                             structural feature density
 # ACT_RUNTIME_MULT = 1.6 is the compromise: +7% on Qwen/Pro (conservative,
-# the safe direction for an OOM verdict), −15% on Flash. That worst case,
-# plus the two known biases below, is what the 25% margin engine.py keeps on
-# the serving-risk verdict absorbs:
-#   * MTP/speculative decoding adds ~15% (DSv4-Pro measured 0.654 -> 0.756)
-#     — NOT modeled here; the default assumes MTP off.
+# the safe direction for an OOM verdict), −15% on Flash. MTP/speculative
+# decoding adds ~15% on top (DSv4-Pro measured 0.654 -> 0.756) — models that
+# ship MTP layers get ACT_MTP_MULT by default, since deployments of those
+# models typically run with speculative decoding on. The remaining worst
+# case (Flash +MTP ≈ 2.16 vs the 1.84 estimate, −15%) is what the 25% margin
+# engine.py keeps on the serving-risk verdict absorbs. Other known bias:
 #   * Dense models pre-reserve this workspace at startup via prefill CUDA
 #     graph capture (serving transient ≈ 0; same GiB, different failure
 #     mode: dense fails at startup, not on the first serving chunk).
@@ -960,6 +961,10 @@ ACT_RUNTIME_MULT = 1.6           # structural bytes -> observed peak: quant
                                  # workspace, allocator rounding. Measured
                                  # spread 1.42–1.61 across dense/MoE/DSA
                                  # (MTP off); grows with structural complexity
+ACT_MTP_MULT = 1.15              # extra transient when speculative decoding
+                                 # runs (draft forward + verify buffers);
+                                 # applied by default to models with MTP
+                                 # layers (DSv4-Pro measured +15%)
 
 
 def activation_parts(cfg: dict, p: dict) -> dict:
@@ -982,8 +987,9 @@ def activation_parts(cfg: dict, p: dict) -> dict:
       * 2 x inter_eff             — FFN gate/up intermediate, follows its
         TP/EP-sliced weight slice
 
-    Both sides x ACT_RUNTIME_MULT (see calibration table above);
-    ACT_BASE_BYTES on top once.
+    Both sides x ACT_RUNTIME_MULT (see calibration table above), x ACT_MTP_MULT
+    on top when the checkpoint ships MTP layers (speculative decoding assumed
+    on for those models); ACT_BASE_BYTES on top once.
     """
     H = cfg["hidden_size"]
     inter = cfg.get("intermediate_size") or 4 * H
@@ -1002,11 +1008,13 @@ def activation_parts(cfg: dict, p: dict) -> dict:
     is_dsa = bool(idx_heads and idx_topk)
     if is_dsa:
         unshard += 2 * idx_heads * idx_topk       # indexer logits
+    has_mtp = bool(p.get("mtp"))
+    mult = ACT_RUNTIME_MULT * (ACT_MTP_MULT if has_mtp else 1.0)
     return {
         "base": ACT_BASE_BYTES,
-        "unshard_per_tok": unshard * ACT_RUNTIME_MULT,
-        "shard_per_tok": 2 * 2 * inter_eff * ACT_RUNTIME_MULT,
-        "is_moe": bool(topk_sh), "is_dsa": is_dsa,
+        "unshard_per_tok": unshard * mult,
+        "shard_per_tok": 2 * 2 * inter_eff * mult,
+        "is_moe": bool(topk_sh), "is_dsa": is_dsa, "is_mtp": has_mtp,
     }
 
 
@@ -1022,11 +1030,13 @@ def activation_bytes(cfg: dict, p: dict, batch_tokens: int) -> tuple[int, str]:
     total = parts["base"] + batch_tokens * per_token
     moe_note = t("act.desc_moe_note") if parts["is_moe"] else ""
     dsa_note = t("act.desc_dsa_note") if parts["is_dsa"] else ""
+    mtp_note = t("act.desc_mtp_note") if parts["is_mtp"] else ""
     desc = t("act.desc", H=cfg["hidden_size"],
              unshard_kib=f"{parts['unshard_per_tok'] / 1024:,.0f}",
              shard_kib=f"{parts['shard_per_tok'] / 1024:,.0f}",
              base_gib=f"{parts['base'] / GIB:.1f}",
-             moe_note=moe_note, dsa_note=dsa_note)
+             mult=f"{ACT_RUNTIME_MULT:g}",
+             moe_note=moe_note, dsa_note=dsa_note, mtp_note=mtp_note)
     return total, desc
 
 
@@ -2262,8 +2272,9 @@ def render_html(a: dict, out_path: str, ctx_options: list, req_options: list,
         return "".join(f"<option value='{v}'{' selected' if v == selected else ''}>"
                        f"{labeler(v)}</option>" for v in values)
 
-    # roofline chunked-prefill-size choices (sglang --chunked-prefill-size);
-    # default selection = --batch-tokens so the tab opens on the generated value
+    # chunked-prefill-size choices (sglang --chunked-prefill-size), shared by
+    # the roofline prefill chunk AND the parallel tab's serving-transient F;
+    # default selection = --batch-tokens so the tabs open on the generated value
     chunk_opts = sorted({1024, 2048, 4096, 8192, 16384, 32768} | {a["batch_tokens"]})
     chunk_options_html = "".join(
         f"<option value='{v}'{' selected' if v == a['batch_tokens'] else ''}>{v:,}</option>"
@@ -2318,7 +2329,7 @@ def render_html(a: dict, out_path: str, ctx_options: list, req_options: list,
           "memGib": inst_spec["memGib"], "gpn": inst_spec["count"],
           "ctx": a["ctx"], "req": a["requests"], "kvDtype": a["kv_dtype"],
           "frac": pargs.mem_fraction_static if pargs else 0.9,
-          "fixedGib": fixed_gib}
+          "fixedGib": fixed_gib, "chunk": a["batch_tokens"]}
     whatif0 = engine.whatif_payload(a, cfg, D0, P0, inst_spec["gpu"],
                                     a["batch_tokens"])
 

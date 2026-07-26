@@ -229,9 +229,12 @@ def gpu_memory(D: dict, P: dict, s: int) -> dict:
     # (shard / tp). The old `actBytes / tp` divided everything by tp — with
     # the missing MoE/DSA terms that compounded to a ~60x underestimate
     # (0.19 vs 13 GiB measured, S1M-S). The base floor is per-rank as-is.
+    # F follows the chunked-prefill-size control (P["chunk"]) so the parallel
+    # tab reacts to it; D["actTokens"] is the report-build default.
     ap = D["actParts"]
+    F = P.get("chunk") or D["actTokens"]
     act = (ap["base"]
-           + D["actTokens"] * (ap["unshard_per_tok"] + ap["shard_per_tok"] / tp)
+           + F * (ap["unshard_per_tok"] + ap["shard_per_tok"] / tp)
            + (D["visionActBytes"] or 0))
     lin_state = (D["linStateBytes"] or 0) * P["req"] * n / L_total / tp
     cap = P["memGib"] * GIB
@@ -350,8 +353,8 @@ def parallel_verdict(D: dict, P: dict) -> dict:
         "serving_oom_risk": pc["serving_risk"] > 0,
         "serving_note": (
             f"starts but serving transient (~{_gib(stages[0]['act'])} GiB "
-            f"peak per forward at {D['actTokens']:,} tokens) exceeds the "
-            f"non-static headroom — lower mem_fraction_static or "
+            f"peak per forward at {P.get('chunk') or D['actTokens']:,} tokens) "
+            f"exceeds the non-static headroom — lower mem_fraction_static or "
             f"chunked_prefill_size" if pc["serving_risk"] > 0 else None),
         "per_gpu": per_stage,  # one entry per pp stage; all tp ranks of a stage are identical
         "max_used_gib": _gib(max_used),

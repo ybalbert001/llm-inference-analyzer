@@ -37,8 +37,8 @@ effective value and lists which came from defaults (`defaults_used`).
 | `gpu_mem_gib` | float > 0 | — | raw GiB-per-GPU fallback for uncataloged hardware (no roofline section then) |
 | `mem_fraction_static` | 0.3 – 0.99 | 0.9 | SGLang semantics: fraction pre-allocated for weights + KV pool |
 | `fixed_overhead_gib` | 0 – 16 | tp-scaled | per-GPU CUDA context/NCCL; default `0.65 + 0.265×(tp−1)` (measured 0.65 @TP1, 2.5–2.9 @TP8 on B200); explicit value overrides |
-| `batch_tokens` | int 128 – 131072 | 8192 | tokens per forward (F) for the serving-transient estimate + decode roofline; set to the engine's chunked-prefill size under sustained load (SGLang DSv4 default: 16384) |
-| `chunk_tokens` | int 128 – 131072 | =batch_tokens | chunked-prefill size for the prefill roofline verdict |
+| `batch_tokens` | int 128 – 131072 | 8192 | decode-roofline batch and the default forward size F when `chunk_tokens` is unset |
+| `chunk_tokens` | int 128 – 131072 | =batch_tokens | chunked-prefill size: drives the prefill roofline verdict AND the serving-transient (activation) estimate in the parallel/fit verdicts; set to the engine's chunked-prefill size under sustained load (SGLang DSv4 default: 16384) |
 | `weight_dtype` | `bf16` `fp8` `fp4` | checkpoint's | roofline what-if: idealized dtype conversion (weights section still reports the real checkpoint) |
 
 ### Response schema
@@ -85,8 +85,10 @@ effective value and lists which came from defaults (`defaults_used`).
   },
 
   "runtime": {
-    "activation_gib": 8.4,                    // serving transient peak per forward over batch_tokens (F);
-                                              // ≈ base + per-token × F, calibrated on B200 measurements —
+    "activation_gib": 8.4,                    // serving transient peak per forward over F tokens
+                                              // (chunk_tokens, falling back to batch_tokens);
+                                              // ≈ base + per-token × F, calibrated on B200; models with
+                                              // MTP layers get ×1.15 (spec decoding assumed on) —
                                               // this lives OUTSIDE the mem-fraction static region
     "vision_encoder_activation_gib": 0,       // VLMs only
     "runtime_total_gib": 145.8,               // kv total + linear state + activations

@@ -18,10 +18,14 @@ MSG = {
     "act.desc": {
         "zh": "每 token ≈ {unshard_kib} KiB 不随 TP 分片（hidden 缓冲{moe_note}{dsa_note}）"
               " + {shard_kib} KiB ÷ TP（FFN/expert 中间层）+ 底数 {base_gib} GiB/卡；"
-              "含 ×1.6 运行时系数（B200 实测标定 1.4–1.9，MTP 关；开 MTP 再 +15%）",
+              "含 ×{mult} 运行时系数（B200 实测标定 1.4–1.9）{mtp_note}",
         "en": "per token ≈ {unshard_kib} KiB unsharded across TP (hidden buffers{moe_note}{dsa_note})"
               " + {shard_kib} KiB ÷ TP (FFN/expert intermediate) + {base_gib} GiB/GPU floor;"
-              " includes a ×1.6 runtime factor (measured 1.4–1.9 on B200, MTP off; MTP adds ~15%)",
+              " includes a ×{mult} runtime factor (measured 1.4–1.9 on B200){mtp_note}",
+    },
+    "act.desc_mtp_note": {
+        "zh": "，另 ×1.15 MTP/投机解码系数（模型带 MTP 层，默认按开启计）",
+        "en": " and ×1.15 for MTP/speculative decoding (model ships MTP layers, assumed on)",
     },
     "act.desc_moe_note": {"zh": "、MoE dispatch 每 token 复制 top-k+shared 份",
                           "en": ", MoE dispatch copies each token top-k+shared times"},
