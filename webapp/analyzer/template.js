@@ -227,6 +227,49 @@ var I18N = {
     fetchError: function () {
       return 'what-if 服务不可达——图中数字仍是上一次成功的参数组合，非当前选择';
     },
+    // structured warnings (viz.kvWarnings {key, params}) — mirror of the
+    // warn.* templates in i18n.py; params arrive pre-formatted from Python
+    warn_hybrid_state: function (p) {
+      return '混合架构：' + p.n_kv_layers + '/' + p.L + ' 层为 attention 存 KV，其余 ' + p.n_linear +
+        ' 层为 linear/SSM 定长 state ≈ ' + p.state_mib + ' MiB/请求（随并发不随 context 增长，' +
+        '并行页已计入静态区）。按 槽位数=并发数 的最小需求计；' +
+        'SGLang 默认启发式可能预分配更多槽，部署时建议显式设 --max-mamba-cache-size。';
+    },
+    warn_hybrid_nostate: function (p) {
+      return '混合架构：' + p.n_kv_layers + '/' + p.L + ' 层为 attention 存 KV，其余 ' + p.n_linear +
+        ' 层为 linear/SSM 定长 state（不计入 KV 池）；config 缺 linear_* 维度字段，state 显存未建模。';
+    },
+    warn_sliding_capped: function (p) {
+      return '滑窗注意力：' + p.n_sliding + ' 层 KV 存储上限已按 min(context, ' + p.window + ') 计。';
+    },
+    warn_sliding_unidentified: function (p) {
+      return '检出 sliding_window=' + p.window + ' 但无法从 config 判定哪些层滑窗；' +
+        'KV 存储未封顶（保守按全 context 计，可能高估）。';
+    },
+    warn_block_sparse: function (p) {
+      return '块稀疏注意力：' + p.n_sparse + ' 层 decode 读取封顶 min(context, ' + p.cap + ') tokens；' +
+        'KV 存储仍为全量（块稀疏需保留全部块）。';
+    },
+    warn_dsa_topk: function (p) {
+      return 'DSA top-k 稀疏：decode 读取封顶 min(context, ' + p.topk + ')；' +
+        '逐层稀疏频率（index_topk_freq 等）未区分。';
+    },
+    warn_weights_sum_mismatch: function (p) {
+      return '权重总量存疑：safetensors 头求和 ' + p.got_gib + ' GiB vs index 声明 ' + p.declared_gib +
+        ' GiB（差 ' + p.diff_pct + '，可能有分片头未读到或含未加载张量）。';
+    },
+    warn_headers_fetch_failed: function (p) {
+      return '未能读取 safetensors 头（' + p.err + '），回退到公式估算，权重为估算值。';
+    },
+    warn_fp4_inflation: function () {
+      return 'fp4 权重运行时会膨胀（B200 实测 +4.6%~+22%，随 kernel 路径而异）——' +
+        'safetensors 口径的 weights 偏乐观，贴边的 fit 判定请留余量';
+    },
+    warn_mla_absorb: function (p) {
+      return 'MLA 权重吸收：SGLang 加载时将 kv_b_proj 反量化为 bf16 w_kc/w_vc（fp8 原件保留），' +
+        '全尺寸 ≈ ' + p.full_gib + ' GiB，随 attention-TP 切分（纯 TP÷tp；dp-attention 每卡整份）。' +
+        '未计入上方 safetensors 权重表；并行 tab 已计入。';
+    },
   },
   en: {
     weightsStaticLabel: function () { return 'Weights (static)'; },
@@ -425,6 +468,52 @@ var I18N = {
     },
     fetchError: function () {
       return 'what-if service unreachable — numbers shown are the last successful combination, not the current selection';
+    },
+    warn_hybrid_state: function (p) {
+      return 'Hybrid architecture: ' + p.n_kv_layers + '/' + p.L + ' layers are attention with paged KV; the other ' +
+        p.n_linear + ' layers keep a fixed linear/SSM state ≈ ' + p.state_mib +
+        ' MiB/request (grows with concurrency, not context; counted into the static region on the parallel tab). ' +
+        'Sized at slots = concurrency, the minimum; SGLang’s default heuristic may pre-allocate more slots — ' +
+        'set --max-mamba-cache-size explicitly when deploying.';
+    },
+    warn_hybrid_nostate: function (p) {
+      return 'Hybrid architecture: ' + p.n_kv_layers + '/' + p.L + ' layers are attention with paged KV; the other ' +
+        p.n_linear + ' layers keep a fixed linear/SSM state (not part of the KV pool); ' +
+        'the config lacks the linear_* dimension fields, so that state’s VRAM is unmodeled.';
+    },
+    warn_sliding_capped: function (p) {
+      return 'Sliding-window attention: KV storage for ' + p.n_sliding + ' layers is capped at min(context, ' + p.window + ').';
+    },
+    warn_sliding_unidentified: function (p) {
+      return 'sliding_window=' + p.window + ' detected but the config does not say which layers are sliding; ' +
+        'KV storage is left uncapped (conservatively full context — likely an overestimate).';
+    },
+    warn_block_sparse: function (p) {
+      return 'Block-sparse attention: decode reads for ' + p.n_sparse + ' layers are capped at min(context, ' + p.cap +
+        ') tokens; KV storage stays full (all blocks must be retained).';
+    },
+    warn_dsa_topk: function (p) {
+      return 'DSA top-k sparsity: decode reads are capped at min(context, ' + p.topk + '); ' +
+        'per-layer sparsity frequency (index_topk_freq etc.) is not differentiated.';
+    },
+    warn_weights_sum_mismatch: function (p) {
+      return 'Weight total in doubt: safetensors headers sum to ' + p.got_gib + ' GiB vs ' + p.declared_gib +
+        ' GiB declared by the index (off by ' + p.diff_pct +
+        '; some shard headers may be unread, or the index counts tensors that never load).';
+    },
+    warn_headers_fetch_failed: function (p) {
+      return 'Could not read the safetensors headers (' + p.err + '); falling back to the config formula — ' +
+        'weight numbers are estimates.';
+    },
+    warn_fp4_inflation: function () {
+      return 'fp4 weights inflate at runtime (+4.6%–+22% measured on B200, varies by kernel path) — ' +
+        'safetensors-based weight numbers are optimistic; leave headroom on fit verdicts near the boundary';
+    },
+    warn_mla_absorb: function (p) {
+      return 'MLA weight absorption: at load SGLang dequantizes kv_b_proj into bf16 w_kc/w_vc ' +
+        '(the fp8 originals are kept), full size ≈ ' + p.full_gib + ' GiB, sharded by attention-TP ' +
+        '(pure TP ÷tp; dp-attention keeps a full copy per GPU). ' +
+        'Not included in the safetensors weight table above; the parallel tab does include it.';
     },
   }
 };
@@ -1304,15 +1393,23 @@ function renderRoofline() {
   });
 })();
 
-function renderAll(){ renderEstimate(); renderParallel(); renderRoofline(); }
+function renderAll(){ renderKvWarnings(); renderEstimate(); renderParallel(); renderRoofline(); }
 
 function renderKvWarnings(){
   var box = el('kv-warnings');
   if (!box) return;
   var ws = D.kvWarnings || [];
-  box.innerHTML = ws.map(function(w){ return "<div class='kvw'>⚠ "+w+"</div>"; }).join('');
+  box.innerHTML = ws.map(function(w){
+    // structured {key, params} → warn_* I18N entry (re-renders on language
+    // switch); plain strings pass through (older cached reports)
+    var text = w;
+    if (w && typeof w === 'object') {
+      var f = Tr('warn_' + w.key);
+      text = f ? f(w.params || {}) : JSON.stringify(w);
+    }
+    return "<div class='kvw'>⚠ "+text+"</div>";
+  }).join('');
 }
-renderKvWarnings();
 // every control change → one debounced server round-trip → full re-render
 ['f-ctx','f-req','f-kv','f-pp','f-ep','f-dp','f-wdtype','f-chunk'].forEach(function(id){
   el(id).addEventListener('change', refresh);

@@ -29,7 +29,7 @@ import sys
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 
-from i18n import t, set_lang, get_lang
+from i18n import t, set_lang, get_lang, warning, render_warning
 
 GIB = 1024 ** 3
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -834,26 +834,19 @@ def kv_structure(cfg: dict) -> dict:
             lin_state_per_req = n_linear * (conv_b + ssm_b)
 
     if n_linear and lin_state_per_req:
-        warnings.append(
-            f"混合架构：{n_kv_layers}/{L} 层为 attention 存 KV，"
-            f"其余 {n_linear} 层为 linear/SSM 定长 state ≈ "
-            f"{lin_state_per_req / 2**20:.1f} MiB/请求（随并发不随 context 增长，"
-            f"并行页已计入静态区）。按 槽位数=并发数 的最小需求计；"
-            f"SGLang 默认启发式可能预分配更多槽，部署时建议显式设 --max-mamba-cache-size。")
+        warnings.append(warning(
+            "hybrid_state", n_kv_layers=n_kv_layers, L=L, n_linear=n_linear,
+            state_mib=f"{lin_state_per_req / 2**20:.1f}"))
     elif n_linear:
-        warnings.append(
-            f"混合架构：{n_kv_layers}/{L} 层为 attention 存 KV，"
-            f"其余 {n_linear} 层为 linear/SSM 定长 state（不计入 KV 池）；"
-            f"config 缺 linear_* 维度字段，state 显存未建模。")
+        warnings.append(warning(
+            "hybrid_nostate", n_kv_layers=n_kv_layers, L=L, n_linear=n_linear))
     if n_sliding:
-        warnings.append(
-            f"滑窗注意力：{n_sliding} 层 KV 存储上限已按 min(context, {sliding_window}) 计。")
+        warnings.append(warning(
+            "sliding_capped", n_sliding=n_sliding, window=sliding_window))
 
     # sliding_window present but layers not identifiable → do NOT cap storage
     if sliding_window and not n_sliding:
-        warnings.append(
-            f"检出 sliding_window={sliding_window} 但无法从 config 判定哪些层滑窗；"
-            f"KV 存储未封顶（保守按全 context 计，可能高估）。")
+        warnings.append(warning("sliding_unidentified", window=sliding_window))
 
     # --- decode read cap (roofline) ------------------------------------------
     read_cap = 0
@@ -865,14 +858,10 @@ def kv_structure(cfg: dict) -> dict:
         freq = sparse.get("sparse_attention_freq")
         n_sparse = sum(freq) if isinstance(freq, list) else L
         read_cap, read_cap_layers = cap, n_sparse
-        warnings.append(
-            f"块稀疏注意力：{n_sparse} 层 decode 读取封顶 min(context, {cap}) tokens；"
-            f"KV 存储仍为全量（块稀疏需保留全部块）。")
+        warnings.append(warning("block_sparse", n_sparse=n_sparse, cap=cap))
     elif cfg.get("index_topk") is not None:
         read_cap, read_cap_layers = int(cfg["index_topk"]), L
-        warnings.append(
-            f"DSA top-k 稀疏：decode 读取封顶 min(context, {cfg['index_topk']})；"
-            f"逐层稀疏频率（index_topk_freq 等）未区分。")
+        warnings.append(warning("dsa_topk", topk=int(cfg["index_topk"])))
     elif n_sliding:
         read_cap, read_cap_layers = sliding_window, n_sliding
 
@@ -1368,7 +1357,7 @@ def report(a: dict):
     print(f"{'=' * 68}")
     print(f"\n-- STATIC: weights {a['total_params'] / 1e9:,.1f} B params -> {human(a['total_bytes'])} --\n")
     for w in a.get("weight_warnings", []):
-        print(f"  ⚠ {w}")
+        print(f"  ⚠ {render_warning(w)}")
     print(f"  {'component':<38}{'params':>12}{'memory':>12}{'share':>7}")
     for c in sorted(a["comps"], key=lambda x: -x["params"]):
         if c["params"] == 0:
@@ -1399,7 +1388,7 @@ def report(a: dict):
         print(f"    每图 {v['tokens_per_image']:,} 个图像 token 进 KV cache（与文本同 cell，占 context 位置）")
     print(f"  runtime total: {human(a['runtime_total'])}")
     for w in a["kv_struct"]["warnings"]:
-        print(f"  ⚠ {w}")
+        print(f"  ⚠ {render_warning(w)}")
     print(f"\n-- TOTAL --\n")
     print(f"  weights {human(a['total_bytes'])} + runtime {human(a['runtime_total'])} "
           f"+ fragmentation ~{a['overhead']:.0%} = ~{human(a['grand'])}")
@@ -2349,6 +2338,8 @@ def render_html(a: dict, out_path: str, ctx_options: list, req_options: list,
         "frags": frags,
         "model": a["model_id"],
         "whatif0": whatif0,
+        # structured {key, params}: template.js renders via its warn.* I18N
+        # mirror so the in-page language switcher re-renders them too
         "kvWarnings": a.get("weight_warnings", []) + a["kv_struct"]["warnings"],
         # model constants the renderer needs between payloads (labels, legend
         # visibility, and the static segments of the estimate bar)
@@ -2464,15 +2455,16 @@ def main():
             catalog, declared, n_shards, index_info = fetch_safetensors_catalog(args.model_id)
             got = sum(tv["bytes"] for tv in catalog.values())
             if declared and abs(got - declared) / declared > 0.01:
-                msg = (f"权重总量存疑：safetensors 头求和 {got / GIB:,.1f} GiB "
-                       f"vs index 声明 {declared / GIB:,.1f} GiB"
-                       f"（差 {abs(got - declared) / declared:.1%}，可能有分片头未读到或含未加载张量）。")
-                weight_warnings.append(msg)
-                print(f"warning: {msg}", file=sys.stderr)
+                w = warning("weights_sum_mismatch",
+                            got_gib=f"{got / GIB:,.1f}",
+                            declared_gib=f"{declared / GIB:,.1f}",
+                            diff_pct=f"{abs(got - declared) / declared:.1%}")
+                weight_warnings.append(w)
+                print(f"warning: {render_warning(w)}", file=sys.stderr)
         except Exception as e:
-            msg = f"未能读取 safetensors 头（{e}），回退到公式估算，权重为估算值。"
-            weight_warnings.append(msg)
-            print(f"note: {msg}", file=sys.stderr)
+            w = warning("headers_fetch_failed", err=str(e))
+            weight_warnings.append(w)
+            print(f"note: {render_warning(w)}", file=sys.stderr)
 
     a = analyze(args.model_id, cfg, args.context, args.requests, args.kv_dtype,
                 args.batch_tokens, args.overhead, catalog=catalog)
@@ -2490,10 +2482,7 @@ def main():
     if a.get("absorb_per_layer"):
         n_mtp = cfg.get("num_nextn_predict_layers", 0) or 0
         full = a["absorb_per_layer"] * (cfg["num_hidden_layers"] + n_mtp)
-        weight_warnings.append(
-            f"MLA 权重吸收：SGLang 加载时将 kv_b_proj 反量化为 bf16 w_kc/w_vc（fp8 原件保留），"
-            f"全尺寸 ≈ {full / GIB:.2f} GiB，随 attention-TP 切分（纯 TP÷tp；dp-attention 每卡整份）。"
-            f"未计入上方 safetensors 权重表；并行 tab 已计入。")
+        weight_warnings.append(warning("mla_absorb", full_gib=f"{full / GIB:.2f}"))
     a["weight_warnings"] = weight_warnings
     report(a)
     if args.html:

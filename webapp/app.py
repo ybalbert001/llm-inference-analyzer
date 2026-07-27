@@ -42,6 +42,7 @@ ANALYZER_SCRIPT = WEBAPP_DIR / "analyzer" / "main.py"
 sys.path.insert(0, str(ANALYZER_SCRIPT.parent))
 import engine  # noqa: E402
 import main as core  # noqa: E402
+from i18n import warning, render_warning  # noqa: E402
 DATA_DIR = WEBAPP_DIR / "data"
 REPORTS_DIR = DATA_DIR / "reports"
 DB_PATH = DATA_DIR / "app.db"
@@ -432,12 +433,13 @@ def _load_model(model_id: str) -> tuple[dict, dict | None, list[str], tuple | No
         catalog, declared, _n_shards, _index_info = core.fetch_safetensors_catalog(model_id)
         got = sum(t["bytes"] for t in catalog.values())
         if declared and abs(got - declared) / declared > 0.01:
-            warnings.append(
-                f"safetensors headers sum {got / (1024**3):.1f} GiB vs index-declared "
-                f"{declared / (1024**3):.1f} GiB — some shards may be unread")
+            warnings.append(warning(
+                "weights_sum_mismatch",
+                got_gib=f"{got / (1024**3):,.1f}",
+                declared_gib=f"{declared / (1024**3):,.1f}",
+                diff_pct=f"{abs(got - declared) / declared:.1%}"))
     except Exception as exc:  # noqa: BLE001 — degrade to formula estimate
-        warnings.append(f"could not read safetensors headers ({exc}); "
-                        "weight numbers are formula estimates")
+        warnings.append(warning("headers_fetch_failed", err=str(exc)))
     exact_parts = core.exact_components(catalog, cfg) if catalog else None
     with _model_cache_lock:
         _model_cache[model_id] = (time.time(), cfg, catalog, warnings, exact_parts)
@@ -539,9 +541,7 @@ def _prepare_analysis(request: Request, *, model: str, context: int, requests: i
     # multiplier — warn instead so fit verdicts near the boundary get a
     # human check.
     if "fp4" in a["wname"]:
-        weight_warnings = list(weight_warnings) + [
-            "fp4 权重运行时会膨胀（B200 实测 +4.6%~+22%，随 kernel 路径而异）——"
-            "safetensors 口径的 weights 偏乐观，贴边的 fit 判定请留余量"]
+        weight_warnings = list(weight_warnings) + [warning("fp4_inflation")]
     D = engine.deploy_data(a, cfg)
     # default fixed overhead is TP-scaled (CUDA context + NCCL buffers grow
     # with world size): 0.65 GiB @TP1 (S0 measured) + 0.265/extra rank
@@ -582,6 +582,8 @@ def api_v1_analyze(  # sync def: FastAPI runs it in a worker thread (blocking HF
     batch_tokens: int = Query(8192, ge=128, le=131_072),
     chunk_tokens: int | None = Query(None, ge=128, le=131_072),
     weight_dtype: str | None = Query(None, description="roofline what-if override"),
+    lang: str = Query("zh", pattern="^(zh|en)$",
+                      description="language for warnings/notes prose"),
 ):
     a, cfg, D, P, hw, weight_warnings = _prepare_analysis(
         request, model=model, context=context, requests=requests,
@@ -641,7 +643,7 @@ def api_v1_analyze(  # sync def: FastAPI runs it in a worker thread (blocking HF
                 {"name": c["name"], "params_b": round(c["params"] / 1e9, 3),
                  "gib": round(c["bytes"] / gib, 2), "share": round(c["share"], 4)}
                 for c in sorted(a["comps"], key=lambda c: -c["bytes"]) if c["params"]],
-            "warnings": weight_warnings,
+            "warnings": [render_warning(w, lang) for w in weight_warnings],
         },
         "kv_cache": {
             "dtype": kv_effective,
@@ -651,7 +653,7 @@ def api_v1_analyze(  # sync def: FastAPI runs it in a worker thread (blocking HF
             "mla_vs_mha_savings_x": round(a["mha_ratio"], 1) if a["mha_ratio"] else None,
             "linear_state_total_gib": round(a["lin_state_total"] / gib, 2)
             if a["lin_state_total"] else 0,
-            "notes": a["kv_struct"]["warnings"],
+            "notes": [render_warning(w, lang) for w in a["kv_struct"]["warnings"]],
         },
         "runtime": {
             "activation_gib": round(a["act_total"] / gib, 2),

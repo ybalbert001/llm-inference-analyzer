@@ -40,6 +40,7 @@ effective value and lists which came from defaults (`defaults_used`).
 | `batch_tokens` | int 128 – 131072 | 8192 | decode-roofline batch and the default forward size F when `chunk_tokens` is unset |
 | `chunk_tokens` | int 128 – 131072 | =batch_tokens | chunked-prefill size: drives the prefill roofline verdict AND the serving-transient (activation) estimate in the parallel/fit verdicts; set to the engine's chunked-prefill size under sustained load (SGLang DSv4 default: 16384) |
 | `weight_dtype` | `bf16` `fp8` `fp4` | checkpoint's | roofline what-if: idealized dtype conversion (weights section still reports the real checkpoint) |
+| `lang` | `zh` `en` | zh | language for the prose in `weights.warnings` and `kv_cache.notes`; numbers are language-independent |
 
 ### Response schema
 

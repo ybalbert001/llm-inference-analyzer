@@ -385,6 +385,87 @@ MSG = {
     # ---- main() console notes
     "cli.kv_dsa_note": {"zh": "（DSA/稀疏注意力模型，对齐 SGLang 默认 fp8_e4m3）", "en": " (DSA/sparse-attention model, matches SGLang default fp8_e4m3)"},
     "pstruct.vision_block": {"zh": "Vision tower + projector（图像入口）", "en": "Vision tower + projector (image input)"},
+
+    # ---- structured warnings ({key, params} in kv_structure()/main(); rendered
+    # via render_warning() for terminal/API, and mirrored key-for-key in
+    # template.js I18N so the in-page language switcher can re-render them.
+    # Params arrive pre-formatted (strings/ints), so templates only substitute.
+    "warn.hybrid_state": {
+        "zh": "混合架构：{n_kv_layers}/{L} 层为 attention 存 KV，"
+              "其余 {n_linear} 层为 linear/SSM 定长 state ≈ "
+              "{state_mib} MiB/请求（随并发不随 context 增长，"
+              "并行页已计入静态区）。按 槽位数=并发数 的最小需求计；"
+              "SGLang 默认启发式可能预分配更多槽，部署时建议显式设 --max-mamba-cache-size。",
+        "en": "Hybrid architecture: {n_kv_layers}/{L} layers are attention with paged KV; "
+              "the other {n_linear} layers keep a fixed linear/SSM state ≈ "
+              "{state_mib} MiB/request (grows with concurrency, not context; "
+              "counted into the static region on the parallel tab). Sized at "
+              "slots = concurrency, the minimum; SGLang's default heuristic may "
+              "pre-allocate more slots — set --max-mamba-cache-size explicitly when deploying.",
+    },
+    "warn.hybrid_nostate": {
+        "zh": "混合架构：{n_kv_layers}/{L} 层为 attention 存 KV，"
+              "其余 {n_linear} 层为 linear/SSM 定长 state（不计入 KV 池）；"
+              "config 缺 linear_* 维度字段，state 显存未建模。",
+        "en": "Hybrid architecture: {n_kv_layers}/{L} layers are attention with paged KV; "
+              "the other {n_linear} layers keep a fixed linear/SSM state (not part of "
+              "the KV pool); the config lacks the linear_* dimension fields, so that "
+              "state's VRAM is unmodeled.",
+    },
+    "warn.sliding_capped": {
+        "zh": "滑窗注意力：{n_sliding} 层 KV 存储上限已按 min(context, {window}) 计。",
+        "en": "Sliding-window attention: KV storage for {n_sliding} layers is capped "
+              "at min(context, {window}).",
+    },
+    "warn.sliding_unidentified": {
+        "zh": "检出 sliding_window={window} 但无法从 config 判定哪些层滑窗；"
+              "KV 存储未封顶（保守按全 context 计，可能高估）。",
+        "en": "sliding_window={window} detected but the config does not say which "
+              "layers are sliding; KV storage is left uncapped (conservatively full "
+              "context — likely an overestimate).",
+    },
+    "warn.block_sparse": {
+        "zh": "块稀疏注意力：{n_sparse} 层 decode 读取封顶 min(context, {cap}) tokens；"
+              "KV 存储仍为全量（块稀疏需保留全部块）。",
+        "en": "Block-sparse attention: decode reads for {n_sparse} layers are capped at "
+              "min(context, {cap}) tokens; KV storage stays full (all blocks must be retained).",
+    },
+    "warn.dsa_topk": {
+        "zh": "DSA top-k 稀疏：decode 读取封顶 min(context, {topk})；"
+              "逐层稀疏频率（index_topk_freq 等）未区分。",
+        "en": "DSA top-k sparsity: decode reads are capped at min(context, {topk}); "
+              "per-layer sparsity frequency (index_topk_freq etc.) is not differentiated.",
+    },
+    "warn.weights_sum_mismatch": {
+        "zh": "权重总量存疑：safetensors 头求和 {got_gib} GiB "
+              "vs index 声明 {declared_gib} GiB"
+              "（差 {diff_pct}，可能有分片头未读到或含未加载张量）。",
+        "en": "Weight total in doubt: safetensors headers sum to {got_gib} GiB vs "
+              "{declared_gib} GiB declared by the index (off by {diff_pct}; some shard "
+              "headers may be unread, or the index counts tensors that never load).",
+    },
+    "warn.headers_fetch_failed": {
+        "zh": "未能读取 safetensors 头（{err}），回退到公式估算，权重为估算值。",
+        "en": "Could not read the safetensors headers ({err}); falling back to the "
+              "config formula — weight numbers are estimates.",
+    },
+    "warn.fp4_inflation": {
+        "zh": "fp4 权重运行时会膨胀（B200 实测 +4.6%~+22%，随 kernel 路径而异）——"
+              "safetensors 口径的 weights 偏乐观，贴边的 fit 判定请留余量",
+        "en": "fp4 weights inflate at runtime (+4.6%–+22% measured on B200, varies by "
+              "kernel path) — safetensors-based weight numbers are optimistic; leave "
+              "headroom on fit verdicts near the boundary",
+    },
+    "warn.mla_absorb": {
+        "zh": "MLA 权重吸收：SGLang 加载时将 kv_b_proj 反量化为 bf16 w_kc/w_vc（fp8 原件保留），"
+              "全尺寸 ≈ {full_gib} GiB，随 attention-TP 切分（纯 TP÷tp；dp-attention 每卡整份）。"
+              "未计入上方 safetensors 权重表；并行 tab 已计入。",
+        "en": "MLA weight absorption: at load SGLang dequantizes kv_b_proj into bf16 "
+              "w_kc/w_vc (the fp8 originals are kept), full size ≈ {full_gib} GiB, "
+              "sharded by attention-TP (pure TP ÷tp; dp-attention keeps a full copy "
+              "per GPU). Not included in the safetensors weight table above; the "
+              "parallel tab does include it.",
+    },
 }
 
 _lang = "zh"
@@ -403,3 +484,26 @@ def t(key: str, **kwargs) -> str:
     entry = MSG[key]
     s = entry.get(_lang, entry["zh"])
     return s.format(**kwargs) if kwargs else s
+
+
+def warning(key: str, **params) -> dict:
+    """A structured warning: {key, params} instead of a baked string.
+
+    Producers (kv_structure(), main(), app.py) emit these; render_warning()
+    turns one into prose for the terminal report and the JSON API, and
+    template.js carries a mirror of the warn.* templates so the in-page
+    language switcher can re-render them client-side. `key` is stored without
+    the "warn." prefix; params must be pre-formatted (plain strings/numbers).
+    """
+    assert f"warn.{key}" in MSG, f"unknown warning key: {key}"
+    return {"key": key, "params": params}
+
+
+def render_warning(w, lang: str | None = None) -> str:
+    """Render a structured warning to prose; plain strings pass through
+    (belt-and-braces for any producer not yet migrated)."""
+    if isinstance(w, str):
+        return w
+    entry = MSG[f"warn.{w['key']}"]
+    s = entry.get(lang or _lang, entry["zh"])
+    return s.format(**w["params"])
