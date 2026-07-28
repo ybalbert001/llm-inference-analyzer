@@ -10,7 +10,7 @@ inference-deployment analysis. This skill contains **no compute logic** — ever
 number comes from the API, so all users always get the same, latest engine.
 
 ```
-BASE=https://llm-inference-analyzer.ybalbert.people.aws.dev
+BASE=https://inference-analyzer.app
 GET $BASE/api/v1/analyze?model=<org/name>&...   # anonymous JSON — the workhorse
 GET $BASE/api/v1/catalog                        # hardware vocabulary + defaults
 ```

@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## 这个仓库是什么
 
-只需一个 HuggingFace model ID，analyzer 就能产出完整的推理部署分析——显存拆解、并行切分、roofline 性能上界——外加一份可交互的单文件 HTML 报告。全程不下载权重：用 `config.json` 公式与 safetensors 分片头（HTTP Range 请求只读前几百 KB）互相对账，从而暴露真实 dtype 与亚字节打包（fp4/int4）。线上服务：<https://llm-inference-analyzer.ybalbert.people.aws.dev>。
+只需一个 HuggingFace model ID，analyzer 就能产出完整的推理部署分析——显存拆解、并行切分、roofline 性能上界——外加一份可交互的单文件 HTML 报告。全程不下载权重：用 `config.json` 公式与 safetensors 分片头（HTTP Range 请求只读前几百 KB）互相对账，从而暴露真实 dtype 与亚字节打包（fp4/int4）。线上服务：<https://inference-analyzer.app>。
 
 ## 常用命令
 
@@ -21,8 +21,6 @@ DEV_MODE=1 .venv/bin/python app.py      # http://localhost:8000，免登录（�
 ```
 
 没有测试套件和 linter。验证是经验性的：skill 行为 eval 在 `skills/llm-inference-analyzer/evals/evals.json`；数学正确性靠真实 SGLang 部署实测对账，记录在 `validate_experiments/`。
-
-Git：push 一律用 `git push --no-verify`（pre-push hook 会拦截普通 `git push`）。
 
 ## 架构
 

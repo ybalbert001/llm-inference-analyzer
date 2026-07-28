@@ -1,7 +1,7 @@
 # API Reference — llm-inference-analyzer hosted service
 
 ```
-BASE = https://llm-inference-analyzer.ybalbert.people.aws.dev
+BASE = https://inference-analyzer.app
 ```
 
 Three anonymous JSON endpoints (no auth, no token). Every response carries `engine_version` identifying the exact math revision.

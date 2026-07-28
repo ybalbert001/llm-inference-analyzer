@@ -30,7 +30,7 @@
 
 ## 使用方式
 
-**1. 访问部署的 webapp**， 线上地址：<https://llm-inference-analyzer.ybalbert.people.aws.dev>
+**1. 访问部署的 webapp**， 线上地址：<https://inference-analyzer.app>
 
 **2. 安装成 Agent Skill**(./llm-inference-analyzer.zip), 通过自然语言提问。
 

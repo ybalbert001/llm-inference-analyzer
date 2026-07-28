@@ -29,7 +29,7 @@ Why this works: the first two sources are independent and can be **reconciled** 
 
 ## How to use
 
-**1. Use the deployed webapp** — live at <https://llm-inference-analyzer.ybalbert.people.aws.dev>
+**1. Use the deployed webapp** — live at <https://inference-analyzer.app>
 
 **2. Install as an Agent Skill**(./llm-inference-analyzer.zip), then just ask in natural language.
 
