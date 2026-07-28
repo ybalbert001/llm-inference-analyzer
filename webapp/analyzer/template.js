@@ -89,6 +89,20 @@ var I18N = {
       return 'mem-fraction-static ' + frac + ' 下 KV 池容量 ≈ <b>' + maxTok +
         '</b> tokens（max_total_num_tokens，按瓶颈 stage）≈ ' + maxReq + ' 个 ' + ctxLbl + ' 满 context 请求';
     },
+    sumCpSeqLine: function (cpRanks, seqTok) {
+      return 'Prefill CP 开启（按 attn_cp_size=tp 建模）：单条序列 KV 跨 ' + cpRanks +
+        ' 卡分摊 → <b>最长单序列 ≈ ' + seqTok +
+        ' tokens</b>（这才是 CP 的价值：跑单卡装不下的超长 context；每卡显存与 DP-attention 相同）';
+    },
+    // per-component "how this is sharded" tooltip strings (mem-bar segments)
+    shardTipPrefix: '切分：',
+    shardReplicated: '每卡整份复制（不切）',
+    shardByTp: function (tp) { return '按 TP 切到 1⁄' + tp + '（每卡持有 1⁄' + tp + '）'; },
+    shardByEp: function (ep) { return '按 EP 切到 ' + ep + ' 组专家（每卡持有 1⁄' + ep + ' 的专家）'; },
+    shardKvRepl: '每卡整份复制（MLA latent 无 head 维，纯 TP 下复制）',
+    shardKvPerTp: function (tp) { return '每卡存 1⁄' + tp + '（dp-attention/CP：各 rank 只存自己那份 KV）'; },
+    shardDenseReplNote: '（moe_dense_tp=1：前置 dense 层每卡整份，CP 会强制此项）',
+    shardSharedEpNote: '（EP 后端 deepep/mooncake/nixl 下 shared expert 复制；纯 TP 则 ⁄tp）',
     sumCapDpSuffix: function (dp, clusterTok, clusterReq) {
       return '（每 rank 池，完整 cell 口径，与 SGLang 日志对账；×DP' + dp + ' = 集群 ' + clusterTok +
         ' tokens ≈ ' + clusterReq + ' 个请求）';
@@ -331,6 +345,20 @@ var I18N = {
       return 'At mem-fraction-static ' + frac + ', KV pool ≈ <b>' + maxTok +
         '</b> tokens (max_total_num_tokens, bottleneck stage) ≈ ' + maxReq + ' full-' + ctxLbl + '-context requests';
     },
+    sumCpSeqLine: function (cpRanks, seqTok) {
+      return 'Prefill CP on (modeled at attn_cp_size=tp): one sequence\'s KV spans ' + cpRanks +
+        ' ranks → <b>longest single sequence ≈ ' + seqTok +
+        ' tokens</b> (this is what CP buys: context too long for one GPU; per-rank memory equals DP-attention)';
+    },
+    // per-component "how this is sharded" tooltip strings (mem-bar segments)
+    shardTipPrefix: 'sharding: ',
+    shardReplicated: 'full copy per rank (not split)',
+    shardByTp: function (tp) { return 'split /TP to 1⁄' + tp + ' (each rank holds 1⁄' + tp + ')'; },
+    shardByEp: function (ep) { return 'split across ' + ep + ' EP groups (each rank holds 1⁄' + ep + ' of experts)'; },
+    shardKvRepl: 'full copy per rank (MLA latent has no head dim, replicated under pure TP)',
+    shardKvPerTp: function (tp) { return '1⁄' + tp + ' per rank (dp-attention/CP: each rank stores only its own KV)'; },
+    shardDenseReplNote: ' (moe_dense_tp=1: leading dense layers kept whole per rank; CP forces this)',
+    shardSharedEpNote: ' (EP backends deepep/mooncake/nixl replicate the shared expert; pure TP splits it ⁄tp)',
     sumCapDpSuffix: function (dp, clusterTok, clusterReq) {
       return ' (per-rank pool at the full cell, matches the SGLang log; ×DP' + dp + ' = cluster ' + clusterTok +
         ' tokens ≈ ' + clusterReq + ' requests)';
@@ -592,6 +620,13 @@ initEvidenceSplit();
 // combination is baked in (D.whatif0), so first paint needs no network.
 var _fetchCtl = null, _fetchTimer = null;
 
+// The user's own dp-attention / dense-repl intent, kept separate from the
+// checkbox DOM because CP overrides those boxes visually (forced + disabled).
+// Updated only on a genuine user click (see the f-dp / f-dense-repl listeners),
+// seeded from the initial server echo.
+var userDpIntent = !!(W.echo && W.echo.dpAttn);
+var userDenseIntent = !!(W.echo && W.echo.denseRepl);
+
 function paramsNow() {
   var q = {
     model: D.model,
@@ -600,7 +635,15 @@ function paramsNow() {
     kv_dtype: el('f-kv').value,
     tp: el('f-tp').value,
     pp: el('f-pp').value,
-    dp_attention: el('f-dp').checked,
+    // Read the user's own intent, not the checkbox DOM: CP visually checks (and
+    // disables) dp/dense as "forced by CP", and programmatic .checked doesn't
+    // fire change — so reading the DOM would let CP's forced state leak back in
+    // and stick after CP is turned off. userDpIntent/userDenseIntent update only
+    // on a real user click (see listeners), so toggling CP off cleanly restores
+    // the user's own choices. Server-side CP logic is the sole source of the force.
+    dp_attention: userDpIntent,
+    dense_repl: userDenseIntent,
+    cp: el('f-cp').checked,
     mem_fraction_static: el('f-frac').value,
     fixed_overhead_gib: D.fixedGib,
     batch_tokens: D.batchTokens,
@@ -752,9 +795,37 @@ function shapeNow() {
     var s = D.instances[inst];
     instLabel = Tr('instLabel')(inst, s.count, s.gpu, s.memGib);
   }
-  return { tp: e.tp, pp: e.pp, ep: e.ep, dpAttn: e.dpAttn, memGib: e.memGib,
-           gpn: e.gpn, instLabel: instLabel, ctx: e.ctx, req: e.req,
+  return { tp: e.tp, pp: e.pp, ep: e.ep, dpAttn: e.dpAttn, denseRepl: e.denseRepl,
+           gpn: e.gpn, instLabel: instLabel, ctx: e.ctx, req: e.req, memGib: e.memGib,
            kvDtype: e.kvDtype, frac: e.frac, fixedGib: e.fixedGib };
+}
+
+// one-line "how this component is sharded" for a mem-bar segment tooltip,
+// reflecting the current tp/ep/dp/cp/denseRepl. Mirrors gpu_memory()'s divisors
+// exactly so the tooltip and the bar length always agree.
+function shardTip(key, P){
+  var repl = Tr('shardReplicated'), byTp = Tr('shardByTp')(P.tp);
+  switch (key){
+    case 'embed':
+      // embed follows the attn-TP group: replicated under dp-attention/CP, else /tp
+      return P.dpAttn ? repl : byTp;
+    case 'attention':
+      return P.dpAttn ? repl : byTp;
+    case 'lmHead':
+      return byTp;                                       // lm_head stays /tp (enable_dp_lm_head off)
+    case 'denseFfn':
+      return P.denseRepl ? repl + Tr('shardDenseReplNote') : byTp;
+    case 'moeRouted':
+      return P.ep > 1 ? Tr('shardByEp')(P.ep) : byTp;
+    case 'moeShared':
+      // EP backends (deepep/mooncake/nixl) build shared experts replicated;
+      // proxied by ep>1. Plain TP (ep==1) shards them /tp like a normal MLP.
+      return P.ep > 1 ? repl + Tr('shardSharedEpNote') : byTp;
+    case 'mtp':
+      return P.dpAttn ? repl : byTp;                     // MTP sliced part flips with dp
+    default:
+      return byTp;                                       // vision/others: approx /tp
+  }
 }
 
 function memBar(m, P){
@@ -763,11 +834,15 @@ function memBar(m, P){
   // the RIGHT edge with the free headroom in between, so they never overlap the
   // frac boundary line.
   var parts = [];
-  COMPS.forEach(function(c){ if (m.w[c.k] > 0) parts.push({label:c.label, b:m.w[c.k], color:c.color}); });
+  COMPS.forEach(function(c){ if (m.w[c.k] > 0) parts.push({label:c.label, b:m.w[c.k], color:c.color,
+                                                           note:Tr('shardTipPrefix')+shardTip(c.k, P)}); });
   parts.push({label:Tr('fixedOverhead')(), b:P.fixedGib*GIB, color:'var(--fixed)'});
   if (m.linState > 0) parts.push({label:Tr('linStateLabel')(P.req), b:m.linState,
                                   color:C.linState, note:Tr('linStateTipNote')()});
-  if (m.canStart) parts.push({label:Tr('kvCapLabel')(), b:m.kvCap, color:C.kv});
+  if (m.canStart) parts.push({label:Tr('kvCapLabel')(), b:m.kvCap, color:C.kv,
+    // KV sharding polarity is opposite to weights: replicated per rank under
+    // pure-TP MLA, else 1/tp under dp-attention/CP (or GQA over kv-heads).
+    note:Tr('shardTipPrefix')+((!P.dpAttn && D.kvIsMla) ? Tr('shardKvRepl') : Tr('shardKvPerTp')(P.tp))});
   function seg(s0){
     // clamp tiny-but-real segments to ~0.6% so they stay visible (activation
     // per GPU can be <0.2% of the card); flex-grow normalizes the slight excess
@@ -851,7 +926,20 @@ function chips(m, ei, P){
 
 function renderParallel(){
   var P = shapeNow();
+  var cpOn = W.echo.cp;
   el('dp-box').style.display = W.echo.dpAvailable ? '' : 'none';
+  // CP splits the latent-KV sequence — only meaningful for MLA/DSA models
+  el('cp-box').style.display = W.echo.cpApplies ? '' : 'none';
+  el('f-cp').checked = W.echo.cp;
+  // moe_dense_tp_size=1 only bites a MoE model with a leading dense prefix
+  el('dense-box').style.display = W.echo.denseReplApplies ? '' : 'none';
+  // reflect the server's effective values (CP forces dp-attention + dense-repl on)
+  el('f-dense-repl').checked = W.echo.denseRepl;
+  el('f-dp').checked = W.echo.dpAttn;
+  // CP implies enable_dp_attention=True: grey out the dp toggle so it reads as
+  // "decided by CP", not "unchecked". Same for dense-repl (moe_dense_tp=1).
+  el('f-dp').disabled = cpOn;
+  el('f-dense-repl').disabled = cpOn;
   el('custom-box').style.display = el('f-inst').value==='custom' ? 'inline-flex' : 'none';
 
   renderWarnmsg();
@@ -949,9 +1037,14 @@ function renderParallel(){
   var capLine = PA.allStart && PA.minMaxTok > 0
     ? '<br>'+Tr('sumCapLine')(tokLabel(PA.minMaxTok), ctxLabel(P.ctx), PA.minMaxReq, P.frac.toFixed(2))
       + (P.dpAttn ? Tr('sumCapDpSuffix')(P.tp, tokLabel(PA.minMaxTok*P.tp), PA.minMaxReq*P.tp) : '') : '';
+  // CP's distinctive payoff: one sequence's KV spans all tp ranks (attn_cp_size=tp),
+  // so the longest single sequence = tp × per-rank pool tokens (server-computed
+  // maxSingleSeq). Only shown when CP is on — this is what CP buys over dp-attention.
+  var cpLine = (W.echo.cp && PA.allStart && PA.maxSingleSeq > 0)
+    ? '<br>'+Tr('sumCpSeqLine')(P.tp, tokLabel(PA.maxSingleSeq)) : '';
   el('sum-line').innerHTML =
     Tr('sumLine')(gib(PA.maxUsed), P.memGib, gib(PA.clusterWeights), gib(D.weightsBytes), gib(Math.max(repl,0)))+
-    '<br>'+kvNote+capLine;
+    '<br>'+kvNote+capLine+cpLine;
 
   // table view
   var th = Tr('tableHeader')();
@@ -1411,9 +1504,13 @@ function renderKvWarnings(){
   }).join('');
 }
 // every control change → one debounced server round-trip → full re-render
-['f-ctx','f-req','f-kv','f-pp','f-ep','f-dp','f-wdtype','f-chunk'].forEach(function(id){
+['f-ctx','f-req','f-kv','f-pp','f-ep','f-cp','f-wdtype','f-chunk'].forEach(function(id){
   el(id).addEventListener('change', refresh);
 });
+// dp-attention / dense-repl: capture the user's genuine intent on click (CP's
+// programmatic override never reaches these handlers), then refresh.
+el('f-dp').addEventListener('change', function(){ userDpIntent = el('f-dp').checked; refresh(); });
+el('f-dense-repl').addEventListener('change', function(){ userDenseIntent = el('f-dense-repl').checked; refresh(); });
 el('f-tp').addEventListener('change', function(){
   rebuildEpOptions(+el('f-tp').value);   // ep divisors depend on tp
   refresh();

@@ -191,9 +191,18 @@ def gpu_memory(D: dict, P: dict, s: int) -> dict:
                               + Ld["attnKvProj"] / min(tp, D["kvNKvHeads"] or tp)
                               + Ld["attnRepl"])
     w["attention"] += n * (D["absorbPerLayer"] or 0) / attn_tp_div
-    w["denseFfn"] = nd * Ld["denseFfn"] / tp
+    # leading dense FFN (first_k_dense_replace layers): normally /tp, but with
+    # moe_dense_tp_size=1 (P["denseRepl"], auto-forced by CP) each rank keeps a
+    # full copy. Only meaningful for a MoE model's dense prefix.
+    w["denseFfn"] = nd * Ld["denseFfn"] / (1 if P.get("denseRepl") else tp)
     w["moeRouted"] = nm * Ld["moeRouted"] / tp
-    w["moeShared"] = nm * Ld["moeShared"] / tp
+    # shared expert: sharded /tp with the plain `none` MoE backend, but the EP
+    # backends (deepep/mooncake/nixl, which force ep_size=tp_size) build it
+    # REPLICATED (tp1). We proxy "EP backend in use" by ep>1: ep>1 -> replicated
+    # (/1), ep==1 -> /tp. Verified against SGLang deepseek_v2.py
+    # (_shared_expert_use_tp1); modeling it as /tp under EP under-counts memory
+    # (GLM tp8/ep8: ~2.5 GiB/card).
+    w["moeShared"] = nm * Ld["moeShared"] / (1 if P["ep"] > 1 else tp)
     w["mtp"] = 0
     if s == P["pp"] - 1 and Ld["mtpTotal"]:
         if dp_attn:
@@ -791,6 +800,13 @@ def whatif_payload(a: dict, cfg: dict, D: dict, P: dict,
             "kvSingle": pc["kv_single"], "oomTotal": pc["oom"],
             "allStart": pc["all_start"], "maxUsed": pc["max_used"],
             "minMaxReq": pc["min_max_req"], "minMaxTok": pc["min_max_tok"],
+            # CP's distinctive payoff: one sequence's KV is split across the CP
+            # ranks. We model attn_cp_size=tp (the common case), so a single
+            # sequence spans all tp ranks: longest single sequence = tp x (one
+            # rank's pool tokens). minMaxTok is already the per-rank pool under
+            # dp/CP (CP is memory-equivalent to dp-attention), so scale it by tp.
+            # Only surfaced when CP is on (else a sequence lives on one rank).
+            "maxSingleSeq": (P["tp"] if P.get("cp") else 1) * pc["min_max_tok"],
         }
 
     # ---- roofline tab (same _comp_time_s/_phase_aggregate core as roofline_verdict)
@@ -834,6 +850,11 @@ def whatif_payload(a: dict, cfg: dict, D: dict, P: dict,
         "echo": {"ctx": P["ctx"], "req": P["req"], "kvDtype": P["kvDtype"],
                  "tp": P["tp"], "pp": P["pp"], "ep": P.get("ep") or P["tp"],
                  "dpAttn": P["dpAttn"], "dpAvailable": dp_available(D, P["tp"]),
+                 "cp": bool(P.get("cp")),
+                 # CP splits the latent-KV sequence — only meaningful for MLA/DSA
+                 "cpApplies": bool(D["kvIsMla"]),
+                 "denseRepl": bool(P.get("denseRepl")),
+                 "denseReplApplies": D["nDense"] > 0 and D["nMoe"] > 0,
                  "frac": P["frac"], "memGib": P["memGib"], "gpn": P["gpn"],
                  "fixedGib": P["fixedGib"], "chunk": chunk_tokens,
                  "weightDtype": weight_dtype or D["weightDtype"]},
