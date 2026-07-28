@@ -191,7 +191,10 @@ def gpu_memory(D: dict, P: dict, s: int) -> dict:
                               + Ld["attnKvProj"] / min(tp, D["kvNKvHeads"] or tp)
                               + Ld["attnRepl"])
     w["attention"] += n * (D["absorbPerLayer"] or 0) / attn_tp_div
-    w["denseFfn"] = nd * Ld["denseFfn"] / tp
+    # leading dense FFN (first_k_dense_replace layers): normally /tp, but with
+    # moe_dense_tp_size=1 (P["denseRepl"], auto-forced by CP) each rank keeps a
+    # full copy. Only meaningful for a MoE model's dense prefix.
+    w["denseFfn"] = nd * Ld["denseFfn"] / (1 if P.get("denseRepl") else tp)
     w["moeRouted"] = nm * Ld["moeRouted"] / tp
     # shared expert: sharded /tp with the plain `none` MoE backend, but the EP
     # backends (deepep/mooncake/nixl, which force ep_size=tp_size) build it
@@ -840,6 +843,8 @@ def whatif_payload(a: dict, cfg: dict, D: dict, P: dict,
         "echo": {"ctx": P["ctx"], "req": P["req"], "kvDtype": P["kvDtype"],
                  "tp": P["tp"], "pp": P["pp"], "ep": P.get("ep") or P["tp"],
                  "dpAttn": P["dpAttn"], "dpAvailable": dp_available(D, P["tp"]),
+                 "denseRepl": bool(P.get("denseRepl")),
+                 "denseReplApplies": D["nDense"] > 0 and D["nMoe"] > 0,
                  "frac": P["frac"], "memGib": P["memGib"], "gpn": P["gpn"],
                  "fixedGib": P["fixedGib"], "chunk": chunk_tokens,
                  "weightDtype": weight_dtype or D["weightDtype"]},

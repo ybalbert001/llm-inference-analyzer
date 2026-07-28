@@ -176,6 +176,7 @@ MSG = {
     "html.lbl_req": {"zh": "并发请求数", "en": "concurrent requests"},
     "html.lbl_kv": {"zh": "KV cache 精度", "en": "KV cache dtype"},
     "html.lbl_dp": {"zh": "DP attention（KV 切 TP，attention 权重复制）", "en": "DP attention (KV split by TP, attention weights replicated)"},
+    "html.lbl_dense_repl": {"zh": "dense 复制（moe_dense_tp=1，前置 dense 层每卡整份）", "en": "dense replicate (moe_dense_tp=1, leading dense layers kept whole per rank)"},
     "html.lbl_inst": {"zh": "机型", "en": "instance"},
     "html.lbl_frac": {"zh": "mem-fraction-static", "en": "mem-fraction-static"},
     "html.lbl_wdtype": {"zh": "权重精度", "en": "weight dtype"},

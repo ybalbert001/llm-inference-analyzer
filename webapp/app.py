@@ -555,7 +555,7 @@ def _prepare_analysis(request: Request, *, model: str, context: int, requests: i
                       batch_tokens: int, chunk_tokens: int | None,
                       weight_dtype: str | None,
                       rate_prefix: str, rate_limit: int,
-                      rate_what: str) -> tuple:
+                      rate_what: str, dense_repl: bool = False) -> tuple:
     """Validate + rate-limit + load + analyze — the shared front half of
     /api/v1/analyze and /api/v1/whatif. Returns (a, cfg, D, P, hw,
     weight_warnings). Any rule about resolving parameters into the engine's
@@ -603,6 +603,9 @@ def _prepare_analysis(request: Request, *, model: str, context: int, requests: i
     D["fixedGib"] = fixed_eff
     P = {"tp": tp, "pp": pp, "ep": ep or tp,
          "dpAttn": dp_attention and engine.dp_available(D, tp),
+         # moe_dense_tp_size=1: leading dense FFN replicated per rank instead of
+         # /tp. Only bites a MoE model with a dense prefix (first_k_dense_replace).
+         "denseRepl": dense_repl and D["nDense"] > 0 and D["nMoe"] > 0,
          "memGib": hw["memGib"], "gpn": hw["gpn"], "ctx": context, "req": requests,
          "kvDtype": kv_effective, "frac": mem_fraction_static,
          "fixedGib": fixed_eff,
@@ -624,6 +627,7 @@ def api_v1_analyze(  # sync def: FastAPI runs it in a worker thread (blocking HF
     pp: int = Query(1, ge=1, le=64),
     ep: int | None = Query(None, ge=1, le=128),
     dp_attention: bool = Query(False),
+    dense_repl: bool = Query(False, description="moe_dense_tp_size=1: replicate leading dense FFN per rank"),
     instance: str | None = Query(None),
     gpu: str | None = Query(None),
     gpu_mem_gib: float | None = Query(None, gt=0),
@@ -639,6 +643,7 @@ def api_v1_analyze(  # sync def: FastAPI runs it in a worker thread (blocking HF
     a, cfg, D, P, hw, weight_warnings = _prepare_analysis(
         request, model=model, context=context, requests=requests,
         kv_dtype=kv_dtype, tp=tp, pp=pp, ep=ep, dp_attention=dp_attention,
+        dense_repl=dense_repl,
         instance=instance, gpu=gpu, gpu_mem_gib=gpu_mem_gib,
         gpus_per_node=gpus_per_node, mem_fraction_static=mem_fraction_static,
         fixed_overhead_gib=fixed_overhead_gib, batch_tokens=batch_tokens,
@@ -742,6 +747,7 @@ def api_v1_whatif(  # sync def: worker thread (config fetch may block on first h
     pp: int = Query(1, ge=1, le=64),
     ep: int | None = Query(None, ge=1, le=128),
     dp_attention: bool = Query(False),
+    dense_repl: bool = Query(False),
     instance: str | None = Query(None),
     gpu: str | None = Query(None),
     gpu_mem_gib: float | None = Query(None, gt=0),
@@ -760,6 +766,7 @@ def api_v1_whatif(  # sync def: worker thread (config fetch may block on first h
     a, cfg, D, P, hw, _ = _prepare_analysis(
         request, model=model, context=context, requests=requests,
         kv_dtype=kv_dtype, tp=tp, pp=pp, ep=ep, dp_attention=dp_attention,
+        dense_repl=dense_repl,
         instance=instance, gpu=gpu, gpu_mem_gib=gpu_mem_gib,
         gpus_per_node=gpus_per_node, mem_fraction_static=mem_fraction_static,
         fixed_overhead_gib=fixed_overhead_gib, batch_tokens=batch_tokens,

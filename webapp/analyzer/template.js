@@ -601,6 +601,7 @@ function paramsNow() {
     tp: el('f-tp').value,
     pp: el('f-pp').value,
     dp_attention: el('f-dp').checked,
+    dense_repl: el('f-dense-repl').checked,
     mem_fraction_static: el('f-frac').value,
     fixed_overhead_gib: D.fixedGib,
     batch_tokens: D.batchTokens,
@@ -752,8 +753,8 @@ function shapeNow() {
     var s = D.instances[inst];
     instLabel = Tr('instLabel')(inst, s.count, s.gpu, s.memGib);
   }
-  return { tp: e.tp, pp: e.pp, ep: e.ep, dpAttn: e.dpAttn, memGib: e.memGib,
-           gpn: e.gpn, instLabel: instLabel, ctx: e.ctx, req: e.req,
+  return { tp: e.tp, pp: e.pp, ep: e.ep, dpAttn: e.dpAttn, denseRepl: e.denseRepl,
+           gpn: e.gpn, instLabel: instLabel, ctx: e.ctx, req: e.req, memGib: e.memGib,
            kvDtype: e.kvDtype, frac: e.frac, fixedGib: e.fixedGib };
 }
 
@@ -852,6 +853,10 @@ function chips(m, ei, P){
 function renderParallel(){
   var P = shapeNow();
   el('dp-box').style.display = W.echo.dpAvailable ? '' : 'none';
+  // moe_dense_tp_size=1 only bites a MoE model with a leading dense prefix
+  el('dense-box').style.display = W.echo.denseReplApplies ? '' : 'none';
+  // reflect the server's effective value (a later CP selection can force it on)
+  el('f-dense-repl').checked = W.echo.denseRepl;
   el('custom-box').style.display = el('f-inst').value==='custom' ? 'inline-flex' : 'none';
 
   renderWarnmsg();
@@ -1411,7 +1416,7 @@ function renderKvWarnings(){
   }).join('');
 }
 // every control change → one debounced server round-trip → full re-render
-['f-ctx','f-req','f-kv','f-pp','f-ep','f-dp','f-wdtype','f-chunk'].forEach(function(id){
+['f-ctx','f-req','f-kv','f-pp','f-ep','f-dp','f-dense-repl','f-wdtype','f-chunk'].forEach(function(id){
   el(id).addEventListener('change', refresh);
 });
 el('f-tp').addEventListener('change', function(){
