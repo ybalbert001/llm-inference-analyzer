@@ -193,7 +193,13 @@ def gpu_memory(D: dict, P: dict, s: int) -> dict:
     w["attention"] += n * (D["absorbPerLayer"] or 0) / attn_tp_div
     w["denseFfn"] = nd * Ld["denseFfn"] / tp
     w["moeRouted"] = nm * Ld["moeRouted"] / tp
-    w["moeShared"] = nm * Ld["moeShared"] / tp
+    # shared expert: sharded /tp with the plain `none` MoE backend, but the EP
+    # backends (deepep/mooncake/nixl, which force ep_size=tp_size) build it
+    # REPLICATED (tp1). We proxy "EP backend in use" by ep>1: ep>1 -> replicated
+    # (/1), ep==1 -> /tp. Verified against SGLang deepseek_v2.py
+    # (_shared_expert_use_tp1); modeling it as /tp under EP under-counts memory
+    # (GLM tp8/ep8: ~2.5 GiB/card).
+    w["moeShared"] = nm * Ld["moeShared"] / (1 if P["ep"] > 1 else tp)
     w["mtp"] = 0
     if s == P["pp"] - 1 and Ld["mtpTotal"]:
         if dp_attn:
