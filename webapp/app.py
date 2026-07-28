@@ -555,7 +555,8 @@ def _prepare_analysis(request: Request, *, model: str, context: int, requests: i
                       batch_tokens: int, chunk_tokens: int | None,
                       weight_dtype: str | None,
                       rate_prefix: str, rate_limit: int,
-                      rate_what: str, dense_repl: bool = False) -> tuple:
+                      rate_what: str, dense_repl: bool = False,
+                      cp: bool = False) -> tuple:
     """Validate + rate-limit + load + analyze — the shared front half of
     /api/v1/analyze and /api/v1/whatif. Returns (a, cfg, D, P, hw,
     weight_warnings). Any rule about resolving parameters into the engine's
@@ -601,11 +602,21 @@ def _prepare_analysis(request: Request, *, model: str, context: int, requests: i
     fixed_eff = (fixed_overhead_gib if fixed_overhead_gib is not None
                  else round(0.65 + 0.265 * (tp - 1), 2))
     D["fixedGib"] = fixed_eff
-    P = {"tp": tp, "pp": pp, "ep": ep or tp,
-         "dpAttn": dp_attention and engine.dp_available(D, tp),
+    # context-parallel (--enable-prefill-cp) only applies to MLA/DSA models. It's
+    # a boolean here: we model the most common attn_cp_size=tp case — attention
+    # weights replicated per rank, one sequence's KV split across all tp ranks —
+    # which per SGLang source forces enable_dp_attention=True + moe_dense_tp_size=1.
+    # (We deliberately don't model the 1<attn_cp_size<tp partial-replication
+    # middle ground; see html.cp_title.) So cp on IMPLIES dp-attention + dense-repl:
+    # resolve here once, the UI just reflects the echoed effective flags.
+    cp_eff = bool(cp) and D["kvIsMla"]
+    dp_eff = (dp_attention or cp_eff) and engine.dp_available(D, tp)
+    P = {"tp": tp, "pp": pp, "ep": ep or tp, "cp": cp_eff,
+         "dpAttn": dp_eff,
          # moe_dense_tp_size=1: leading dense FFN replicated per rank instead of
-         # /tp. Only bites a MoE model with a dense prefix (first_k_dense_replace).
-         "denseRepl": dense_repl and D["nDense"] > 0 and D["nMoe"] > 0,
+         # /tp. Only bites a MoE model with a dense prefix (first_k_dense_replace);
+         # CP forces it on.
+         "denseRepl": (dense_repl or cp_eff) and D["nDense"] > 0 and D["nMoe"] > 0,
          "memGib": hw["memGib"], "gpn": hw["gpn"], "ctx": context, "req": requests,
          "kvDtype": kv_effective, "frac": mem_fraction_static,
          "fixedGib": fixed_eff,
@@ -628,6 +639,7 @@ def api_v1_analyze(  # sync def: FastAPI runs it in a worker thread (blocking HF
     ep: int | None = Query(None, ge=1, le=128),
     dp_attention: bool = Query(False),
     dense_repl: bool = Query(False, description="moe_dense_tp_size=1: replicate leading dense FFN per rank"),
+    cp: bool = Query(False, description="prefill context-parallel (MLA/DSA; modeled at attn_cp_size=tp, forces dp-attention + dense-repl)"),
     instance: str | None = Query(None),
     gpu: str | None = Query(None),
     gpu_mem_gib: float | None = Query(None, gt=0),
@@ -643,7 +655,7 @@ def api_v1_analyze(  # sync def: FastAPI runs it in a worker thread (blocking HF
     a, cfg, D, P, hw, weight_warnings = _prepare_analysis(
         request, model=model, context=context, requests=requests,
         kv_dtype=kv_dtype, tp=tp, pp=pp, ep=ep, dp_attention=dp_attention,
-        dense_repl=dense_repl,
+        dense_repl=dense_repl, cp=cp,
         instance=instance, gpu=gpu, gpu_mem_gib=gpu_mem_gib,
         gpus_per_node=gpus_per_node, mem_fraction_static=mem_fraction_static,
         fixed_overhead_gib=fixed_overhead_gib, batch_tokens=batch_tokens,
@@ -748,6 +760,7 @@ def api_v1_whatif(  # sync def: worker thread (config fetch may block on first h
     ep: int | None = Query(None, ge=1, le=128),
     dp_attention: bool = Query(False),
     dense_repl: bool = Query(False),
+    cp: bool = Query(False),
     instance: str | None = Query(None),
     gpu: str | None = Query(None),
     gpu_mem_gib: float | None = Query(None, gt=0),
@@ -766,7 +779,7 @@ def api_v1_whatif(  # sync def: worker thread (config fetch may block on first h
     a, cfg, D, P, hw, _ = _prepare_analysis(
         request, model=model, context=context, requests=requests,
         kv_dtype=kv_dtype, tp=tp, pp=pp, ep=ep, dp_attention=dp_attention,
-        dense_repl=dense_repl,
+        dense_repl=dense_repl, cp=cp,
         instance=instance, gpu=gpu, gpu_mem_gib=gpu_mem_gib,
         gpus_per_node=gpus_per_node, mem_fraction_static=mem_fraction_static,
         fixed_overhead_gib=fixed_overhead_gib, batch_tokens=batch_tokens,

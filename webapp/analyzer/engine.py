@@ -800,6 +800,13 @@ def whatif_payload(a: dict, cfg: dict, D: dict, P: dict,
             "kvSingle": pc["kv_single"], "oomTotal": pc["oom"],
             "allStart": pc["all_start"], "maxUsed": pc["max_used"],
             "minMaxReq": pc["min_max_req"], "minMaxTok": pc["min_max_tok"],
+            # CP's distinctive payoff: one sequence's KV is split across the CP
+            # ranks. We model attn_cp_size=tp (the common case), so a single
+            # sequence spans all tp ranks: longest single sequence = tp x (one
+            # rank's pool tokens). minMaxTok is already the per-rank pool under
+            # dp/CP (CP is memory-equivalent to dp-attention), so scale it by tp.
+            # Only surfaced when CP is on (else a sequence lives on one rank).
+            "maxSingleSeq": (P["tp"] if P.get("cp") else 1) * pc["min_max_tok"],
         }
 
     # ---- roofline tab (same _comp_time_s/_phase_aggregate core as roofline_verdict)
@@ -843,6 +850,9 @@ def whatif_payload(a: dict, cfg: dict, D: dict, P: dict,
         "echo": {"ctx": P["ctx"], "req": P["req"], "kvDtype": P["kvDtype"],
                  "tp": P["tp"], "pp": P["pp"], "ep": P.get("ep") or P["tp"],
                  "dpAttn": P["dpAttn"], "dpAvailable": dp_available(D, P["tp"]),
+                 "cp": bool(P.get("cp")),
+                 # CP splits the latent-KV sequence — only meaningful for MLA/DSA
+                 "cpApplies": bool(D["kvIsMla"]),
                  "denseRepl": bool(P.get("denseRepl")),
                  "denseReplApplies": D["nDense"] > 0 and D["nMoe"] > 0,
                  "frac": P["frac"], "memGib": P["memGib"], "gpn": P["gpn"],
