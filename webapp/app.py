@@ -402,7 +402,13 @@ async def serve_report(request: Request, slug: str):
 # `model`; response echoes every effective assumption.
 
 API_PER_HOUR = int(os.environ.get("API_PER_HOUR", "120"))
-MODEL_CACHE_TTL_S = 6 * 3600
+# A cache entry holds main-branch config + safetensors headers + the derived
+# component split — all of which only change when the repo is re-uploaded. The
+# TTL used to be 6 h, which meant the first control change after any idle
+# period paid the full cold sweep (25-90 s). It is now a week; correctness does
+# not lean on it, because a re-upload changes the repo commit sha and the
+# sha-keyed disk layer under it (hfcache) misses on its own.
+MODEL_CACHE_TTL_S = int(os.environ.get("MODEL_CACHE_TTL_S", str(7 * 24 * 3600)))
 KV_DTYPES = ("auto", "bf16", "fp16", "fp8", "fp4")
 WEIGHT_DTYPES = ("bf16", "fp8", "fp4")
 
@@ -414,39 +420,84 @@ GPU_CATALOG: dict[str, float] = {}
 for _name, (_gpu, _cnt, _mib) in core.STATIC_INSTANCES.items():
     GPU_CATALOG[_gpu] = max(GPU_CATALOG.get(_gpu, 0), round(_mib / 1024, 1))
 
-_model_cache: dict[str, tuple[float, dict, dict | None, list[str], tuple | None]] = {}
-_model_cache_lock = threading.Lock()
+_MODEL_CACHE_MAX = 64
+# entry: {"filled": ts, "used": ts, "cfg", "catalog", "warnings", "exact_parts"}
+_model_cache: dict[str, dict] = {}
+_model_cache_lock = threading.Lock()      # guards _model_cache and _model_locks
+_model_locks: dict[str, threading.Lock] = {}
+
+
+def _model_lock(model_id: str) -> threading.Lock:
+    with _model_cache_lock:
+        return _model_locks.setdefault(model_id, threading.Lock())
+
+
+def _cache_get(model_id: str) -> dict | None:
+    """Live entry for `model_id`, refreshing its recency. Eviction ranks on
+    last USE, not on fill time — ranking on fill time evicted the model being
+    actively explored as soon as 64 others had been touched since."""
+    with _model_cache_lock:
+        hit = _model_cache.get(model_id)
+        if hit and time.time() - hit["filled"] < MODEL_CACHE_TTL_S:
+            hit["used"] = time.time()
+            return hit
+        return None
 
 
 def _load_model(model_id: str) -> tuple[dict, dict | None, list[str], tuple | None]:
     """config + safetensors catalog + precomputed exact_components, cached.
-    The headers fetch takes seconds, and exact_components over a 100k+-tensor
-    MoE catalog takes seconds of CPU — both depend only on the model, so they
-    are computed once per cache fill, not per request."""
-    with _model_cache_lock:
-        hit = _model_cache.get(model_id)
-        if hit and time.time() - hit[0] < MODEL_CACHE_TTL_S:
-            return hit[1], hit[2], hit[3], hit[4]
-    cfg = engine.normalize_config(core.fetch_config(model_id))
-    catalog, warnings = None, []
-    try:
-        catalog, declared, _n_shards, _index_info = core.fetch_safetensors_catalog(model_id)
-        got = sum(t["bytes"] for t in catalog.values())
-        if declared and abs(got - declared) / declared > 0.01:
-            warnings.append(warning(
-                "weights_sum_mismatch",
-                got_gib=f"{got / (1024**3):,.1f}",
-                declared_gib=f"{declared / (1024**3):,.1f}",
-                diff_pct=f"{abs(got - declared) / declared:.1%}"))
-    except Exception as exc:  # noqa: BLE001 — degrade to formula estimate
-        warnings.append(warning("headers_fetch_failed", err=str(exc)))
-    exact_parts = core.exact_components(catalog, cfg) if catalog else None
-    with _model_cache_lock:
-        _model_cache[model_id] = (time.time(), cfg, catalog, warnings, exact_parts)
-        if len(_model_cache) > 64:  # bound memory: drop oldest entries
-            for k in sorted(_model_cache, key=lambda k: _model_cache[k][0])[:16]:
-                _model_cache.pop(k, None)
-    return cfg, catalog, warnings, exact_parts
+
+    Three layers, because the sweep behind this is the analyzer's one truly slow
+    step (150+ range requests, 15-90 s):
+      1. this process's dict — sub-millisecond, holds the derived exact_parts;
+      2. a per-model lock, so N concurrent misses for the same model do ONE
+         sweep and the rest wait for it (the report page fires a request per
+         control change, and an aborted fetch still runs to completion server
+         side, so same-model pile-ups are the normal case, not the rare one);
+      3. hfcache on disk, keyed by repo commit sha — survives redeploys and is
+         shared with the report-generating subprocesses.
+    """
+    hit = _cache_get(model_id)
+    if hit:
+        return hit["cfg"], hit["catalog"], hit["warnings"], hit["exact_parts"]
+
+    with _model_lock(model_id):
+        hit = _cache_get(model_id)        # filled while we waited on the lock
+        if hit:
+            return hit["cfg"], hit["catalog"], hit["warnings"], hit["exact_parts"]
+
+        cfg_raw, repo_sha = core.fetch_config_with_sha(model_id)
+        cfg = engine.normalize_config(cfg_raw)
+        catalog, warnings = None, []
+        try:
+            catalog, declared, _n_shards, _index_info = core.fetch_safetensors_catalog(
+                model_id, sha=repo_sha)
+            got = sum(t["bytes"] for t in catalog.values())
+            if declared and abs(got - declared) / declared > 0.01:
+                warnings.append(warning(
+                    "weights_sum_mismatch",
+                    got_gib=f"{got / (1024**3):,.1f}",
+                    declared_gib=f"{declared / (1024**3):,.1f}",
+                    diff_pct=f"{abs(got - declared) / declared:.1%}"))
+        except Exception as exc:  # noqa: BLE001 — degrade to formula estimate
+            warnings.append(warning("headers_fetch_failed", err=str(exc)))
+        exact_parts = core.exact_components(catalog, cfg) if catalog else None
+
+        now_ts = time.time()
+        with _model_cache_lock:
+            _model_cache[model_id] = {
+                "filled": now_ts, "used": now_ts, "cfg": cfg, "catalog": catalog,
+                "warnings": warnings, "exact_parts": exact_parts}
+            if len(_model_cache) > _MODEL_CACHE_MAX:  # bound memory: drop least-recently-used
+                stale = sorted(_model_cache, key=lambda k: _model_cache[k]["used"])
+                for k in stale[:len(_model_cache) - _MODEL_CACHE_MAX]:
+                    _model_cache.pop(k, None)
+            # locks outlive their entry (and exist for models that failed to
+            # load at all) — drop the idle ones so bad ids can't grow the dict
+            for k, lk in [(k, lk) for k, lk in _model_locks.items()
+                          if k not in _model_cache and not lk.locked()]:
+                _model_locks.pop(k, None)
+        return cfg, catalog, warnings, exact_parts
 
 
 def _resolve_hardware(instance: str | None, gpu: str | None,

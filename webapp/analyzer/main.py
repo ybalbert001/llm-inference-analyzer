@@ -29,6 +29,7 @@ import sys
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 
+import hfcache
 from i18n import t, set_lang, get_lang, warning, render_warning
 
 GIB = 1024 ** 3
@@ -122,13 +123,21 @@ def fetch_instance_specs(names: list) -> dict:
 # ---------------------------------------------------------------- fetch
 
 def fetch_config(model_id: str) -> dict:
+    return fetch_config_with_sha(model_id)[0]
+
+
+def fetch_config_with_sha(model_id: str) -> tuple[dict, str | None]:
+    """config.json plus the repo's commit sha, which HF returns for free in the
+    X-Repo-Commit response header. The sha is the cache key for the safetensors
+    header sweep (see hfcache) — fetching it costs nothing extra here, so the
+    catalog never needs its own revision probe."""
     url = f"https://huggingface.co/{model_id}/raw/main/config.json"
     req = urllib.request.Request(url, headers={"User-Agent": "vram-estimate/1.0"})
     token = os.environ.get("HF_TOKEN")
     if token:
         req.add_header("Authorization", f"Bearer {token}")
     with urllib.request.urlopen(req, timeout=30) as resp:
-        return json.load(resp)
+        return json.load(resp), resp.headers.get("X-Repo-Commit")
 
 
 # ---------------------------------------------------------------- exact sizes from safetensors
@@ -145,7 +154,18 @@ def _fetch_range(url: str, start: int, length: int) -> bytes:
         return resp.read()
 
 
-def fetch_safetensors_catalog(model_id: str) -> tuple[dict, int | None, int, dict | None]:
+# The sweep is latency-bound, not bandwidth-bound: each range request against
+# the HF CDN takes ~2 s regardless of size, and big MoE checkpoints have 150+
+# shards. So fan out wide (32 concurrent) and read enough of each shard in ONE
+# request that the header almost always arrives whole — a 128 KiB probe covered
+# all 163 DeepSeek-V3 shards (largest header there: 34 KB). Bigger headers just
+# cost a second request, as before.
+HEADER_WORKERS = int(os.environ.get("ANALYZER_HEADER_WORKERS", "32"))
+HEADER_PROBE_BYTES = 128 * 1024
+
+
+def fetch_safetensors_catalog(model_id: str,
+                              sha: str | None = None) -> tuple[dict, int | None, int, dict | None]:
     """Per-tensor {name: {dtype, shape, bytes}} from safetensors headers.
 
     Only range-requests each shard's JSON header (a few hundred KB), never the
@@ -157,7 +177,19 @@ def fetch_safetensors_catalog(model_id: str) -> tuple[dict, int | None, int, dic
     and index_info — a small sample of the file itself (metadata + a few
     weight_map entries + shard list) for the evidence tab's "bridge file" view.
     index_info is None for single-file checkpoints (no index.json).
+
+    `sha` is the repo commit sha from fetch_config_with_sha(). When given, the
+    whole result is cached on disk under that sha (see hfcache) and shared with
+    every other process on the box — the sweep costs 15-90 s, so this is the
+    difference between an instant what-if and a minute of waiting. Pass None to
+    force a live sweep.
     """
+    if sha is not None:
+        hit = hfcache.load(model_id, sha)
+        if hit is not None:
+            return (hit["catalog"], hit["declared"], hit["n_shards"],
+                    hit["index_info"])
+
     base = f"https://huggingface.co/{model_id}/resolve/main"
     declared = None
     index_info = None
@@ -186,18 +218,25 @@ def fetch_safetensors_catalog(model_id: str) -> tuple[dict, int | None, int, dic
         files = ["model.safetensors"]  # single-file checkpoint
 
     def header(fname):
+        # one request for length prefix + header together; only re-fetch when
+        # the header is bigger than the probe
         url = f"{base}/{fname}"
-        n = struct.unpack("<Q", _fetch_range(url, 0, 8))[0]
-        h = json.loads(_fetch_range(url, 8, n))
+        blob = _fetch_range(url, 0, HEADER_PROBE_BYTES)
+        n = struct.unpack("<Q", blob[:8])[0]
+        raw = blob[8:8 + n] if 8 + n <= len(blob) else _fetch_range(url, 8, n)
+        h = json.loads(raw)
         h.pop("__metadata__", None)
         return h
 
     catalog = {}
-    with ThreadPoolExecutor(max_workers=8) as ex:
+    with ThreadPoolExecutor(max_workers=HEADER_WORKERS) as ex:
         for h in ex.map(header, files):
             for name, meta in h.items():
                 b = meta["data_offsets"][1] - meta["data_offsets"][0]
                 catalog[name] = {"dtype": meta["dtype"], "shape": meta["shape"], "bytes": b}
+    if sha is not None:
+        hfcache.store(model_id, {"sha": sha, "catalog": catalog, "declared": declared,
+                                 "n_shards": len(files), "index_info": index_info})
     return catalog, declared, len(files), index_info
 
 
@@ -2428,7 +2467,7 @@ def main():
     set_lang(args.lang)
 
     try:
-        cfg = fetch_config(args.model_id)
+        cfg, repo_sha = fetch_config_with_sha(args.model_id)
     except Exception as e:
         sys.exit(f"failed to fetch config for {args.model_id}: {e}")
 
@@ -2452,7 +2491,10 @@ def main():
     weight_warnings = []
     if not args.no_exact:
         try:
-            catalog, declared, n_shards, index_info = fetch_safetensors_catalog(args.model_id)
+            # shares the disk cache with the webapp: a report generated right
+            # after an API call reuses that call's sweep instead of redoing it
+            catalog, declared, n_shards, index_info = fetch_safetensors_catalog(
+                args.model_id, sha=repo_sha)
             got = sum(tv["bytes"] for tv in catalog.values())
             if declared and abs(got - declared) / declared > 0.01:
                 w = warning("weights_sum_mismatch",
